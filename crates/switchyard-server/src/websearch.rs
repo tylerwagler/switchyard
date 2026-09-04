@@ -16,28 +16,21 @@
 //! answer), aggregate or SSE, through the existing response/SSE plumbing. All
 //! other traffic passes through untouched.
 //!
-//! Configuration (v1 — env vars; a config-file home may come later):
-//!   SWITCHYARD_WEBSEARCH            "on" | "1" | "true" enables the bridge
-//!   SWITCHYARD_SEARXNG_URL          SearXNG base             [http://127.0.0.1:8080]
-//!   SWITCHYARD_WEBSEARCH_MAX_RESULTS results returned        [6, clamped 1..=20]
-//!   SWITCHYARD_WEBSEARCH_TIMEOUT_MS SearXNG timeout          [15_000]
+//! Configuration lives in the deployment's `[web_search]` section (see
+//! `switchyard_runner::WebSearchConfig`); the bridge is off until enabled.
 
-use std::sync::OnceLock;
 use std::time::Instant;
 
 use axum::Json;
 use axum::response::{IntoResponse, Response as AxumResponse};
 use opentelemetry::{KeyValue, global};
 use serde_json::{Value, json};
+use switchyard_runner::WebSearchConfig;
 use switchyard_translation::{LlmStreamError, RawEventStream, WireFormat};
 
 use crate::ServerState;
 use crate::sse::frame_stream;
 
-const ENV_ENABLE: &str = "SWITCHYARD_WEBSEARCH";
-const ENV_URL: &str = "SWITCHYARD_SEARXNG_URL";
-const ENV_MAX_RESULTS: &str = "SWITCHYARD_WEBSEARCH_MAX_RESULTS";
-const ENV_TIMEOUT_MS: &str = "SWITCHYARD_WEBSEARCH_TIMEOUT_MS";
 const DEFAULT_MODEL: &str = "claude-fable-5-1";
 
 /// Search-instruction sentence shapes the client prepends to the query.
@@ -47,48 +40,6 @@ const QUERY_PREFIXES: &[&str] = &[
     "web search for the query:",
     "search for the query:",
 ];
-
-fn enabled() -> bool {
-    matches!(
-        std::env::var(ENV_ENABLE).as_deref(),
-        Ok("on") | Ok("1") | Ok("true")
-    )
-}
-
-fn searxng_url() -> String {
-    std::env::var(ENV_URL).unwrap_or_else(|_| "http://127.0.0.1:8080".into())
-}
-
-fn max_results() -> usize {
-    std::env::var(ENV_MAX_RESULTS)
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(6)
-        .clamp(1, 20)
-}
-
-fn timeout() -> std::time::Duration {
-    std::time::Duration::from_millis(
-        std::env::var(ENV_TIMEOUT_MS)
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(15_000),
-    )
-}
-
-static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
-
-fn http() -> &'static reqwest::Client {
-    CLIENT.get_or_init(|| {
-        reqwest::Client::builder()
-            .timeout(timeout())
-            .build()
-            .unwrap_or_else(|error| {
-                tracing::warn!(%error, "websearch client build failed; using default");
-                reqwest::Client::new()
-            })
-    })
-}
 
 // --- detection ---------------------------------------------------------------
 
@@ -172,14 +123,19 @@ fn encode_query(value: &str) -> String {
     out
 }
 
-async fn search(query: &str) -> Result<Vec<Value>, String> {
+async fn search(
+    query: &str,
+    config: &WebSearchConfig,
+    client: &reqwest::Client,
+) -> Result<Vec<Value>, String> {
     let url = format!(
         "{}/search?q={}&format=json&pageno=1",
-        searxng_url(),
+        config.searxng_url(),
         encode_query(query)
     );
-    let response = http()
+    let response = client
         .get(url)
+        .timeout(config.timeout())
         .header("Accept", "application/json")
         .header("User-Agent", "switchyard-websearch/1.0")
         .send()
@@ -194,7 +150,7 @@ async fn search(query: &str) -> Result<Vec<Value>, String> {
         .map_err(|error| format!("searxng body parse failed: {error}"))?;
     let mut out = Vec::new();
     if let Some(results) = body.get("results").and_then(Value::as_array) {
-        for item in results.iter().take(max_results()) {
+        for item in results.iter().take(config.max_results()) {
             let url = item.get("url").and_then(Value::as_str).unwrap_or("");
             if url.is_empty() {
                 continue;
@@ -333,14 +289,15 @@ fn record(outcome: &str, started: Instant) {
 /// Short-circuits dedicated web-search requests with a synthesized response.
 /// Everything else returns `None` and the normal routing path runs unchanged.
 pub(crate) async fn maybe_short_circuit(
-    _state: &ServerState,
+    state: &ServerState,
     wire_format: WireFormat,
     body: &Value,
 ) -> Option<AxumResponse> {
-    if !enabled()
-        || wire_format != WireFormat::AnthropicMessages
-        || !is_dedicated_web_search(body)
-    {
+    if wire_format != WireFormat::AnthropicMessages || !is_dedicated_web_search(body) {
+        return None;
+    }
+    let config = state.web_search_config()?;
+    if !config.is_enabled() {
         return None;
     }
     let started = Instant::now();
@@ -350,22 +307,27 @@ pub(crate) async fn maybe_short_circuit(
         .unwrap_or(DEFAULT_MODEL)
         .to_string();
     let query = extract_query(body);
-    let results = match search(&query).await {
+    let results = match search(&query, config, state.web_search_client()).await {
         Ok(results) => {
             record("ok", started);
-            Some(results)
+            results
         }
         Err(error) => {
             tracing::warn!(%error, "web search failed");
             record("error", started);
-            None
+            Vec::new()
         }
     };
-    let results = results.unwrap_or_default();
 
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if streaming {
-        Some(frame_stream(sse_stream(&model, &query, &results), WireFormat::AnthropicMessages).into_response())
+        Some(
+            frame_stream(
+                sse_stream(&model, &query, &results),
+                WireFormat::AnthropicMessages,
+            )
+            .into_response(),
+        )
     } else {
         Some(Json(aggregate(&model, &query, &results)).into_response())
     }

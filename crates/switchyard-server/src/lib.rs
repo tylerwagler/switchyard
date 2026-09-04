@@ -42,6 +42,7 @@ use switchyard_llm_client::{AuxiliaryOperation, ClientRouter, RunObservation, Ru
 use switchyard_protocol::{LlmClientError, Metadata, ModelId, Request, Usage};
 use switchyard_runner::{
     CallerAuthKind, DecisionTarget, ModelCapabilities, Route, RunOutput, Runner, RunnerError,
+    WebSearchConfig,
 };
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::task;
@@ -143,6 +144,7 @@ pub struct ServerState {
     stats: StatsAccumulator,
     routing_log: Option<SharedRoutingLog>,
     track_cache_eligibility: bool,
+    web_search: Option<WebSearchConfig>,
 }
 
 #[derive(Clone)]
@@ -214,6 +216,7 @@ impl ServerState {
             metrics.clone(),
             runner.models().map(|model| model.algorithm),
         );
+        let web_search = runner.web_search().cloned();
         Ok(Self {
             runner: Arc::new(runner),
             fallback_http,
@@ -221,6 +224,7 @@ impl ServerState {
             stats,
             routing_log: None,
             track_cache_eligibility: tracking_enabled_from_env(),
+            web_search,
         })
     }
 
@@ -233,6 +237,16 @@ impl ServerState {
     /// Returns the route model IDs served by the configured algorithms.
     pub fn models(&self) -> impl Iterator<Item = &str> {
         self.runner.models().map(|model| model.id.as_str())
+    }
+
+    /// Returns the configured hosted web-search settings, if enabled.
+    pub(crate) fn web_search_config(&self) -> Option<&WebSearchConfig> {
+        self.web_search.as_ref()
+    }
+
+    /// HTTP client used by the hosted-web-search bridge for SearXNG requests.
+    pub(crate) fn web_search_client(&self) -> &reqwest::Client {
+        &self.fallback_http
     }
 
     /// Returns the caller credential family used by `model`, if any.
