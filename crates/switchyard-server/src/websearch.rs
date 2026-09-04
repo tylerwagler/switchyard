@@ -70,6 +70,31 @@ fn parse_instruction(content: &str) -> Option<String> {
     None
 }
 
+/// Flattens an Anthropic `content` field to plain text so detection and query
+/// extraction handle both wire forms: the legacy bare string and the array of
+/// content blocks (`[{"type": "text", "text": "…"}, …]`) that real Claude Code
+/// clients send. Non-text blocks (thoughts, tool_use, …) are ignored.
+fn content_text(content: &Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    if let Some(blocks) = content.as_array() {
+        for block in blocks {
+            if block.get("type").and_then(Value::as_str) != Some("text") {
+                continue;
+            }
+            if let Some(text) = block.get("text").and_then(Value::as_str) {
+                if !out.is_empty() {
+                    out.push(' ');
+                }
+                out.push_str(text);
+            }
+        }
+    }
+    out
+}
+
 /// True for the dedicated web-search request shape we short-circuit: every
 /// declared tool is a web-search tool, or the single user message is the literal
 /// "Perform a web search for the query: …" instruction.
@@ -81,8 +106,8 @@ pub(crate) fn is_dedicated_web_search(body: &Value) -> bool {
     }
     let messages = body.get("messages").and_then(Value::as_array);
     if let Some([message]) = messages.map(|m| m.as_slice()) {
-        if let Some(content) = message.get("content").and_then(Value::as_str) {
-            return parse_instruction(content).is_some();
+        if let Some(content) = message.get("content") {
+            return parse_instruction(&content_text(content)).is_some();
         }
     }
     false
@@ -91,9 +116,9 @@ pub(crate) fn is_dedicated_web_search(body: &Value) -> bool {
 fn extract_query(body: &Value) -> String {
     if let Some(messages) = body.get("messages").and_then(Value::as_array) {
         for message in messages.iter().rev() {
-            let content = message.get("content");
-            if let Some(text) = content.and_then(Value::as_str) {
-                if let Some(query) = parse_instruction(text) {
+            if let Some(content) = message.get("content") {
+                let text = content_text(content);
+                if let Some(query) = parse_instruction(&text) {
                     return query;
                 }
                 if !text.trim().is_empty() {

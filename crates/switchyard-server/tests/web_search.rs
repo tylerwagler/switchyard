@@ -195,6 +195,20 @@ fn web_search_body() -> Value {
     })
 }
 
+/// Real Claude Code clients send `content` as an array of content blocks, not a
+/// bare string; the bridge must extract the query from `{"type": "text", …}`
+/// blocks, not hand the client an empty query (which SearXNG 400s).
+fn web_search_block_content_body() -> Value {
+    json!({
+        "model": "test/main",
+        "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 1}],
+        "tool_choice": {"type": "auto"},
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "Perform a web search for the query: biggest AI news this week"},
+        ]}],
+    })
+}
+
 fn sample_results() -> Vec<Value> {
     vec![
         json!({
@@ -253,6 +267,22 @@ async fn web_search_aggregate_returns_server_tool_use_blocks() -> TestResult {
     assert_eq!(content[0]["name"], "web_search");
     assert_eq!(content[0]["search_result"]["url"], "https://example.com/a");
     assert_eq!(content.last().unwrap()["type"], "text");
+    Ok(())
+}
+
+#[tokio::test]
+async fn web_search_accepts_array_content_blocks() -> TestResult {
+    let stub = SearxngStub::start(sample_results(), 0).await?;
+    let upstream = UpstreamApp::start().await?;
+    let app = started_router(&stub.base_url, &upstream.base_url, true).await?;
+
+    let response = send(&app, "POST", "/v1/messages", Some(web_search_block_content_body())).await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let body: Value = serde_json::from_slice(&response.bytes)?;
+    let content = body["content"].as_array().expect("content array");
+    assert_eq!(content[0]["type"], "server_tool_use");
+    // The query must come from the text block, not be empty.
+    assert_eq!(stub.recorded_queries().await, vec!["biggest AI news this week"]);
     Ok(())
 }
 
