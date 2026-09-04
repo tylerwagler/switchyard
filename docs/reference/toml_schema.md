@@ -267,6 +267,21 @@ instead. The stage table takes no `picker`: the classifier supplies that tier pe
 classifier cannot reach falls open to the efficient tier. Leaving out
 `classifier` is recommended: that judge runs ahead of the fall-open tier.
 
+## `[web_search]`
+
+Optional. Serves Claude Code's native server-side `web_search` tool requests
+from a self-hosted SearXNG instance instead of passing them to a model backend
+(vLLM rejects the tool declaration with a 422). Off unless `enabled = true`.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `enabled` | `false` | Set `true` to short-circuit dedicated web-search requests. |
+| `searxng_url` | `http://127.0.0.1:8080` | SearXNG base URL, validated with `--dry-run`. |
+| `max_results` | `6` | Results returned per query; range `1..=20`. |
+| `timeout_ms` | `15000` | Per-request timeout for SearXNG. |
+
+See [Hosted Web Search](/operations/hosted_web_search/).
+
 ## Validation Errors
 
 `--dry-run` prefixes configuration failures with

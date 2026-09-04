@@ -8,6 +8,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Hosted web search** — a `[web_search]` deployment section that serves
+  Claude Code's native server-side `web_search` tool requests from a self-hosted
+  SearXNG instance, synthesizing Anthropic `server_tool_use` web-search result
+  blocks (aggregate and SSE) instead of forwarding them to a model backend
+  (vLLM rejects the tool declaration with a 422). Off by default; see
+  [Hosted Web Search](/operations/hosted_web_search/).
+
 - **NeMo Relay native plugin** — a dynamically loaded integration that loads
   Switchyard's standard TOML deployment and executes its `switchyard-runner`-
   supported configured routes in process. Managed calls require NeMo Relay

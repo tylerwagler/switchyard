@@ -35,6 +35,7 @@ nav:
   - Operations:
       - Context-Window Handling: operations/context_window.md
       - Soak Testing: operations/soak_test.md
+      - Hosted Web Search: operations/hosted_web_search.md
   - Reference:
       - Server CLI Reference: cli_reference.md
       - TOML Schema: reference/toml_schema.md
