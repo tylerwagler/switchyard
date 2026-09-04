@@ -13,7 +13,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   SearXNG instance, synthesizing Anthropic `server_tool_use` web-search result
   blocks (aggregate and SSE) instead of forwarding them to a model backend
   (vLLM rejects the tool declaration with a 422). Off by default; see
-  [Hosted Web Search](/operations/hosted_web_search/).
+  [Hosted Web Search](/operations/hosted_web_search/). Retries transient
+  SearXNG engine failures with backoff and reports persistent outages plainly
+  rather than masking them as an empty result set.
 
 - **NeMo Relay native plugin** — a dynamically loaded integration that loads
   Switchyard's standard TOML deployment and executes its `switchyard-runner`-

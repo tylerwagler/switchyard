@@ -33,11 +33,12 @@ struct SearxngStub {
 }
 
 impl SearxngStub {
-    async fn start(results: Vec<Value>) -> TestResult<Self> {
+    async fn start(results: Vec<Value>, failures: u32) -> TestResult<Self> {
         let queries = Arc::new(Mutex::new(Vec::new()));
         let state = StubState {
             results: Arc::new(Mutex::new(results)),
             queries: Arc::clone(&queries),
+            failures_left: Arc::new(Mutex::new(failures)),
         };
         let app = Router::new()
             .route("/search", get(searxng_search))
@@ -69,18 +70,30 @@ impl Drop for SearxngStub {
 struct StubState {
     results: Arc<Mutex<Vec<Value>>>,
     queries: Arc<Mutex<Vec<String>>>,
+    failures_left: Arc<Mutex<u32>>,
 }
 
 async fn searxng_search(
     State(state): State<StubState>,
     Query(params): Query<HashMap<String, String>>,
-) -> Json<Value> {
+) -> (StatusCode, Json<Value>) {
     state
         .queries
         .lock()
         .unwrap()
         .push(params.get("q").cloned().unwrap_or_default());
-    Json(json!({ "results": *state.results.lock().unwrap() }))
+    let mut failures_left = state.failures_left.lock().unwrap();
+    if *failures_left > 0 {
+        *failures_left -= 1;
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "engine outage" })),
+        );
+    }
+    (
+        StatusCode::OK,
+        Json(json!({ "results": *state.results.lock().unwrap() })),
+    )
 }
 
 // --- upstream stub (for the feature-off passthrough check) --------------------
@@ -187,7 +200,7 @@ async fn started_router(searxng: &str, upstream: &str, enabled: bool) -> TestRes
 
 #[tokio::test]
 async fn web_search_aggregate_returns_server_tool_use_blocks() -> TestResult {
-    let stub = SearxngStub::start(sample_results()).await?;
+    let stub = SearxngStub::start(sample_results(), 0).await?;
     let upstream = UpstreamApp::start().await?;
     let app = started_router(&stub.base_url, &upstream.base_url, true).await?;
 
@@ -204,7 +217,7 @@ async fn web_search_aggregate_returns_server_tool_use_blocks() -> TestResult {
 
 #[tokio::test]
 async fn web_search_streaming_emits_anthropic_sse() -> TestResult {
-    let stub = SearxngStub::start(sample_results()).await?;
+    let stub = SearxngStub::start(sample_results(), 0).await?;
     let upstream = UpstreamApp::start().await?;
     let app = started_router(&stub.base_url, &upstream.base_url, true).await?;
 
@@ -222,7 +235,7 @@ async fn web_search_streaming_emits_anthropic_sse() -> TestResult {
 
 #[tokio::test]
 async fn web_search_forwards_the_query_to_searxng() -> TestResult {
-    let stub = SearxngStub::start(sample_results()).await?;
+    let stub = SearxngStub::start(sample_results(), 0).await?;
     let upstream = UpstreamApp::start().await?;
     let app = started_router(&stub.base_url, &upstream.base_url, true).await?;
 
@@ -235,7 +248,7 @@ async fn web_search_forwards_the_query_to_searxng() -> TestResult {
 
 #[tokio::test]
 async fn web_search_disabled_does_not_short_circuit() -> TestResult {
-    let stub = SearxngStub::start(sample_results()).await?;
+    let stub = SearxngStub::start(sample_results(), 0).await?;
     let upstream = UpstreamApp::start().await?;
     // No `[web_search]` section: the request must flow to the upstream backend.
     let app = started_router(&stub.base_url, &upstream.base_url, false).await?;
@@ -249,6 +262,43 @@ async fn web_search_disabled_does_not_short_circuit() -> TestResult {
         "feature disabled but bridge short-circuited: {text}"
     );
     assert_eq!(body["content"][0]["text"], "upstream reply");
+    Ok(())
+}
+
+#[tokio::test]
+async fn web_search_retries_transient_searxng_failures() -> TestResult {
+    // Two 400s (engines suspended), then a 200: the bridge's retry recovers it.
+    let stub = SearxngStub::start(sample_results(), 2).await?;
+    let upstream = UpstreamApp::start().await?;
+    let app = started_router(&stub.base_url, &upstream.base_url, true).await?;
+
+    let response = send(&app, "POST", "/v1/messages", Some(web_search_body())).await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let body: Value = serde_json::from_slice(&response.bytes)?;
+    assert_eq!(body["content"][0]["type"], "server_tool_use");
+    assert_eq!(body["content"][0]["search_result"]["url"], "https://example.com/a");
+    Ok(())
+}
+
+#[tokio::test]
+async fn web_search_outage_is_reported_not_masked_as_empty_results() -> TestResult {
+    // Unending failures: the bridge answers 200 with a text explanation naming
+    // the search error, never a bare "no results" and never a model call.
+    let stub = SearxngStub::start(sample_results(), u32::MAX).await?;
+    let upstream = UpstreamApp::start().await?;
+    let app = started_router(&stub.base_url, &upstream.base_url, true).await?;
+
+    let response = send(&app, "POST", "/v1/messages", Some(web_search_body())).await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let body: Value = serde_json::from_slice(&response.bytes)?;
+    let all = serde_json::to_string(&body)?;
+    assert!(!all.contains("server_tool_use"), "expected no results on outage: {all}");
+    let text = body["content"][0]["text"].as_str().unwrap_or("");
+    assert!(text.contains("temporarily unavailable"), "expected outage notice: {text}");
+    assert!(
+        text.contains("searxng returned 400"),
+        "expected the error detail in the notice: {text}"
+    );
     Ok(())
 }
 

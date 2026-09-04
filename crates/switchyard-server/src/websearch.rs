@@ -123,6 +123,13 @@ fn encode_query(value: &str) -> String {
     out
 }
 
+/// Extra attempts after the first before reporting a search failure. SearXNG's
+/// upstream engines suspend briefly (rate limits, CAPTCHAs); a retry usually
+/// succeeds without failing the request end-to-end.
+const SEARXNG_RETRIES: u32 = 2;
+/// Base backoff (ms) between retries, doubled each attempt.
+const RETRY_BASE_MS: u64 = 250;
+
 async fn search(
     query: &str,
     config: &WebSearchConfig,
@@ -133,6 +140,25 @@ async fn search(
         config.searxng_url(),
         encode_query(query)
     );
+    for attempt in 0..=SEARXNG_RETRIES {
+        match search_once(&url, config, client).await {
+            Ok(results) => return Ok(results),
+            Err(error) if attempt < SEARXNG_RETRIES => {
+                tracing::debug!(%error, attempt, websearch = true, "searxng request failed; retrying");
+                tokio::time::sleep(std::time::Duration::from_millis(RETRY_BASE_MS << attempt))
+                    .await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    unreachable!("search loop always returns");
+}
+
+async fn search_once(
+    url: &str,
+    config: &WebSearchConfig,
+    client: &reqwest::Client,
+) -> Result<Vec<Value>, String> {
     let response = client
         .get(url)
         .timeout(config.timeout())
@@ -210,8 +236,18 @@ fn message_id() -> String {
     format!("msg_{}", hex(&format!("{:?}", Instant::now())).chars().take(24).collect::<String>())
 }
 
-fn aggregate(model: &str, query: &str, results: &[Value]) -> Value {
-    let (content, _) = build_blocks(query, results);
+/// A text-only explanation shown instead of "no results" when SearXNG itself
+/// fails, so the client can tell a genuine empty result set from an outage.
+fn failure_text(error: &str) -> Vec<Value> {
+    vec![json!({
+        "type": "text",
+        "text": format!(
+            "Web search is temporarily unavailable: {error}. No results were returned."
+        ),
+    })]
+}
+
+fn aggregate_from_content(model: &str, content: &[Value]) -> Value {
     json!({
         "id": message_id(),
         "type": "message",
@@ -224,8 +260,7 @@ fn aggregate(model: &str, query: &str, results: &[Value]) -> Value {
     })
 }
 
-fn sse_stream(model: &str, query: &str, results: &[Value]) -> RawEventStream {
-    let (content, _) = build_blocks(query, results);
+fn sse_from_content(model: &str, content: &[Value]) -> RawEventStream {
     let events: Vec<Value> = {
         let mut events = vec![json!({
             "type": "message_start",
@@ -270,6 +305,16 @@ fn sse_stream(model: &str, query: &str, results: &[Value]) -> RawEventStream {
     Box::pin(stream) as RawEventStream
 }
 
+fn aggregate(model: &str, query: &str, results: &[Value]) -> Value {
+    let (content, _) = build_blocks(query, results);
+    aggregate_from_content(model, &content)
+}
+
+fn sse_stream(model: &str, query: &str, results: &[Value]) -> RawEventStream {
+    let (content, _) = build_blocks(query, results);
+    sse_from_content(model, &content)
+}
+
 // --- metrics ----------------------------------------------------------------
 
 fn record(outcome: &str, started: Instant) {
@@ -307,15 +352,15 @@ pub(crate) async fn maybe_short_circuit(
         .unwrap_or(DEFAULT_MODEL)
         .to_string();
     let query = extract_query(body);
-    let results = match search(&query, config, state.web_search_client()).await {
+    let content = match search(&query, config, state.web_search_client()).await {
         Ok(results) => {
             record("ok", started);
-            results
+            build_blocks(&query, &results).0
         }
         Err(error) => {
             tracing::warn!(%error, "web search failed");
             record("error", started);
-            Vec::new()
+            failure_text(&error)
         }
     };
 
@@ -323,13 +368,13 @@ pub(crate) async fn maybe_short_circuit(
     if streaming {
         Some(
             frame_stream(
-                sse_stream(&model, &query, &results),
+                sse_from_content(&model, &content),
                 WireFormat::AnthropicMessages,
             )
             .into_response(),
         )
     } else {
-        Some(Json(aggregate(&model, &query, &results)).into_response())
+        Some(Json(aggregate_from_content(&model, &content)).into_response())
     }
 }
 
