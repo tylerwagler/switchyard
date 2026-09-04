@@ -59,6 +59,59 @@ pub(crate) struct DeploymentConfig {
     llm_clients: BTreeMap<String, LlmClientConfig>,
     targets: BTreeMap<String, TargetConfig>,
     routes: BTreeMap<String, RouteConfig>,
+    #[serde(default)]
+    web_search: Option<WebSearchConfig>,
+}
+
+/// Opt-in hosted web search: serves Claude Code's server-side `web_search` tool
+/// (dedicated `/v1/messages` requests declaring `web_search` / `web_search_20250305`)
+/// via SearXNG instead of Anthropic's hosted backend. Absent or `enabled = false`
+/// disables it; the bridge never engages without explicit opt-in.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WebSearchConfig {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default = "default_web_search_url")]
+    searxng_url: String,
+    #[serde(default = "default_web_search_max_results")]
+    max_results: usize,
+    #[serde(default = "default_web_search_timeout_ms")]
+    timeout_ms: u64,
+}
+
+impl WebSearchConfig {
+    /// True when the bridge should engage requests that declare `web_search`.
+    pub const fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// SearXNG base URL the bridge queries.
+    pub fn searxng_url(&self) -> &str {
+        &self.searxng_url
+    }
+
+    /// Maximum number of results returned per query.
+    pub const fn max_results(&self) -> usize {
+        self.max_results
+    }
+
+    /// Timeout for each SearXNG request.
+    pub const fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.timeout_ms)
+    }
+}
+
+fn default_web_search_url() -> String {
+    "http://127.0.0.1:8080".to_string()
+}
+
+const fn default_web_search_max_results() -> usize {
+    6
+}
+
+const fn default_web_search_timeout_ms() -> u64 {
+    15_000
 }
 
 #[derive(Debug)]
@@ -210,7 +263,25 @@ impl DeploymentConfig {
             );
             routes.push((config.id.clone(), route));
         }
-        let runner = Runner::new(routes).with_fallback_url(fallback_base_url);
+        let web_search = self.web_search;
+        if let Some(config) = web_search.as_ref() {
+            if config.is_enabled() {
+                reqwest::Url::parse(config.searxng_url()).map_err(|error| {
+                    RunnerError::configuration(format!(
+                        "web_search.searxng_url is not a valid URL: {error}"
+                    ))
+                })?;
+                let max = config.max_results();
+                if max == 0 || max > 20 {
+                    return Err(RunnerError::configuration(format!(
+                        "web_search.max_results must be between 1 and 20, got {max}"
+                    )));
+                }
+            }
+        }
+        let runner = Runner::new(routes)
+            .with_fallback_url(fallback_base_url)
+            .with_web_search(web_search);
         Ok(runner)
     }
 
@@ -1499,5 +1570,81 @@ advisor_target = "advisor"
             "advisor_target = \"advisor\"\nmax_reviews = 0",
         );
         assert!(error_message(&invalid).contains("max_reviews must be at least 1"));
+    }
+}
+
+#[cfg(test)]
+mod web_search_config_tests {
+    use super::*;
+
+    const BASE: &str = r#"
+schema_version = 1
+
+[llm_clients.stub]
+format = "anthropic_messages"
+base_url = "https://example.test"
+
+[targets.t]
+id = "switchyard/websearch-test"
+llm_client = "stub"
+
+[routes.r]
+id = "switchyard/websearch-test"
+type = "passthrough"
+target = "t"
+"#;
+
+    fn error_message(toml: &str) -> String {
+        match runner_from_toml(toml) {
+            Ok(_) => panic!("expected configuration error, config parsed"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn web_search_is_off_by_default() {
+        let runner = runner_from_toml(BASE).expect("base config parses");
+        assert!(runner.web_search().is_none());
+    }
+
+    #[test]
+    fn web_search_parses_with_defaults() {
+        let toml = format!("{BASE}\n[web_search]\nenabled = true\n");
+        let runner = runner_from_toml(&toml).expect("web_search parses");
+        let config = runner.web_search().expect("web_search configured");
+        assert!(config.is_enabled());
+        assert_eq!(config.searxng_url(), "http://127.0.0.1:8080");
+        assert_eq!(config.max_results(), 6);
+        assert_eq!(config.timeout(), std::time::Duration::from_millis(15_000));
+    }
+
+    #[test]
+    fn web_search_honors_explicit_values() {
+        let toml = format!(
+            "{BASE}\n[web_search]\nenabled = true\nsearxng_url = \"http://search.lan:8888\"\nmax_results = 5\ntimeout_ms = 2000\n"
+        );
+        let runner = runner_from_toml(&toml).expect("web_search parses");
+        let config = runner.web_search().expect("web_search configured");
+        assert_eq!(config.searxng_url(), "http://search.lan:8888");
+        assert_eq!(config.max_results(), 5);
+        assert_eq!(config.timeout(), std::time::Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn web_search_rejects_malformed_url_when_enabled() {
+        let toml = format!("{BASE}\n[web_search]\nenabled = true\nsearxng_url = \"not a url\"\n");
+        assert!(error_message(&toml).contains("searxng_url is not a valid URL"));
+    }
+
+    #[test]
+    fn web_search_ignores_malformed_url_when_disabled() {
+        let toml = format!("{BASE}\n[web_search]\nsearxng_url = \"not a url\"\n");
+        runner_from_toml(&toml).expect("disabled web_search skips URL validation");
+    }
+
+    #[test]
+    fn web_search_rejects_out_of_range_max_results() {
+        let toml = format!("{BASE}\n[web_search]\nenabled = true\nmax_results = 21\n");
+        assert!(error_message(&toml).contains("max_results must be between 1 and 20"));
     }
 }

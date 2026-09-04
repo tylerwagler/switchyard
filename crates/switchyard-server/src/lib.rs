@@ -12,6 +12,7 @@ mod shutdown;
 mod sse;
 mod stats;
 mod usage_metrics;
+mod websearch;
 
 use std::collections::BTreeMap;
 use std::error::Error;
@@ -996,6 +997,12 @@ async fn handle_llm_request(
     routing_log_context: Option<routing_log::RoutingLogContext>,
 ) -> Response {
     let cache_probe = state.track_cache_eligibility.then(|| prefix_probe(&body));
+    // Hosted web search: dedicated `web_search` requests are served here, before
+    // routing or any model call (server-side search tools carry no input_schema,
+    // which vLLM rejects with a 422). All other traffic continues as normal.
+    if let Some(response) = websearch::maybe_short_circuit(&state, wire_format, &body).await {
+        return response;
+    }
     let (route, request) = match resolve_route(&state, metadata, body, wire_format) {
         Ok(resolved) => resolved,
         Err(response) => return response,

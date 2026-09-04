@@ -11,12 +11,13 @@ use serde_json::Value;
 use switchyard_protocol::{ModelId, WireFormat};
 
 use crate::config;
-use crate::{ModelCapabilities, Route, RunnerError};
+use crate::{ModelCapabilities, Route, RunnerError, WebSearchConfig};
 
 /// Immutable named route table.
 pub struct Runner {
     routes: Vec<(ModelId, Route)>,
     fallback_base_url: Option<String>,
+    web_search: Option<WebSearchConfig>,
 }
 
 /// Borrowed model metadata returned while listing routes.
@@ -61,12 +62,23 @@ impl Runner {
         Self {
             routes,
             fallback_base_url: None,
+            web_search: None,
         }
     }
 
     pub(crate) fn with_fallback_url(mut self, fallback_base_url: Option<String>) -> Self {
         self.fallback_base_url = fallback_base_url;
         self
+    }
+
+    pub(crate) fn with_web_search(mut self, web_search: Option<WebSearchConfig>) -> Self {
+        self.web_search = web_search;
+        self
+    }
+
+    /// Returns the configured hosted web-search settings, if any.
+    pub fn web_search(&self) -> Option<&WebSearchConfig> {
+        self.web_search.as_ref()
     }
 
     /// Returns the route registered for a model.
