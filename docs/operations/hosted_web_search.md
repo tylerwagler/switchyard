@@ -16,17 +16,39 @@ works end to end.
 ## Configuration
 
 ```toml
+[search.main]                       # named search endpoint (typically SearXNG)
+base_url = "http://127.0.0.1:8080"
+timeout_ms = 15000
+max_results = 20
+
+[rerank.qwen3-vl-rerank]            # optional named rerank backend
+base_url = "http://host:8002/v1"
+model = "qwen3-vl-rerank"
+
 [web_search]
-enabled = true                 # off unless enabled (also the default when absent)
-searxng_url = "http://127.0.0.1:8080"   # SearXNG base URL
-max_results = 6                # results returned per query (1-20)
-timeout_ms = 15000             # per-request timeout
+enabled = true
+search = "main"                     # reference the named endpoint
+rerank = "qwen3-vl-rerank"          # re-rank candidates before returning
+max_results = 6                     # results returned per query (1-20)
 ```
 
-The section lives in the deployment's `routes.toml` alongside `[llm_clients]`,
+The sections live in the deployment's `routes.toml` alongside `[llm_clients]`,
 `[targets]`, and `[routes]`. An absent section or `enabled = false` leaves every
-request untouched. When enabled, `--dry-run` validates the URL and the
-`max_results` range at load time.
+request untouched. When enabled, `--dry-run` validates URLs and the
+`max_results` range at load time. `search` references a `[search.*]` endpoint;
+the legacy inline `searxng_url` key remains a compatibility alias (mutually
+exclusive with `search`).
+
+## Re-ranking
+
+When `web_search.rerank` names a `[rerank.*]` backend, the bridge fetches a
+surplus of raw candidates (3× `max_results`) and re-ranks them against the query
+via the Cohere-shaped `POST /v1/rerank` endpoint (query vs `title\nsnippet`),
+returning the top `max_results` best-first. The re-ranker counters the noisy
+ordering scraped engines often produce. It is **fail-open**: if the rerank
+backend is unreachable or errors, results are returned in raw engine order and
+`switchyard.websearch_rerank_errors` increments — a reranker outage never fails
+a search.
 
 Only requests whose *every* declared tool is a web-search tool (or that carry
 the single-message "Perform a web search for the query: …" instruction) are
@@ -57,6 +79,14 @@ The bridge calls SearXNG directly from the Switchyard process. It uses the same
 client and proxy behavior as the rest of the server, so a loopback SearXNG
 (e.g. `http://127.0.0.1:8080`) works out of the box where `NO_PROXY` covers
 localhost.
+
+## Serving non-chat backends
+
+The named backends are also served by the gateway itself: `POST /v1/embeddings`
+and `POST /v1/rerank` (default = first configured backend, or a `/{name}` path
+segment) relay to the `[embeddings.*]` / `[rerank.*]` backends. `GET /v1/models`
+advertises a truthful capability listing — chat routes plus `kind: embeddings` /
+`kind: rerank` / `kind: search` entries.
 
 ## Relationship to MCP search
 

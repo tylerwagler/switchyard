@@ -270,15 +270,58 @@ classifier cannot reach falls open to the efficient tier. Leaving out
 ## `[web_search]`
 
 Optional. Serves Claude Code's native server-side `web_search` tool requests
-from a self-hosted SearXNG instance instead of passing them to a model backend
-(vLLM rejects the tool declaration with a 422). Off unless `enabled = true`.
+from a named `[search.*]` endpoint (typically SearXNG) instead of passing them
+to a model backend (vLLM rejects the tool declaration with a 422). Off unless
+`enabled = true`. When `rerank` names a `[rerank.*]` backend, a surplus of raw
+candidates is fetched and re-ranked before the top `max_results` are returned.
 
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Set `true` to short-circuit dedicated web-search requests. |
-| `searxng_url` | `http://127.0.0.1:8080` | SearXNG base URL, validated with `--dry-run`. |
+| `search` | — | Name of a `[search.<name>]` endpoint to query. |
+| `rerank` | — | Name of a `[rerank.<name>]` backend to re-rank candidates. |
 | `max_results` | `6` | Results returned per query; range `1..=20`. |
-| `timeout_ms` | `15000` | Per-request timeout for SearXNG. |
+| `timeout_ms` | `15000` | Inline timeout; applies when not using a named `search`. |
+| `searxng_url` | `http://127.0.0.1:8080` | Compatibility alias for an inline SearXNG endpoint; mutually exclusive with `search`. |
+
+When `search` is omitted, `searxng_url` (or the default) is used as an implicit
+inline endpoint.
+
+## `[search.<name>]`
+
+Optional. A named search endpoint, typically a self-hosted SearXNG instance.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `base_url` | — | Base URL of the search endpoint (required). |
+| `timeout_ms` | `15000` | Per-request timeout. |
+| `max_results` | `20` | Cap on raw candidates a consumer may request (feed for re-ranking). |
+
+## `[rerank.<name>]`
+
+Optional. A named rerank backend exposing the Cohere-shaped `POST /v1/rerank`
+API (e.g. vLLM). Served by the gateway at `/v1/rerank` (default or `/{name}`)
+and usable from `web_search.rerank`.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `base_url` | — | Backend base URL (required), e.g. `http://host:8002/v1`. |
+| `model` | — | Model id the backend serves (required). |
+| `default_top_n` | `6` | top-n applied when a consumer does not specify one. |
+
+## `[embeddings.<name>]`
+
+Optional. A named embeddings backend (`POST /v1/embeddings`, e.g. vLLM), served
+by the gateway at `/v1/embeddings` (default or `/{name}`).
+
+| Key | Default | Meaning |
+|---|---|---|
+| `base_url` | — | Backend base URL (required), e.g. `http://host:8001/v1`. |
+| `model` | — | Model id the backend serves (required). |
+| `api_key_env` | — | Env var holding the API key, when the backend requires one. |
+
+Serving: `GET /v1/models` advertises a truthful capability listing — chat
+routes plus `kind: embeddings` / `kind: rerank` / `kind: search` entries.
 
 See [Hosted Web Search](/operations/hosted_web_search/).
 
