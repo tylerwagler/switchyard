@@ -17,6 +17,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   SearXNG engine failures with backoff and reports persistent outages plainly
   rather than masking them as an empty result set.
 
+- **Named non-chat backends** — new `[search.*]` and `[rerank.*]` deployment
+  sections (searxng-style endpoints and Cohere-shaped `/v1/rerank` backends,
+  respectively). `[web_search]` references them by name (`search = "…"`,
+  `rerank = "…"`); when a rerank backend is set, the bridge fetches a surplus of
+  candidates and re-ranks them before returning `max_results`, fail-open on
+  reranker errors. The inline `searxng_url` key remains a compatibility alias.
+
 - **NeMo Relay native plugin** — a dynamically loaded integration that loads
   Switchyard's standard TOML deployment and executes its `switchyard-runner`-
   supported configured routes in process. Managed calls require NeMo Relay

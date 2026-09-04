@@ -41,8 +41,8 @@ use serde_json::{Value, json};
 use switchyard_llm_client::{AuxiliaryOperation, ClientRouter, RunObservation, RunObserver};
 use switchyard_protocol::{LlmClientError, Metadata, ModelId, Request, Usage};
 use switchyard_runner::{
-    CallerAuthKind, DecisionTarget, ModelCapabilities, Route, RunOutput, Runner, RunnerError,
-    WebSearchConfig,
+    CallerAuthKind, DecisionTarget, ModelCapabilities, ResolvedWebSearch, Route, RunOutput, Runner,
+    RunnerError,
 };
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::task;
@@ -144,7 +144,7 @@ pub struct ServerState {
     stats: StatsAccumulator,
     routing_log: Option<SharedRoutingLog>,
     track_cache_eligibility: bool,
-    web_search: Option<WebSearchConfig>,
+    web_search: Option<ResolvedWebSearch>,
 }
 
 #[derive(Clone)]
@@ -239,8 +239,8 @@ impl ServerState {
         self.runner.models().map(|model| model.id.as_str())
     }
 
-    /// Returns the configured hosted web-search settings, if enabled.
-    pub(crate) fn web_search_config(&self) -> Option<&WebSearchConfig> {
+    /// Returns the resolved hosted web-search settings, if enabled.
+    pub(crate) fn web_search_config(&self) -> Option<&ResolvedWebSearch> {
         self.web_search.as_ref()
     }
 

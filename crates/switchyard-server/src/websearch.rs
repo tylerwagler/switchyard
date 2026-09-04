@@ -25,7 +25,7 @@ use axum::Json;
 use axum::response::{IntoResponse, Response as AxumResponse};
 use opentelemetry::{KeyValue, global};
 use serde_json::{Value, json};
-use switchyard_runner::WebSearchConfig;
+use switchyard_runner::{ResolvedRerank, ResolvedWebSearch};
 use switchyard_translation::{LlmStreamError, RawEventStream, WireFormat};
 
 use crate::ServerState;
@@ -129,22 +129,35 @@ fn encode_query(value: &str) -> String {
 const SEARXNG_RETRIES: u32 = 2;
 /// Base backoff (ms) between retries, doubled each attempt.
 const RETRY_BASE_MS: u64 = 250;
+/// Raw candidates fetched per returned result when a rerank backend is configured,
+/// so the reranker (not engine ordering) decides which `max_results` win.
+const CANDIDATES_PER_RESULT: usize = 3;
 
 async fn search(
     query: &str,
-    config: &WebSearchConfig,
+    settings: &ResolvedWebSearch,
     client: &reqwest::Client,
 ) -> Result<Vec<Value>, String> {
+    // With a reranker, fetch a surplus of raw candidates and let it pick; without
+    // one, ask the engine for exactly what we return.
+    let requested = if settings.rerank.is_some() {
+        settings
+            .max_results
+            .saturating_mul(CANDIDATES_PER_RESULT)
+            .clamp(1, 20)
+    } else {
+        settings.max_results.max(1)
+    };
     let url = format!(
         "{}/search?q={}&format=json&pageno=1",
-        config.searxng_url(),
+        settings.search_url,
         encode_query(query)
     );
     for attempt in 0..=SEARXNG_RETRIES {
-        match search_once(&url, config, client).await {
+        match search_once(&url, settings.timeout, requested, client).await {
             Ok(results) => return Ok(results),
             Err(error) if attempt < SEARXNG_RETRIES => {
-                tracing::debug!(%error, attempt, websearch = true, "searxng request failed; retrying");
+                tracing::debug!(%error, attempt, websearch = true, "search request failed; retrying");
                 tokio::time::sleep(std::time::Duration::from_millis(RETRY_BASE_MS << attempt))
                     .await;
             }
@@ -156,27 +169,28 @@ async fn search(
 
 async fn search_once(
     url: &str,
-    config: &WebSearchConfig,
+    timeout: std::time::Duration,
+    take: usize,
     client: &reqwest::Client,
 ) -> Result<Vec<Value>, String> {
     let response = client
         .get(url)
-        .timeout(config.timeout())
+        .timeout(timeout)
         .header("Accept", "application/json")
         .header("User-Agent", "switchyard-websearch/1.0")
         .send()
         .await
-        .map_err(|error| format!("searxng request failed: {error}"))?;
+        .map_err(|error| format!("search request failed: {error}"))?;
     if !response.status().is_success() {
-        return Err(format!("searxng returned {}", response.status()));
+        return Err(format!("search returned {}", response.status()));
     }
     let body: Value = response
         .json()
         .await
-        .map_err(|error| format!("searxng body parse failed: {error}"))?;
+        .map_err(|error| format!("search body parse failed: {error}"))?;
     let mut out = Vec::new();
     if let Some(results) = body.get("results").and_then(Value::as_array) {
-        for item in results.iter().take(config.max_results()) {
+        for item in results.iter().take(take) {
             let url = item.get("url").and_then(Value::as_str).unwrap_or("");
             if url.is_empty() {
                 continue;
@@ -190,6 +204,89 @@ async fn search_once(
         }
     }
     Ok(out)
+}
+
+/// Re-ranks `candidates` against `query` via the named Cohere-shaped `/v1/rerank`
+/// backend, returning them best-first, or `None` to signal "use raw order" on any
+/// failure (the bridge is fail-open: a reranker outage never fails the search).
+async fn rerank(
+    query: &str,
+    candidates: &[Value],
+    rerank: &ResolvedRerank,
+    client: &reqwest::Client,
+) -> Option<Vec<Value>> {
+    let documents: Vec<String> = candidates
+        .iter()
+        .map(|candidate| {
+            let title = candidate["title"].as_str().unwrap_or("");
+            let content = candidate["content"].as_str().unwrap_or("");
+            if title.is_empty() {
+                content.to_string()
+            } else {
+                format!("{title}\n{content}")
+            }
+        })
+        .collect();
+
+    let payload = json!({ "model": rerank.model, "query": query, "documents": documents });
+    let response = match client
+        .post(format!("{}/rerank", rerank.base_url.trim_end_matches('/')))
+        .json(&payload)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            record_rerank_error();
+            tracing::warn!(%error, "web search rerank request failed; using raw order");
+            return None;
+        }
+    };
+    if !response.status().is_success() {
+        record_rerank_error();
+        tracing::warn!(
+            status = %response.status(),
+            "web search rerank returned an error; using raw order"
+        );
+        return None;
+    }
+    let body: Value = match response.json().await {
+        Ok(body) => body,
+        Err(error) => {
+            record_rerank_error();
+            tracing::warn!(%error, "web search rerank body parse failed; using raw order");
+            return None;
+        }
+    };
+    let Some(results) = body.get("results").and_then(Value::as_array) else {
+        record_rerank_error();
+        tracing::warn!("web search rerank response had no results; using raw order");
+        return None;
+    };
+
+    let mut scored: Vec<(usize, f64)> = results
+        .iter()
+        .filter_map(|entry| {
+            let index = entry.get("index")?.as_u64()? as usize;
+            let score = entry.get("relevance_score")?.as_f64()?;
+            Some((index, score))
+        })
+        .collect();
+    // Descending relevance; stable sort keeps original order on ties.
+    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let ranked: Vec<Value> = scored
+        .iter()
+        .filter_map(|(index, _)| candidates.get(*index).cloned())
+        .collect();
+    if ranked.is_empty() { None } else { Some(ranked) }
+}
+
+fn record_rerank_error() {
+    global::meter("switchyard")
+        .u64_counter("switchyard.websearch_rerank_errors")
+        .build()
+        .add(1, &[]);
 }
 
 // --- response synthesis ------------------------------------------------------
@@ -341,10 +438,8 @@ pub(crate) async fn maybe_short_circuit(
     if wire_format != WireFormat::AnthropicMessages || !is_dedicated_web_search(body) {
         return None;
     }
-    let config = state.web_search_config()?;
-    if !config.is_enabled() {
-        return None;
-    }
+    // `state.web_search_config()` is only present when web search is resolved+enabled.
+    let settings = state.web_search_config()?;
     let started = Instant::now();
     let model = body
         .get("model")
@@ -352,10 +447,26 @@ pub(crate) async fn maybe_short_circuit(
         .unwrap_or(DEFAULT_MODEL)
         .to_string();
     let query = extract_query(body);
-    let content = match search(&query, config, state.web_search_client()).await {
-        Ok(results) => {
+    let content = match search(&query, settings, state.web_search_client()).await {
+        Ok(candidates) => {
+            // Re-rank the surplus of raw candidates when a backend is configured,
+            // falling back to raw engine order on any rerank failure (fail-open).
+            let ranked = match settings.rerank.as_ref() {
+                Some(backend) => {
+                    match rerank(&query, &candidates, backend, state.web_search_client()).await {
+                        Some(ranked) => {
+                            ranked.into_iter().take(settings.max_results).collect::<Vec<_>>()
+                        }
+                        None => candidates
+                            .into_iter()
+                            .take(settings.max_results)
+                            .collect::<Vec<_>>(),
+                    }
+                }
+                None => candidates.into_iter().take(settings.max_results).collect::<Vec<_>>(),
+            };
             record("ok", started);
-            build_blocks(&query, &results).0
+            build_blocks(&query, &ranked).0
         }
         Err(error) => {
             tracing::warn!(%error, "web search failed");

@@ -145,6 +145,47 @@ target = "main"
     )
 }
 
+/// Deployment that routes web search through a named `[search.main]` endpoint
+/// and a named `[rerank.r]` backend, so the bridge re-ranks candidates.
+fn deployment_with_rerank(
+    upstream: &str,
+    search: &str,
+    rerank_url: &str,
+    max_results: usize,
+) -> String {
+    format!(
+        r#"
+schema_version = 1
+
+[llm_clients.upstream]
+format = "anthropic_messages"
+base_url = "{upstream}"
+
+[targets.main]
+id = "test/main"
+llm_client = "upstream"
+
+[routes.main]
+id = "test/main"
+type = "passthrough"
+target = "main"
+
+[search.main]
+base_url = "{search}"
+
+[rerank.r]
+base_url = "{rerank_url}"
+model = "stub-rerank"
+
+[web_search]
+enabled = true
+search = "main"
+rerank = "r"
+max_results = {max_results}
+"#
+    )
+}
+
 fn web_search_body() -> Value {
     json!({
         "model": "test/main",
@@ -296,10 +337,133 @@ async fn web_search_outage_is_reported_not_masked_as_empty_results() -> TestResu
     let text = body["content"][0]["text"].as_str().unwrap_or("");
     assert!(text.contains("temporarily unavailable"), "expected outage notice: {text}");
     assert!(
-        text.contains("searxng returned 400"),
+        text.contains("search returned 400"),
         "expected the error detail in the notice: {text}"
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn web_search_reranks_candidates_best_first() -> TestResult {
+    let search = SearxngStub::start(
+        vec![
+            json!({"url":"https://example.com/a","title":"A","content":"unrelated filler"}),
+            json!({"url":"https://example.com/b","title":"B","content":"AI model news today"}),
+            json!({"url":"https://example.com/c","title":"C","content":"another on-topic item"}),
+        ],
+        0,
+    )
+    .await?;
+    // Rerank favors index 1 (B) > 2 (C) > 0 (A).
+    let rerank = RerankStub::start(vec![(0, 0.1), (1, 0.9), (2, 0.5)], false).await?;
+    let upstream = UpstreamApp::start().await?;
+    let state = ServerState::from_runner(Runner::from_toml(&deployment_with_rerank(
+        &upstream.base_url,
+        &search.base_url,
+        &rerank.base_url,
+        3,
+    ))?)?;
+    let app = build_switchyard_router(state);
+
+    let response = send(&app, "POST", "/v1/messages", Some(web_search_body())).await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let body: Value = serde_json::from_slice(&response.bytes)?;
+    let urls: Vec<&str> = body["content"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|b| b.get("search_result").and_then(|r| r["url"].as_str()))
+        .collect();
+    assert_eq!(urls, vec!["https://example.com/b", "https://example.com/c", "https://example.com/a"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn web_search_falls_back_to_raw_order_when_reranker_down() -> TestResult {
+    let search = SearxngStub::start(
+        vec![
+            json!({"url":"https://example.com/a","title":"A","content":"a"}),
+            json!({"url":"https://example.com/b","title":"B","content":"b"}),
+        ],
+        0,
+    )
+    .await?;
+    let rerank = RerankStub::start(vec![], true).await?; // always 500
+    let upstream = UpstreamApp::start().await?;
+    let state = ServerState::from_runner(Runner::from_toml(&deployment_with_rerank(
+        &upstream.base_url,
+        &search.base_url,
+        &rerank.base_url,
+        2,
+    ))?)?;
+    let app = build_switchyard_router(state);
+
+    let response = send(&app, "POST", "/v1/messages", Some(web_search_body())).await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let body: Value = serde_json::from_slice(&response.bytes)?;
+    assert_eq!(body["content"][0]["search_result"]["url"], "https://example.com/a");
+    assert_eq!(body["content"][1]["search_result"]["url"], "https://example.com/b");
+    Ok(())
+}
+
+// --- rerank stub -----------------------------------------------------------------
+
+struct RerankStub {
+    base_url: String,
+    task: tokio::task::JoinHandle<()>,
+}
+
+#[derive(Clone)]
+struct RerankState {
+    scores: Arc<Mutex<Vec<(usize, f64)>>>,
+    error: bool,
+}
+
+impl RerankStub {
+    async fn start(scores: Vec<(usize, f64)>, error: bool) -> TestResult<Self> {
+        let state = RerankState {
+            scores: Arc::new(Mutex::new(scores)),
+            error,
+        };
+        let app = Router::new()
+            .route("/rerank", post(rerank_handler))
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let task = tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+        Ok(Self {
+            base_url: format!("http://{addr}"),
+            task,
+        })
+    }
+}
+
+impl Drop for RerankStub {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+async fn rerank_handler(
+    State(state): State<RerankState>,
+    Json(_body): Json<Value>,
+) -> (StatusCode, Json<Value>) {
+    if state.error {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "reranker unavailable" })),
+        );
+    }
+    let results: Vec<Value> = state
+        .scores
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(index, score)| json!({ "index": index, "relevance_score": score }))
+        .collect();
+    (StatusCode::OK, Json(json!({ "results": results })))
 }
 
 // --- minimal upstream -----------------------------------------------------------------

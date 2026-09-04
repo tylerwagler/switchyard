@@ -61,23 +61,37 @@ pub(crate) struct DeploymentConfig {
     routes: BTreeMap<String, RouteConfig>,
     #[serde(default)]
     web_search: Option<WebSearchConfig>,
+    #[serde(default)]
+    search: BTreeMap<String, SearchConfig>,
+    #[serde(default)]
+    rerank: BTreeMap<String, RerankConfig>,
 }
 
 /// Opt-in hosted web search: serves Claude Code's server-side `web_search` tool
 /// (dedicated `/v1/messages` requests declaring `web_search` / `web_search_20250305`)
-/// via SearXNG instead of Anthropic's hosted backend. Absent or `enabled = false`
-/// disables it; the bridge never engages without explicit opt-in.
+/// via a named `[search.*]` endpoint (or the inline `searxng_url` alias) instead of
+/// Anthropic's hosted backend, optionally re-ranking candidates through a named
+/// `[rerank.*]` backend. Absent or `enabled = false` disables it; the bridge never
+/// engages without explicit opt-in.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WebSearchConfig {
     #[serde(default)]
     enabled: bool,
-    #[serde(default = "default_web_search_url")]
-    searxng_url: String,
-    #[serde(default = "default_web_search_max_results")]
-    max_results: usize,
-    #[serde(default = "default_web_search_timeout_ms")]
-    timeout_ms: u64,
+    /// Named `[search.<name>]` endpoint. Mutually exclusive with `searxng_url`.
+    #[serde(default)]
+    search: Option<String>,
+    /// Named `[rerank.<name>]` backend used to re-rank candidates before returning.
+    #[serde(default)]
+    rerank: Option<String>,
+    /// Inline SearXNG base URL (compatibility alias; superseded by `search`).
+    #[serde(default)]
+    searxng_url: Option<String>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+    /// Results returned to the client (1-20).
+    #[serde(default)]
+    max_results: Option<usize>,
 }
 
 impl WebSearchConfig {
@@ -86,20 +100,72 @@ impl WebSearchConfig {
         self.enabled
     }
 
-    /// SearXNG base URL the bridge queries.
-    pub fn searxng_url(&self) -> &str {
-        &self.searxng_url
+    /// Named `[search.*]` endpoint, if configured.
+    pub fn search(&self) -> Option<&str> {
+        self.search.as_deref()
     }
 
-    /// Maximum number of results returned per query.
-    pub const fn max_results(&self) -> usize {
+    /// Named `[rerank.*]` backend, if configured.
+    pub fn rerank(&self) -> Option<&str> {
+        self.rerank.as_deref()
+    }
+
+    /// Inline SearXNG URL override, if configured.
+    pub fn searxng_url(&self) -> Option<&str> {
+        self.searxng_url.as_deref()
+    }
+
+    pub const fn timeout_ms(&self) -> Option<u64> {
+        self.timeout_ms
+    }
+
+    pub const fn max_results(&self) -> Option<usize> {
         self.max_results
     }
+}
 
-    /// Timeout for each SearXNG request.
-    pub const fn timeout(&self) -> std::time::Duration {
-        std::time::Duration::from_millis(self.timeout_ms)
-    }
+/// A named search endpoint (for example a SearXNG instance). Field names mirror
+/// the historical inline `[web_search]` keys for a predictable mental model.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchConfig {
+    #[serde(default = "default_web_search_url")]
+    pub base_url: String,
+    #[serde(default = "default_web_search_timeout_ms")]
+    pub timeout_ms: u64,
+    /// Cap on raw candidates a consumer may request (feed for reranking).
+    #[serde(default = "default_search_max_results")]
+    pub max_results: usize,
+}
+
+/// A named rerank backend exposing Cohere-shaped `POST /v1/rerank`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RerankConfig {
+    pub base_url: String,
+    pub model: String,
+    /// Default top_n applied when a consumer does not specify one.
+    #[serde(default = "default_rerank_top_n")]
+    pub default_top_n: usize,
+}
+
+/// Web-search settings after name resolution against `[search.*]` / `[rerank.*]`.
+/// What the server surface consumes; built once at config load.
+#[derive(Debug, Clone)]
+pub struct ResolvedWebSearch {
+    pub enabled: bool,
+    pub search_url: String,
+    pub timeout: std::time::Duration,
+    /// Results returned to the client.
+    pub max_results: usize,
+    pub rerank: Option<ResolvedRerank>,
+}
+
+/// A rerank backend resolved from a `[rerank.<name>]` declaration.
+#[derive(Debug, Clone)]
+pub struct ResolvedRerank {
+    pub base_url: String,
+    pub model: String,
 }
 
 fn default_web_search_url() -> String {
@@ -112,6 +178,83 @@ const fn default_web_search_max_results() -> usize {
 
 const fn default_web_search_timeout_ms() -> u64 {
     15_000
+}
+
+const fn default_search_max_results() -> usize {
+    20
+}
+
+const fn default_rerank_top_n() -> usize {
+    6
+}
+
+/// Resolves `[web_search]` against the named `[search.*]` / `[rerank.*]` backends,
+/// validating cross-references and collapsing inline aliases into the effective
+/// settings the server surface consumes.
+fn resolve_web_search(
+    config: Option<WebSearchConfig>,
+    search: &BTreeMap<String, SearchConfig>,
+    rerank: &BTreeMap<String, RerankConfig>,
+) -> RunnerResult<Option<ResolvedWebSearch>> {
+    let Some(config) = config else {
+        return Ok(None);
+    };
+    if !config.is_enabled() {
+        return Ok(None);
+    }
+    if config.search().is_some() && config.searxng_url().is_some() {
+        return Err(RunnerError::configuration(
+            "web_search: set either `search` (named [search.*] endpoint) or `searxng_url` (inline), not both",
+        ));
+    }
+    let (search_url, timeout) = if let Some(name) = config.search() {
+        let entry = search.get(name).ok_or_else(|| {
+            RunnerError::configuration(format!(
+                "web_search.search references unknown [search.{name}] endpoint"
+            ))
+        })?;
+        (
+            entry.base_url.clone(),
+            std::time::Duration::from_millis(entry.timeout_ms),
+        )
+    } else {
+        let url = config
+            .searxng_url()
+            .map(str::to_string)
+            .unwrap_or_else(default_web_search_url);
+        let ms = config.timeout_ms().unwrap_or_else(default_web_search_timeout_ms);
+        (url, std::time::Duration::from_millis(ms))
+    };
+    reqwest::Url::parse(&search_url).map_err(|error| {
+        RunnerError::configuration(format!("web_search endpoint is not a valid URL: {error}"))
+    })?;
+    let max_results = config.max_results().unwrap_or_else(default_web_search_max_results);
+    if max_results == 0 || max_results > 20 {
+        return Err(RunnerError::configuration(format!(
+            "web_search.max_results must be between 1 and 20, got {max_results}"
+        )));
+    }
+    let resolved_rerank = config
+        .rerank()
+        .map(|name| -> RunnerResult<ResolvedRerank> {
+            let entry = rerank.get(name).ok_or_else(|| {
+                RunnerError::configuration(format!(
+                    "web_search.rerank references unknown [rerank.{name}] backend"
+                ))
+            })?;
+            Ok(ResolvedRerank {
+                base_url: entry.base_url.clone(),
+                model: entry.model.clone(),
+            })
+        })
+        .transpose()?;
+    Ok(Some(ResolvedWebSearch {
+        enabled: true,
+        search_url,
+        timeout,
+        max_results,
+        rerank: resolved_rerank,
+    }))
 }
 
 #[derive(Debug)]
@@ -263,22 +406,7 @@ impl DeploymentConfig {
             );
             routes.push((config.id.clone(), route));
         }
-        let web_search = self.web_search;
-        if let Some(config) = web_search.as_ref() {
-            if config.is_enabled() {
-                reqwest::Url::parse(config.searxng_url()).map_err(|error| {
-                    RunnerError::configuration(format!(
-                        "web_search.searxng_url is not a valid URL: {error}"
-                    ))
-                })?;
-                let max = config.max_results();
-                if max == 0 || max > 20 {
-                    return Err(RunnerError::configuration(format!(
-                        "web_search.max_results must be between 1 and 20, got {max}"
-                    )));
-                }
-            }
-        }
+        let web_search = resolve_web_search(self.web_search, &self.search, &self.rerank)?;
         let runner = Runner::new(routes)
             .with_fallback_url(fallback_base_url)
             .with_web_search(web_search);
@@ -1611,29 +1739,73 @@ target = "t"
     fn web_search_parses_with_defaults() {
         let toml = format!("{BASE}\n[web_search]\nenabled = true\n");
         let runner = runner_from_toml(&toml).expect("web_search parses");
-        let config = runner.web_search().expect("web_search configured");
-        assert!(config.is_enabled());
-        assert_eq!(config.searxng_url(), "http://127.0.0.1:8080");
-        assert_eq!(config.max_results(), 6);
-        assert_eq!(config.timeout(), std::time::Duration::from_millis(15_000));
+        let settings = runner.web_search().expect("web_search configured");
+        assert!(settings.enabled);
+        assert_eq!(settings.search_url.as_str(), "http://127.0.0.1:8080");
+        assert_eq!(settings.max_results, 6);
+        assert_eq!(settings.timeout, std::time::Duration::from_millis(15_000));
+        assert!(settings.rerank.is_none());
     }
 
     #[test]
-    fn web_search_honors_explicit_values() {
+    fn web_search_honors_explicit_inline_values() {
         let toml = format!(
             "{BASE}\n[web_search]\nenabled = true\nsearxng_url = \"http://search.lan:8888\"\nmax_results = 5\ntimeout_ms = 2000\n"
         );
         let runner = runner_from_toml(&toml).expect("web_search parses");
-        let config = runner.web_search().expect("web_search configured");
-        assert_eq!(config.searxng_url(), "http://search.lan:8888");
-        assert_eq!(config.max_results(), 5);
-        assert_eq!(config.timeout(), std::time::Duration::from_millis(2000));
+        let settings = runner.web_search().expect("web_search configured");
+        assert_eq!(settings.search_url.as_str(), "http://search.lan:8888");
+        assert_eq!(settings.max_results, 5);
+        assert_eq!(settings.timeout, std::time::Duration::from_millis(2000));
+    }
+
+    #[test]
+    fn web_search_resolves_named_search_endpoint() {
+        let toml = format!(
+            "{BASE}\n[search.main]\nbase_url = \"http://search.lan:9999\"\ntimeout_ms = 9000\nmax_results = 30\n\n[web_search]\nenabled = true\nsearch = \"main\"\n"
+        );
+        let runner = runner_from_toml(&toml).expect("web_search with named search parses");
+        let settings = runner.web_search().expect("web_search configured");
+        assert_eq!(settings.search_url.as_str(), "http://search.lan:9999");
+        assert_eq!(settings.timeout, std::time::Duration::from_millis(9000));
+    }
+
+    #[test]
+    fn web_search_resolves_named_rerank_backend() {
+        let toml = format!(
+            "{BASE}\n[rerank.r]\nbase_url = \"http://rank.lan:8002/v1\"\nmodel = \"qwen3-vl-rerank\"\n\n[web_search]\nenabled = true\nrerank = \"r\"\n"
+        );
+        let runner = runner_from_toml(&toml).expect("web_search with named rerank parses");
+        let settings = runner.web_search().expect("web_search configured");
+        let rerank = settings.rerank.as_ref().expect("rerank resolved");
+        assert_eq!(rerank.base_url.as_str(), "http://rank.lan:8002/v1");
+        assert_eq!(rerank.model.as_str(), "qwen3-vl-rerank");
+    }
+
+    #[test]
+    fn web_search_rejects_unknown_named_search() {
+        let toml = format!("{BASE}\n[web_search]\nenabled = true\nsearch = \"missing\"\n");
+        assert!(error_message(&toml).contains("unknown [search.missing]"));
+    }
+
+    #[test]
+    fn web_search_rejects_unknown_named_rerank() {
+        let toml = format!("{BASE}\n[web_search]\nenabled = true\nrerank = \"missing\"\n");
+        assert!(error_message(&toml).contains("unknown [rerank.missing]"));
+    }
+
+    #[test]
+    fn web_search_rejects_search_plus_searxng_url() {
+        let toml = format!(
+            "{BASE}\n[search.main]\nbase_url = \"http://search.lan:9999\"\n\n[web_search]\nenabled = true\nsearch = \"main\"\nsearxng_url = \"http://127.0.0.1:8080\"\n"
+        );
+        assert!(error_message(&toml).contains("not both"));
     }
 
     #[test]
     fn web_search_rejects_malformed_url_when_enabled() {
         let toml = format!("{BASE}\n[web_search]\nenabled = true\nsearxng_url = \"not a url\"\n");
-        assert!(error_message(&toml).contains("searxng_url is not a valid URL"));
+        assert!(error_message(&toml).contains("not a valid URL"));
     }
 
     #[test]
