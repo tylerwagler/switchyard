@@ -24,6 +24,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   candidates and re-ranks them before returning `max_results`, fail-open on
   reranker errors. The inline `searxng_url` key remains a compatibility alias.
 
+- **Non-chat serving** — `[embeddings.*]` sections; the gateway now serves
+  `POST /v1/embeddings` and `POST /v1/rerank` (default = first configured
+  backend, or a named `/{name}` path segment) as transparent relays to the
+  configured backends. `/v1/models` advertises a truthful capability listing —
+  chat routes plus `kind: embeddings` / `kind: rerank` / `kind: search`
+  entries. `--dry-run` validates URLs and models; per-backend
+  `switchyard.aux_requests_total` / `switchyard.aux_duration_seconds` metrics.
+
 - **NeMo Relay native plugin** — a dynamically loaded integration that loads
   Switchyard's standard TOML deployment and executes its `switchyard-runner`-
   supported configured routes in process. Managed calls require NeMo Relay

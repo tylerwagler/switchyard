@@ -65,6 +65,8 @@ pub(crate) struct DeploymentConfig {
     search: BTreeMap<String, SearchConfig>,
     #[serde(default)]
     rerank: BTreeMap<String, RerankConfig>,
+    #[serde(default)]
+    embeddings: BTreeMap<String, EmbeddingsConfig>,
 }
 
 /// Opt-in hosted web search: serves Claude Code's server-side `web_search` tool
@@ -147,6 +149,17 @@ pub struct RerankConfig {
     /// Default top_n applied when a consumer does not specify one.
     #[serde(default = "default_rerank_top_n")]
     pub default_top_n: usize,
+}
+
+/// A named embeddings backend (vLLM OpenAI-shaped `POST /v1/embeddings`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EmbeddingsConfig {
+    pub base_url: String,
+    pub model: String,
+    /// Env var holding the API key, when the backend requires one.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
 }
 
 /// Web-search settings after name resolution against `[search.*]` / `[rerank.*]`.
@@ -255,6 +268,21 @@ fn resolve_web_search(
         max_results,
         rerank: resolved_rerank,
     }))
+}
+
+/// Validates a named non-chat backend's reachable endpoint and model field.
+fn validate_aux_backend(kind: &str, name: &str, base_url: &str, model: &str) -> RunnerResult<()> {
+    reqwest::Url::parse(base_url).map_err(|error| {
+        RunnerError::configuration(format!(
+            "[{kind}.{name}].base_url is not a valid URL: {error}"
+        ))
+    })?;
+    if model.trim().is_empty() {
+        return Err(RunnerError::configuration(format!(
+            "[{kind}.{name}].model must not be empty"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -407,9 +435,30 @@ impl DeploymentConfig {
             routes.push((config.id.clone(), route));
         }
         let web_search = resolve_web_search(self.web_search, &self.search, &self.rerank)?;
+        for (name, config) in &self.embeddings {
+            validate_aux_backend(
+                "embeddings",
+                name,
+                &config.base_url,
+                &config.model,
+            )?;
+        }
+        for (name, config) in &self.rerank {
+            validate_aux_backend("rerank", name, &config.base_url, &config.model)?;
+        }
+        for (name, config) in &self.search {
+            reqwest::Url::parse(&config.base_url).map_err(|error| {
+                RunnerError::configuration(format!(
+                    "[search.{name}].base_url is not a valid URL: {error}"
+                ))
+            })?;
+        }
         let runner = Runner::new(routes)
             .with_fallback_url(fallback_base_url)
-            .with_web_search(web_search);
+            .with_web_search(web_search)
+            .with_embeddings(self.embeddings)
+            .with_rerank(self.rerank)
+            .with_search(self.search);
         Ok(runner)
     }
 
@@ -1818,5 +1867,83 @@ target = "t"
     fn web_search_rejects_out_of_range_max_results() {
         let toml = format!("{BASE}\n[web_search]\nenabled = true\nmax_results = 21\n");
         assert!(error_message(&toml).contains("max_results must be between 1 and 20"));
+    }
+}
+
+#[cfg(test)]
+mod aux_backend_config_tests {
+    use super::*;
+
+    const AUX: &str = r#"
+schema_version = 1
+
+[llm_clients.stub]
+format = "anthropic_messages"
+base_url = "https://example.test"
+
+[targets.t]
+id = "switchyard/aux-test"
+llm_client = "stub"
+
+[routes.r]
+id = "switchyard/aux-test"
+type = "passthrough"
+target = "t"
+
+[embeddings.e1]
+base_url = "http://embed.lan:8001/v1"
+model = "qwen3-vl-embed"
+
+[embeddings.e2]
+base_url = "http://embed2.lan:8001/v1"
+model = "qwen3-vl-embed-2"
+api_key_env = "EMBED_KEY"
+
+[rerank.r1]
+base_url = "http://rerank.lan:8002/v1"
+model = "qwen3-vl-rerank"
+
+[search.s1]
+base_url = "http://search.lan:8080"
+"#;
+
+    #[test]
+    fn aux_backends_parse_and_are_exposed() {
+        let runner = runner_from_toml(AUX).expect("aux config parses");
+        let e1 = runner.embeddings().get("e1").expect("e1 configured");
+        assert_eq!(e1.base_url.as_str(), "http://embed.lan:8001/v1");
+        assert_eq!(e1.model.as_str(), "qwen3-vl-embed");
+        assert!(e1.api_key_env.is_none());
+        let e2 = runner.embeddings().get("e2").expect("e2 configured");
+        assert_eq!(e2.api_key_env.as_deref(), Some("EMBED_KEY"));
+        let r1 = runner.rerank().get("r1").expect("r1 configured");
+        assert_eq!(r1.model.as_str(), "qwen3-vl-rerank");
+        let s1 = runner.search().get("s1").expect("s1 configured");
+        assert_eq!(s1.base_url.as_str(), "http://search.lan:8080");
+    }
+
+    fn error_message(toml: &str) -> String {
+        match runner_from_toml(toml) {
+            Ok(_) => panic!("expected configuration error, config parsed"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn embeddings_reject_malformed_url() {
+        let toml = AUX.replace("\"http://embed.lan:8001/v1\"", "\"not a url\"");
+        assert!(error_message(&toml).contains("[embeddings.e1].base_url"));
+    }
+
+    #[test]
+    fn embeddings_reject_empty_model() {
+        let toml = AUX.replace("model = \"qwen3-vl-embed\"", "model = \"\"");
+        assert!(error_message(&toml).contains("[embeddings.e1].model must not be empty"));
+    }
+
+    #[test]
+    fn rerank_reject_malformed_url() {
+        let toml = AUX.replace("\"http://rerank.lan:8002/v1\"", "\"not a url\"");
+        assert!(error_message(&toml).contains("[rerank.r1].base_url"));
     }
 }

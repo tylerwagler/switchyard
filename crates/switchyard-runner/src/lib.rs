@@ -17,5 +17,8 @@ pub use failure::{RouteErrorKind, RouteErrorPhase, RouteErrorSummary, stream_err
 pub use route::{
     AuxiliaryTarget, CallerAuthKind, ModelCapabilities, Route, RunOutput, RunnerError,
 };
-pub use config::{RerankConfig, ResolvedRerank, ResolvedWebSearch, SearchConfig, WebSearchConfig};
+pub use config::{
+    EmbeddingsConfig, RerankConfig, ResolvedRerank, ResolvedWebSearch, SearchConfig,
+    WebSearchConfig,
+};
 pub use runner::{DecisionDescription, DecisionTarget, ModelInfo, Runner};

@@ -7,6 +7,7 @@ pub mod config;
 mod metrics;
 mod observability;
 mod response;
+mod auxiliary;
 mod routing_log;
 mod shutdown;
 mod sse;
@@ -41,8 +42,8 @@ use serde_json::{Value, json};
 use switchyard_llm_client::{AuxiliaryOperation, ClientRouter, RunObservation, RunObserver};
 use switchyard_protocol::{LlmClientError, Metadata, ModelId, Request, Usage};
 use switchyard_runner::{
-    CallerAuthKind, DecisionTarget, ModelCapabilities, ResolvedWebSearch, Route, RunOutput, Runner,
-    RunnerError,
+    CallerAuthKind, DecisionTarget, EmbeddingsConfig, ModelCapabilities, RerankConfig,
+    ResolvedWebSearch, Route, RunOutput, Runner, RunnerError, SearchConfig,
 };
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::task;
@@ -145,6 +146,9 @@ pub struct ServerState {
     routing_log: Option<SharedRoutingLog>,
     track_cache_eligibility: bool,
     web_search: Option<ResolvedWebSearch>,
+    embeddings: BTreeMap<String, EmbeddingsConfig>,
+    rerank: BTreeMap<String, RerankConfig>,
+    search: BTreeMap<String, SearchConfig>,
 }
 
 #[derive(Clone)]
@@ -217,6 +221,9 @@ impl ServerState {
             runner.models().map(|model| model.algorithm),
         );
         let web_search = runner.web_search().cloned();
+        let embeddings = runner.embeddings().clone();
+        let rerank = runner.rerank().clone();
+        let search = runner.search().clone();
         Ok(Self {
             runner: Arc::new(runner),
             fallback_http,
@@ -225,6 +232,9 @@ impl ServerState {
             routing_log: None,
             track_cache_eligibility: tracking_enabled_from_env(),
             web_search,
+            embeddings,
+            rerank,
+            search,
         })
     }
 
@@ -247,6 +257,26 @@ impl ServerState {
     /// HTTP client used by the hosted-web-search bridge for SearXNG requests.
     pub(crate) fn web_search_client(&self) -> &reqwest::Client {
         &self.fallback_http
+    }
+
+    /// HTTP client used by the non-chat relay (embeddings/rerank) endpoints.
+    pub(crate) fn http_client(&self) -> &reqwest::Client {
+        &self.fallback_http
+    }
+
+    /// Named embeddings backends (`[embeddings.*]`).
+    pub(crate) fn embeddings(&self) -> &BTreeMap<String, EmbeddingsConfig> {
+        &self.embeddings
+    }
+
+    /// Named rerank backends (`[rerank.*]`).
+    pub(crate) fn rerank(&self) -> &BTreeMap<String, RerankConfig> {
+        &self.rerank
+    }
+
+    /// Named search endpoints (`[search.*]`).
+    pub(crate) fn search(&self) -> &BTreeMap<String, SearchConfig> {
+        &self.search
     }
 
     /// Returns the caller credential family used by `model`, if any.
@@ -511,7 +541,11 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
         .route("/v1/stats", get(get_stats))
         .route("/v1/stats/reset", post(reset_stats))
         .route("/metrics", get(prometheus_metrics))
-        .route("/health", get(health));
+        .route("/health", get(health))
+        .route("/v1/embeddings", post(auxiliary::embeddings_default))
+        .route("/v1/embeddings/{name}", post(auxiliary::embeddings_named))
+        .route("/v1/rerank", post(auxiliary::rerank_default))
+        .route("/v1/rerank/{name}", post(auxiliary::rerank_named));
     if state.routing_log.is_some() {
         router = router.route("/v1/routing/session-stats", get(get_session_stats));
     }
@@ -1379,12 +1413,18 @@ fn error_response(
 }
 
 async fn models(State(state): State<ServerState>) -> Json<Value> {
-    Json(model_list_payload(
+    let mut payload = model_list_payload(
         state
             .runner
             .models()
             .map(|model| (model.id.as_str(), model.capabilities)),
-    ))
+    );
+    // Advertise non-chat backends too, so /v1/models is a truthful capability
+    // listing (chat + embeddings + rerank + search).
+    if let Some(data) = payload.get_mut("data").and_then(Value::as_array_mut) {
+        data.extend(auxiliary::capability_entries(&state));
+    }
+    Json(payload)
 }
 
 async fn get_stats(State(state): State<ServerState>) -> Json<StatsSnapshot> {

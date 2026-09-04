@@ -11,13 +11,19 @@ use serde_json::Value;
 use switchyard_protocol::{ModelId, WireFormat};
 
 use crate::config;
-use crate::{ModelCapabilities, ResolvedWebSearch, Route, RunnerError};
+use crate::{
+    EmbeddingsConfig, ModelCapabilities, RerankConfig, ResolvedWebSearch, Route, RunnerError,
+    SearchConfig,
+};
 
 /// Immutable named route table.
 pub struct Runner {
     routes: Vec<(ModelId, Route)>,
     fallback_base_url: Option<String>,
     web_search: Option<ResolvedWebSearch>,
+    embeddings: BTreeMap<String, EmbeddingsConfig>,
+    rerank: BTreeMap<String, RerankConfig>,
+    search: BTreeMap<String, SearchConfig>,
 }
 
 /// Borrowed model metadata returned while listing routes.
@@ -63,6 +69,9 @@ impl Runner {
             routes,
             fallback_base_url: None,
             web_search: None,
+            embeddings: BTreeMap::new(),
+            rerank: BTreeMap::new(),
+            search: BTreeMap::new(),
         }
     }
 
@@ -76,9 +85,42 @@ impl Runner {
         self
     }
 
+    pub(crate) fn with_embeddings(
+        mut self,
+        embeddings: BTreeMap<String, EmbeddingsConfig>,
+    ) -> Self {
+        self.embeddings = embeddings;
+        self
+    }
+
+    pub(crate) fn with_rerank(mut self, rerank: BTreeMap<String, RerankConfig>) -> Self {
+        self.rerank = rerank;
+        self
+    }
+
+    pub(crate) fn with_search(mut self, search: BTreeMap<String, SearchConfig>) -> Self {
+        self.search = search;
+        self
+    }
+
     /// Returns the resolved hosted web-search settings, if enabled.
     pub fn web_search(&self) -> Option<&ResolvedWebSearch> {
         self.web_search.as_ref()
+    }
+
+    /// Named embeddings backends (`[embeddings.*]`).
+    pub fn embeddings(&self) -> &BTreeMap<String, EmbeddingsConfig> {
+        &self.embeddings
+    }
+
+    /// Named rerank backends (`[rerank.*]`).
+    pub fn rerank(&self) -> &BTreeMap<String, RerankConfig> {
+        &self.rerank
+    }
+
+    /// Named search endpoints (`[search.*]`).
+    pub fn search(&self) -> &BTreeMap<String, SearchConfig> {
+        &self.search
     }
 
     /// Returns the route registered for a model.
