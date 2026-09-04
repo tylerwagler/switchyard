@@ -402,15 +402,6 @@ fn sse_from_content(model: &str, content: &[Value]) -> RawEventStream {
     Box::pin(stream) as RawEventStream
 }
 
-fn aggregate(model: &str, query: &str, results: &[Value]) -> Value {
-    let (content, _) = build_blocks(query, results);
-    aggregate_from_content(model, &content)
-}
-
-fn sse_stream(model: &str, query: &str, results: &[Value]) -> RawEventStream {
-    let (content, _) = build_blocks(query, results);
-    sse_from_content(model, &content)
-}
 
 // --- metrics ----------------------------------------------------------------
 
@@ -537,7 +528,8 @@ mod tests {
             "title": "Example",
             "content": "snippet",
         })];
-        let body = aggregate("claude-fable-5-1", "q", &results);
+        let (content, _) = build_blocks("q", &results);
+        let body = aggregate_from_content("claude-fable-5-1", &content);
         let content = body["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "server_tool_use");
         assert_eq!(content[0]["search_result"]["url"], "https://example.com");
