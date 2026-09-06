@@ -16,7 +16,7 @@ works end to end.
 ## Configuration
 
 ```toml
-[search.main]                       # named search endpoint (typically SearXNG)
+[search.searxng]                    # named search endpoint (typically SearXNG)
 base_url = "http://127.0.0.1:8080"
 timeout_ms = 15000
 max_results = 20
@@ -32,7 +32,7 @@ key_prefix = "switchyard:websearch"
 
 [web_search]
 enabled = true
-search = "main"                     # reference the named endpoint
+search = "searxng"                  # reference the named endpoint
 rerank = "qwen3-vl-rerank"          # re-rank candidates before returning
 cache = "valkey"                    # memoize raw search results
 max_results = 6                     # results returned per query (1-20)
