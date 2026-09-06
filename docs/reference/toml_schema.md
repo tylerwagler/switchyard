@@ -39,6 +39,18 @@ target. Only its `base_url` is used: caller end-to-end headers are forwarded, ho
 removed, and configured API keys, extra headers, format, and retries are not applied. When omitted,
 unmatched paths return `404`.
 
+The optional top-level `default_route` names an entry under `[routes]` that serves any
+model id matching no route. Without it an unrecognized model is a `404 model_not_found`, so
+every id a client might send has to be enumerated up front. It changes resolution only:
+`GET /v1/models` still advertises the configured ids, so a default route never makes the
+gateway claim it serves every model in existence. Inside the NeMo Relay plugin, model
+*ownership* likewise stays exact — a default route means "serve unmatched models I am
+given", not "claim every model on the deployment".
+
+```toml
+default_route = "main"   # names [routes.main]
+```
+
 `schema_version`, `[targets]`, and `[routes]` must all be present, even when a
 route reaches no upstream. A file without a `[targets]` table is rejected with
 `missing field targets`; an empty `[targets]` table satisfies it.

@@ -19,6 +19,10 @@ use crate::{
 /// Immutable named route table.
 pub struct Runner {
     routes: Vec<(ModelId, Route)>,
+    /// Route serving models that match no route id. Without it an unrecognized
+    /// model is a hard 404, so every id a client might send has to be
+    /// enumerated up front.
+    default_route: Option<ModelId>,
     fallback_base_url: Option<String>,
     web_search: Option<ResolvedWebSearch>,
     embeddings: BTreeMap<String, EmbeddingsConfig>,
@@ -67,12 +71,18 @@ impl Runner {
     pub fn new(routes: Vec<(ModelId, Route)>) -> Self {
         Self {
             routes,
+            default_route: None,
             fallback_base_url: None,
             web_search: None,
             embeddings: BTreeMap::new(),
             rerank: BTreeMap::new(),
             search: BTreeMap::new(),
         }
+    }
+
+    pub(crate) fn with_default_route(mut self, default_route: Option<ModelId>) -> Self {
+        self.default_route = default_route;
+        self
     }
 
     pub(crate) fn with_fallback_url(mut self, fallback_base_url: Option<String>) -> Self {
@@ -123,12 +133,32 @@ impl Runner {
         &self.search
     }
 
-    /// Returns the route registered for a model.
+    /// Returns the route registered for a model, falling back to the
+    /// configured default route when the id matches none.
+    ///
+    /// Every caller resolves through here -- the server and the Relay plugin
+    /// alike -- so the default applies uniformly.
     pub fn route(&self, model: &str) -> Option<&Route> {
+        self.exact_route(model).or_else(|| {
+            self.default_route
+                .as_ref()
+                .and_then(|id| self.exact_route(id.as_str()))
+        })
+    }
+
+    /// Route registered under exactly this id, ignoring the default.
+    /// `/v1/models` advertises the configured ids only: a default route must
+    /// not make the gateway claim it serves every id in existence.
+    pub fn exact_route(&self, model: &str) -> Option<&Route> {
         self.routes
             .iter()
             .find(|(id, _)| id.as_str() == model)
             .map(|(_, route)| route)
+    }
+
+    /// The configured default route id, if any.
+    pub fn default_route(&self) -> Option<&ModelId> {
+        self.default_route.as_ref()
     }
 
     /// Iterates over configured routes in caller-provided order.

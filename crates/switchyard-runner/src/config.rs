@@ -55,6 +55,9 @@ pub(crate) fn runner_from_toml(source: &str) -> RunnerResult<Runner> {
 pub(crate) struct DeploymentConfig {
     schema_version: u32,
     fallback_client: Option<String>,
+    /// Name of the `[routes.<name>]` entry serving models that match no route
+    /// id. Absent means an unrecognized model stays a 404.
+    default_route: Option<String>,
     #[serde(default)]
     llm_clients: BTreeMap<String, LlmClientConfig>,
     targets: BTreeMap<String, TargetConfig>,
@@ -527,7 +530,19 @@ impl DeploymentConfig {
                 ))
             })?;
         }
+        let default_route = match self.default_route.as_deref() {
+            None => None,
+            Some(name) => {
+                let config = self.routes.get(name).ok_or_else(|| {
+                    RunnerError::configuration(format!(
+                        "default_route references unknown [routes.{name}]"
+                    ))
+                })?;
+                Some(config.id.clone())
+            }
+        };
         let runner = Runner::new(routes)
+            .with_default_route(default_route)
             .with_fallback_url(fallback_base_url)
             .with_web_search(web_search)
             .with_embeddings(self.embeddings)
@@ -1915,6 +1930,31 @@ target = "t"
     fn web_search_rejects_unknown_named_rerank() {
         let toml = format!("{BASE}\n[web_search]\nenabled = true\nrerank = \"missing\"\n");
         assert!(error_message(&toml).contains("unknown [rerank.missing]"));
+    }
+
+    #[test]
+    fn default_route_serves_unmatched_models() {
+        // top-level key must precede the first table, or TOML nests it inside one
+        let toml = format!("default_route = \"r\"{BASE}");
+        let runner = runner_from_toml(&toml).expect("default_route resolves");
+        // an id nobody configured still resolves, via the default
+        assert!(runner.route("some-model-nobody-configured").is_some());
+        // ...but ownership/advertising stays exact
+        assert!(runner.exact_route("some-model-nobody-configured").is_none());
+        assert!(runner.default_route().is_some());
+    }
+
+    #[test]
+    fn without_default_route_unmatched_models_stay_unresolved() {
+        let runner = runner_from_toml(BASE).expect("base config loads");
+        assert!(runner.route("some-model-nobody-configured").is_none());
+        assert!(runner.default_route().is_none());
+    }
+
+    #[test]
+    fn default_route_rejects_unknown_route_name() {
+        let toml = format!("default_route = \"missing\"{BASE}");
+        assert!(error_message(&toml).contains("unknown [routes.missing]"));
     }
 
     #[test]

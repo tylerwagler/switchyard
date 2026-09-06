@@ -72,8 +72,12 @@ impl SwitchyardRuntime {
         })
     }
 
+    /// Ownership is decided by the configured ids only, never the default
+    /// route. Inside Relay, Switchyard is one plugin among several: a default
+    /// route means "serve unmatched models I am given", not "claim every model
+    /// on the deployment".
     pub(crate) fn manages_model(&self, model: &str) -> bool {
-        self.runner.route(model).is_some()
+        self.runner.exact_route(model).is_some()
     }
 
     pub(crate) fn decode_request(
