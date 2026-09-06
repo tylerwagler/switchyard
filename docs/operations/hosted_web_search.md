@@ -25,10 +25,16 @@ max_results = 20
 base_url = "http://host:8002/v1"
 model = "qwen3-vl-rerank"
 
+[cache.valkey]                      # optional named cache backend
+url = "redis://valkey.defense.lan:6379"
+ttl_s = 3600
+key_prefix = "switchyard:websearch"
+
 [web_search]
 enabled = true
 search = "main"                     # reference the named endpoint
 rerank = "qwen3-vl-rerank"          # re-rank candidates before returning
+cache = "valkey"                    # memoize raw search results
 max_results = 6                     # results returned per query (1-20)
 ```
 
@@ -53,6 +59,23 @@ a search.
 Only requests whose *every* declared tool is a web-search tool (or that carry
 the single-message "Perform a web search for the query: …" instruction) are
 short-circuited; all other traffic is routed exactly as before.
+
+## Caching
+
+When `web_search.cache` names a `[cache.*]` backend, raw SearXNG candidates are
+memoized under `{key_prefix}:{candidate_count}:{query}` for `ttl_s` seconds.
+Caching the *raw* candidates (not the reranked, truncated output) means a
+rerank or `max_results` change takes effect without waiting out the TTL.
+
+Only successful searches are stored, so an outage expires with the outage
+rather than occupying the cache for a full TTL. Like the reranker the cache is
+**fail-open**: an unreachable backend is logged at debug and the search
+proceeds against SearXNG. Every round trip is bounded at 250ms, so the cache
+can never make a search slower than it would have been without one. The
+connection is not written off on first failure — a backend that is down at
+startup is retried on the next search.
+
+`switchyard.websearch_cache` counts `hit` and `miss` outcomes.
 
 ## What the bridge returns
 

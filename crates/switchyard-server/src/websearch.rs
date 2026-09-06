@@ -19,7 +19,7 @@
 //! Configuration lives in the deployment's `[web_search]` section (see
 //! `switchyard_runner::WebSearchConfig`); the bridge is off until enabled.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::response::{IntoResponse, Response as AxumResponse};
@@ -30,7 +30,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Value, json};
-use switchyard_runner::{ResolvedRerank, ResolvedWebSearch};
+use switchyard_runner::{ResolvedCache, ResolvedRerank, ResolvedWebSearch};
 use switchyard_translation::{LlmStreamError, RawEventStream, WireFormat};
 
 use crate::ServerState;
@@ -178,6 +178,12 @@ async fn search(
     } else {
         settings.max_results.max(1)
     };
+    if let Some(cache) = settings.cache.as_ref() {
+        if let Some(hit) = cache_get(cache, query, requested).await {
+            return Ok(hit);
+        }
+        record_cache("miss");
+    }
     let url = format!(
         "{}/search?q={}&format=json&pageno=1",
         settings.search_url,
@@ -185,7 +191,14 @@ async fn search(
     );
     for attempt in 0..=SEARXNG_RETRIES {
         match search_once(&url, settings.timeout, requested, client).await {
-            Ok(results) => return Ok(results),
+            Ok(results) => {
+                // Only successful searches are cached: an outage must expire with
+                // the outage, not sit in the cache for the whole TTL.
+                if let Some(cache) = settings.cache.as_ref() {
+                    cache_put(cache, query, requested, &results).await;
+                }
+                return Ok(results);
+            }
             Err(error) if attempt < SEARXNG_RETRIES => {
                 tracing::debug!(%error, attempt, websearch = true, "search request failed; retrying");
                 tokio::time::sleep(std::time::Duration::from_millis(RETRY_BASE_MS << attempt))
@@ -533,6 +546,92 @@ fn sse_from_content(model: &str, content: &[Value]) -> RawEventStream {
     Box::pin(stream) as RawEventStream
 }
 
+
+
+// --- result cache -------------------------------------------------------------
+
+/// Lazily built, and deliberately NOT cached on failure: `get_or_try_init`
+/// leaves the cell empty on `Err`, so a valkey that is down at startup is
+/// retried on the next search instead of being written off for the process
+/// lifetime.
+static CACHE: tokio::sync::OnceCell<redis::aio::ConnectionManager> =
+    tokio::sync::OnceCell::const_new();
+
+/// Bounds every cache round trip. The cache exists to make search faster; it
+/// must never make it slower than the search it is standing in front of.
+const CACHE_TIMEOUT: Duration = Duration::from_millis(250);
+
+async fn cache_conn(cache: &ResolvedCache) -> Option<redis::aio::ConnectionManager> {
+    // The connect has to be bounded too, not just the commands: ConnectionManager
+    // retries with exponential backoff internally, so an unreachable cache
+    // otherwise stalls the search for ~19s -- far worse than having no cache.
+    let init = CACHE.get_or_try_init(|| async {
+        let client = redis::Client::open(cache.url.as_str())?;
+        let config = redis::aio::ConnectionManagerConfig::new()
+            .set_number_of_retries(0)
+            .set_connection_timeout(Some(CACHE_TIMEOUT))
+            .set_response_timeout(Some(CACHE_TIMEOUT));
+        client.get_connection_manager_with_config(config).await
+    });
+    match tokio::time::timeout(CACHE_TIMEOUT, init).await {
+        Ok(Ok(conn)) => Some(conn.clone()),
+        Ok(Err(error)) => {
+            tracing::debug!(error = %error, "web-search cache unavailable");
+            None
+        }
+        Err(_) => {
+            tracing::debug!("web-search cache connect timed out");
+            None
+        }
+    }
+}
+
+/// Raw SearXNG candidates are what gets cached: they are the slow, rate-limited
+/// half. Reranking still runs per request, so a rerank config change takes
+/// effect without waiting out the TTL.
+fn cache_key(cache: &ResolvedCache, query: &str, take: usize) -> String {
+    format!("{}:{}:{}", cache.key_prefix, take, query)
+}
+
+async fn cache_get(cache: &ResolvedCache, query: &str, take: usize) -> Option<Vec<Value>> {
+    let mut conn = cache_conn(cache).await?;
+    let key = cache_key(cache, query, take);
+    let raw: Option<String> = tokio::time::timeout(
+        CACHE_TIMEOUT,
+        redis::cmd("GET").arg(&key).query_async(&mut conn),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let parsed = serde_json::from_str::<Vec<Value>>(&raw?).ok()?;
+    record_cache("hit");
+    Some(parsed)
+}
+
+async fn cache_put(cache: &ResolvedCache, query: &str, take: usize, results: &[Value]) {
+    let Some(mut conn) = cache_conn(cache).await else {
+        return;
+    };
+    let Ok(payload) = serde_json::to_string(results) else {
+        return;
+    };
+    let key = cache_key(cache, query, take);
+    let mut command = redis::cmd("SET");
+    command.arg(&key).arg(payload).arg("EX").arg(cache.ttl.as_secs());
+    if tokio::time::timeout(CACHE_TIMEOUT, command.query_async::<()>(&mut conn))
+        .await
+        .is_err()
+    {
+        tracing::debug!("web-search cache write timed out");
+    }
+}
+
+fn record_cache(outcome: &str) {
+    global::meter("switchyard")
+        .u64_counter("switchyard.websearch_cache")
+        .build()
+        .add(1, &[KeyValue::new("outcome", outcome.to_string())]);
+}
 
 // --- metrics ----------------------------------------------------------------
 

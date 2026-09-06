@@ -67,6 +67,8 @@ pub(crate) struct DeploymentConfig {
     rerank: BTreeMap<String, RerankConfig>,
     #[serde(default)]
     embeddings: BTreeMap<String, EmbeddingsConfig>,
+    #[serde(default)]
+    cache: BTreeMap<String, CacheConfig>,
 }
 
 /// Opt-in hosted web search: serves Claude Code's server-side `web_search` tool
@@ -86,6 +88,9 @@ pub struct WebSearchConfig {
     /// Named `[rerank.<name>]` backend used to re-rank candidates before returning.
     #[serde(default)]
     rerank: Option<String>,
+    /// Named `[cache.<name>]` backend memoizing raw search results.
+    #[serde(default)]
+    cache: Option<String>,
     /// Inline SearXNG base URL (compatibility alias; superseded by `search`).
     #[serde(default)]
     searxng_url: Option<String>,
@@ -110,6 +115,11 @@ impl WebSearchConfig {
     /// Named `[rerank.*]` backend, if configured.
     pub fn rerank(&self) -> Option<&str> {
         self.rerank.as_deref()
+    }
+
+    /// Named `[cache.*]` backend, if configured.
+    pub fn cache(&self) -> Option<&str> {
+        self.cache.as_deref()
     }
 
     /// Inline SearXNG URL override, if configured.
@@ -162,6 +172,21 @@ pub struct EmbeddingsConfig {
     pub api_key_env: Option<String>,
 }
 
+/// A named cache backend (Valkey or Redis, addressed as `redis://host:port[/db]`).
+/// Used to memoize raw search results: SearXNG scrapes engines that rate-limit,
+/// so a repeated query is both the slowest and the most fragile path.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CacheConfig {
+    pub url: String,
+    /// How long a cached result set stays fresh.
+    #[serde(default = "default_cache_ttl_s")]
+    pub ttl_s: u64,
+    /// Namespace on every key, so one instance can back several deployments.
+    #[serde(default = "default_cache_key_prefix")]
+    pub key_prefix: String,
+}
+
 /// Web-search settings after name resolution against `[search.*]` / `[rerank.*]`.
 /// What the server surface consumes; built once at config load.
 #[derive(Debug, Clone)]
@@ -172,6 +197,15 @@ pub struct ResolvedWebSearch {
     /// Results returned to the client.
     pub max_results: usize,
     pub rerank: Option<ResolvedRerank>,
+    pub cache: Option<ResolvedCache>,
+}
+
+/// A cache backend resolved from a `[cache.<name>]` declaration.
+#[derive(Debug, Clone)]
+pub struct ResolvedCache {
+    pub url: String,
+    pub ttl: std::time::Duration,
+    pub key_prefix: String,
 }
 
 /// A rerank backend resolved from a `[rerank.<name>]` declaration.
@@ -179,6 +213,14 @@ pub struct ResolvedWebSearch {
 pub struct ResolvedRerank {
     pub base_url: String,
     pub model: String,
+}
+
+const fn default_cache_ttl_s() -> u64 {
+    3600
+}
+
+fn default_cache_key_prefix() -> String {
+    "switchyard:websearch".to_string()
 }
 
 fn default_web_search_url() -> String {
@@ -208,6 +250,7 @@ fn resolve_web_search(
     config: Option<WebSearchConfig>,
     search: &BTreeMap<String, SearchConfig>,
     rerank: &BTreeMap<String, RerankConfig>,
+    cache: &BTreeMap<String, CacheConfig>,
 ) -> RunnerResult<Option<ResolvedWebSearch>> {
     let Some(config) = config else {
         return Ok(None);
@@ -261,12 +304,38 @@ fn resolve_web_search(
             })
         })
         .transpose()?;
+    let resolved_cache = config
+        .cache()
+        .map(|name| -> RunnerResult<ResolvedCache> {
+            let entry = cache.get(name).ok_or_else(|| {
+                RunnerError::configuration(format!(
+                    "web_search.cache references unknown [cache.{name}] backend"
+                ))
+            })?;
+            reqwest::Url::parse(&entry.url).map_err(|error| {
+                RunnerError::configuration(format!(
+                    "cache.{name}.url is not a valid URL: {error}"
+                ))
+            })?;
+            if entry.ttl_s == 0 {
+                return Err(RunnerError::configuration(format!(
+                    "cache.{name}.ttl_s must be greater than 0"
+                )));
+            }
+            Ok(ResolvedCache {
+                url: entry.url.clone(),
+                ttl: std::time::Duration::from_secs(entry.ttl_s),
+                key_prefix: entry.key_prefix.clone(),
+            })
+        })
+        .transpose()?;
     Ok(Some(ResolvedWebSearch {
         enabled: true,
         search_url,
         timeout,
         max_results,
         rerank: resolved_rerank,
+        cache: resolved_cache,
     }))
 }
 
@@ -438,7 +507,8 @@ impl DeploymentConfig {
             );
             routes.push((config.id.clone(), route));
         }
-        let web_search = resolve_web_search(self.web_search, &self.search, &self.rerank)?;
+        let web_search =
+            resolve_web_search(self.web_search, &self.search, &self.rerank, &self.cache)?;
         for (name, config) in &self.embeddings {
             validate_aux_backend(
                 "embeddings",
@@ -1845,6 +1915,52 @@ target = "t"
     fn web_search_rejects_unknown_named_rerank() {
         let toml = format!("{BASE}\n[web_search]\nenabled = true\nrerank = \"missing\"\n");
         assert!(error_message(&toml).contains("unknown [rerank.missing]"));
+    }
+
+    #[test]
+    fn web_search_resolves_named_cache() {
+        let toml = format!(
+            "{BASE}\n[cache.valkey]\nurl = \"redis://valkey.lan:6379\"\nttl_s = 900\nkey_prefix = \"sy:ws\"\n\n[web_search]\nenabled = true\ncache = \"valkey\"\n"
+        );
+        let runner = runner_from_toml(&toml).expect("named cache resolves");
+        let cache = runner
+            .web_search()
+            .expect("web search enabled")
+            .cache
+            .as_ref()
+            .expect("cache resolved");
+        assert_eq!(cache.url.as_str(), "redis://valkey.lan:6379");
+        assert_eq!(cache.ttl, std::time::Duration::from_secs(900));
+        assert_eq!(cache.key_prefix.as_str(), "sy:ws");
+    }
+
+    #[test]
+    fn web_search_cache_is_optional() {
+        let toml = format!("{BASE}\n[web_search]\nenabled = true\n");
+        let runner = runner_from_toml(&toml).expect("cache is optional");
+        assert!(runner.web_search().expect("enabled").cache.is_none());
+    }
+
+    #[test]
+    fn web_search_rejects_unknown_named_cache() {
+        let toml = format!("{BASE}\n[web_search]\nenabled = true\ncache = \"missing\"\n");
+        assert!(error_message(&toml).contains("unknown [cache.missing]"));
+    }
+
+    #[test]
+    fn web_search_rejects_zero_cache_ttl() {
+        let toml = format!(
+            "{BASE}\n[cache.valkey]\nurl = \"redis://valkey.lan:6379\"\nttl_s = 0\n\n[web_search]\nenabled = true\ncache = \"valkey\"\n"
+        );
+        assert!(error_message(&toml).contains("ttl_s must be greater than 0"));
+    }
+
+    #[test]
+    fn web_search_rejects_malformed_cache_url() {
+        let toml = format!(
+            "{BASE}\n[cache.valkey]\nurl = \"not a url\"\n\n[web_search]\nenabled = true\ncache = \"valkey\"\n"
+        );
+        assert!(error_message(&toml).contains("not a valid URL"));
     }
 
     #[test]

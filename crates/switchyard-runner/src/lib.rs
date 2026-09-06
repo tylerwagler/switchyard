@@ -18,7 +18,8 @@ pub use route::{
     AuxiliaryTarget, CallerAuthKind, ModelCapabilities, Route, RunOutput, RunnerError,
 };
 pub use config::{
-    EmbeddingsConfig, RerankConfig, ResolvedRerank, ResolvedWebSearch, SearchConfig,
+    CacheConfig, EmbeddingsConfig, RerankConfig, ResolvedCache, ResolvedRerank, ResolvedWebSearch,
+    SearchConfig,
     WebSearchConfig,
 };
 pub use runner::{DecisionDescription, DecisionTarget, ModelInfo, Runner};

@@ -310,6 +310,21 @@ and usable from `web_search.rerank`.
 | `model` | — | Model id the backend serves (required). |
 | `default_top_n` | `6` | top-n applied when a consumer does not specify one. |
 
+## `[cache.<name>]`
+
+Optional. A named Valkey/Redis cache backend. `[web_search]` references it by
+name to memoize raw search results.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `url` | — | `redis://host:port[/db]` (required). |
+| `ttl_s` | `3600` | Seconds a cached result set stays fresh. Must be > 0. |
+| `key_prefix` | `switchyard:websearch` | Namespace on every key, so one instance can back several deployments. |
+
+The cache is fail-open: an unreachable backend is logged and skipped, never an
+error. Round trips are bounded at 250ms so the cache can never be slower than
+the search it fronts.
+
 ## `[embeddings.<name>]`
 
 Optional. A named embeddings backend (`POST /v1/embeddings`, e.g. vLLM), served
