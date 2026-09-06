@@ -24,6 +24,8 @@ use std::time::Instant;
 use axum::Json;
 use axum::response::{IntoResponse, Response as AxumResponse};
 use opentelemetry::{KeyValue, global};
+use base64::Engine as _;
+use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Value, json};
 use switchyard_runner::{ResolvedRerank, ResolvedWebSearch};
 use switchyard_translation::{LlmStreamError, RawEventStream, WireFormat};
@@ -316,34 +318,68 @@ fn record_rerank_error() {
 
 // --- response synthesis ------------------------------------------------------
 
+/// Anthropic's server-side web search returns ONE `server_tool_use` block
+/// carrying the query, followed by ONE `web_search_tool_result` block whose
+/// `content` holds the whole result array — not one block per result. Claude
+/// Code reads that pair; a different shape is dropped rather than rejected,
+/// so the search silently returns nothing.
 fn build_blocks(query: &str, results: &[Value]) -> (Vec<Value>, String) {
-    let mut blocks = Vec::with_capacity(results.len() + 1);
-    for result in results {
-        blocks.push(json!({
-            "type": "server_tool_use",
-            "id": format!("web-{}", hex(result["url"].as_str().unwrap_or(""))),
-            "name": "web_search",
-            "input": { "query": query },
-            "search_result": result,
-        }));
-    }
+    let tool_id = tool_use_id();
     let answer = if results.is_empty() {
         format!("No web search results found for \u{201c}{query}\u{201d}.")
     } else {
         let lines: Vec<String> = results
             .iter()
             .map(|r| {
-                format!(
-                    "- {} \u{2014} {}",
-                    r["title"].as_str().unwrap_or("(untitled)"),
-                    r["url"].as_str().unwrap_or("")
-                )
+                let title = r["title"].as_str().unwrap_or("(untitled)");
+                let url = r["url"].as_str().unwrap_or("");
+                match r["content"].as_str().unwrap_or("") {
+                    "" => format!("- {title} \u{2014} {url}"),
+                    snippet => format!("- {title} \u{2014} {url}\n  {snippet}"),
+                }
             })
             .collect();
         format!("Web search results for \u{201c}{query}\u{201d}:\n{}", lines.join("\n"))
     };
-    blocks.push(json!({ "type": "text", "text": answer }));
+
+    let blocks = vec![
+        json!({
+            "type": "server_tool_use",
+            "id": tool_id,
+            "name": "web_search",
+            "input": { "query": query },
+        }),
+        json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": tool_id,
+            "content": results.iter().map(search_result_block).collect::<Vec<Value>>(),
+        }),
+        json!({ "type": "text", "text": answer }),
+    ];
     (blocks, answer)
+}
+
+/// One `web_search_result` entry. `encrypted_content` is opaque to the client
+/// and round-tripped back on later turns; upstream it is a ciphertext blob, so
+/// the snippet is base64-encoded rather than given an invented plaintext
+/// meaning. The readable copy lives in the trailing text block, which is what a
+/// self-hosted model actually reads.
+fn search_result_block(result: &Value) -> Value {
+    let mut block = json!({
+        "type": "web_search_result",
+        "url": result["url"].as_str().unwrap_or(""),
+        "title": result["title"].as_str().unwrap_or("(untitled)"),
+        "encrypted_content": BASE64.encode(result["content"].as_str().unwrap_or("")),
+    });
+    if let Some(age) = result.get("publishedDate").and_then(Value::as_str) {
+        block["page_age"] = json!(age);
+    }
+    block
+}
+
+/// `srvtoolu_`-prefixed to match the ids Anthropic issues for server tools.
+fn tool_use_id() -> String {
+    format!("srvtoolu_{}", hex(&format!("{:?}", Instant::now())))
 }
 
 fn hex(input: &str) -> String {
@@ -358,15 +394,31 @@ fn message_id() -> String {
     format!("msg_{}", hex(&format!("{:?}", Instant::now())).chars().take(24).collect::<String>())
 }
 
-/// A text-only explanation shown instead of "no results" when SearXNG itself
-/// fails, so the client can tell a genuine empty result set from an outage.
-fn failure_text(error: &str) -> Vec<Value> {
-    vec![json!({
-        "type": "text",
-        "text": format!(
-            "Web search is temporarily unavailable: {error}. No results were returned."
-        ),
-    })]
+/// Shown instead of "no results" when SearXNG itself fails, so the client can
+/// tell a genuine empty result set from an outage. Uses the documented
+/// `web_search_tool_result_error` shape so the client sees a failed search
+/// rather than a malformed one.
+fn failure_blocks(query: &str, error: &str) -> Vec<Value> {
+    let tool_id = tool_use_id();
+    vec![
+        json!({
+            "type": "server_tool_use",
+            "id": tool_id,
+            "name": "web_search",
+            "input": { "query": query },
+        }),
+        json!({
+            "type": "web_search_tool_result",
+            "tool_use_id": tool_id,
+            "content": { "type": "web_search_tool_result_error", "error_code": "unavailable" },
+        }),
+        json!({
+            "type": "text",
+            "text": format!(
+                "Web search is temporarily unavailable: {error}. No results were returned."
+            ),
+        }),
+    ]
 }
 
 fn aggregate_from_content(model: &str, content: &[Value]) -> Value {
@@ -378,7 +430,11 @@ fn aggregate_from_content(model: &str, content: &[Value]) -> Value {
         "content": content,
         "stop_reason": "end_turn",
         "stop_sequence": null,
-        "usage": { "input_tokens": 0, "output_tokens": 0 },
+        "usage": {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "server_tool_use": { "web_search_requests": 1 },
+        },
     })
 }
 
@@ -393,21 +449,61 @@ fn sse_from_content(model: &str, content: &[Value]) -> RawEventStream {
                 "model": model,
                 "content": [],
                 "stop_reason": null,
-                "usage": { "input_tokens": 0, "output_tokens": 0 },
+                "usage": {
+                    "input_tokens": 0,
+                    "output_tokens": 0,
+                    "server_tool_use": { "web_search_requests": 1 },
+                },
             },
         })];
         for (index, block) in content.iter().enumerate() {
-            events.push(json!({
-                "type": "content_block_start",
-                "index": index,
-                "content_block": block,
-            }));
-            let delta = if block["type"] == "server_tool_use" {
-                json!({ "type": "input_json_delta", "partial_json": serde_json::to_string(block).unwrap_or_default() })
-            } else {
-                json!({ "type": "text_delta", "text": block["text"].as_str().unwrap_or("") })
-            };
-            events.push(json!({ "type": "content_block_delta", "index": index, "delta": delta }));
+            match block["type"].as_str() {
+                // Tool-use blocks stream their arguments: `content_block_start`
+                // carries an empty `input`, the delta carries the JSON.
+                Some("server_tool_use") => {
+                    let mut start = block.clone();
+                    start["input"] = json!({});
+                    events.push(json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": start,
+                    }));
+                    events.push(json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": serde_json::to_string(&block["input"])
+                                .unwrap_or_default(),
+                        },
+                    }));
+                }
+                // Result blocks are not streamed as deltas: they arrive whole.
+                Some("web_search_tool_result") => {
+                    events.push(json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": block,
+                    }));
+                }
+                _ => {
+                    let mut start = block.clone();
+                    start["text"] = json!("");
+                    events.push(json!({
+                        "type": "content_block_start",
+                        "index": index,
+                        "content_block": start,
+                    }));
+                    events.push(json!({
+                        "type": "content_block_delta",
+                        "index": index,
+                        "delta": {
+                            "type": "text_delta",
+                            "text": block["text"].as_str().unwrap_or(""),
+                        },
+                    }));
+                }
+            }
             events.push(json!({ "type": "content_block_stop", "index": index }));
         }
         events.push(json!({
@@ -487,7 +583,7 @@ pub(crate) async fn maybe_short_circuit(
         Err(error) => {
             tracing::warn!(%error, "web search failed");
             record("error", started);
-            failure_text(&error)
+            failure_blocks(&query, &error)
         }
     };
 
@@ -556,12 +652,25 @@ mod tests {
         let (content, _) = build_blocks("q", &results);
         let body = aggregate_from_content("claude-fable-5-1", &content);
         let content = body["content"].as_array().unwrap();
+        assert_eq!(content.len(), 3);
         assert_eq!(content[0]["type"], "server_tool_use");
-        assert_eq!(content[0]["search_result"]["url"], "https://example.com");
-        assert_eq!(content.last().unwrap()["type"], "text");
-        assert!(body["content"].as_array().unwrap().last().unwrap()["text"]
-            .as_str()
-            .unwrap()
-            .contains("Web search results"));
+        assert_eq!(content[0]["name"], "web_search");
+        assert_eq!(content[0]["input"]["query"], "q");
+        // the result block references the tool call and carries every result
+        assert_eq!(content[1]["type"], "web_search_tool_result");
+        assert_eq!(content[1]["tool_use_id"], content[0]["id"]);
+        let results = content[1]["content"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["type"], "web_search_result");
+        assert_eq!(results[0]["url"], "https://example.com");
+        assert_eq!(results[0]["title"], "Example");
+        assert!(results[0]["encrypted_content"].as_str().is_some_and(|v| !v.is_empty()));
+        // no result is emitted as a bare server_tool_use block
+        assert!(content.iter().all(|b| b.get("search_result").is_none()));
+        assert_eq!(body["usage"]["server_tool_use"]["web_search_requests"], 1);
+        assert_eq!(content[2]["type"], "text");
+        assert!(content[2]["text"].as_str().unwrap().contains("Web search results"));
+        // the snippet is readable in the text block for a self-hosted model
+        assert!(content[2]["text"].as_str().unwrap().contains("snippet"));
     }
 }

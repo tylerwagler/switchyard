@@ -265,7 +265,10 @@ async fn web_search_aggregate_returns_server_tool_use_blocks() -> TestResult {
     let content = body["content"].as_array().expect("content array");
     assert_eq!(content[0]["type"], "server_tool_use");
     assert_eq!(content[0]["name"], "web_search");
-    assert_eq!(content[0]["search_result"]["url"], "https://example.com/a");
+    assert_eq!(content[1]["type"], "web_search_tool_result");
+    assert_eq!(content[1]["tool_use_id"], content[0]["id"]);
+    assert_eq!(content[1]["content"][0]["url"], "https://example.com/a");
+    assert_eq!(content[1]["content"][0]["type"], "web_search_result");
     assert_eq!(content.last().unwrap()["type"], "text");
     Ok(())
 }
@@ -347,7 +350,7 @@ async fn web_search_retries_transient_searxng_failures() -> TestResult {
     assert_eq!(response.status, StatusCode::OK);
     let body: Value = serde_json::from_slice(&response.bytes)?;
     assert_eq!(body["content"][0]["type"], "server_tool_use");
-    assert_eq!(body["content"][0]["search_result"]["url"], "https://example.com/a");
+    assert_eq!(body["content"][1]["content"][0]["url"], "https://example.com/a");
     Ok(())
 }
 
@@ -363,8 +366,16 @@ async fn web_search_outage_is_reported_not_masked_as_empty_results() -> TestResu
     assert_eq!(response.status, StatusCode::OK);
     let body: Value = serde_json::from_slice(&response.bytes)?;
     let all = serde_json::to_string(&body)?;
-    assert!(!all.contains("server_tool_use"), "expected no results on outage: {all}");
-    let text = body["content"][0]["text"].as_str().unwrap_or("");
+    assert_eq!(
+        body["content"][1]["content"]["type"], "web_search_tool_result_error",
+        "expected a typed error result on outage: {all}"
+    );
+    assert_eq!(body["content"][1]["content"]["error_code"], "unavailable");
+    assert!(
+        body["content"][1]["content"].get("url").is_none(),
+        "expected no results on outage: {all}"
+    );
+    let text = body["content"][2]["text"].as_str().unwrap_or("");
     assert!(text.contains("temporarily unavailable"), "expected outage notice: {text}");
     assert!(
         text.contains("search returned 400"),
@@ -398,11 +409,11 @@ async fn web_search_reranks_candidates_best_first() -> TestResult {
     let response = send(&app, "POST", "/v1/messages", Some(web_search_body())).await?;
     assert_eq!(response.status, StatusCode::OK);
     let body: Value = serde_json::from_slice(&response.bytes)?;
-    let urls: Vec<&str> = body["content"]
+    let urls: Vec<&str> = body["content"][1]["content"]
         .as_array()
         .unwrap()
         .iter()
-        .filter_map(|b| b.get("search_result").and_then(|r| r["url"].as_str()))
+        .filter_map(|r| r["url"].as_str())
         .collect();
     assert_eq!(urls, vec!["https://example.com/b", "https://example.com/c", "https://example.com/a"]);
     Ok(())
@@ -431,8 +442,9 @@ async fn web_search_falls_back_to_raw_order_when_reranker_down() -> TestResult {
     let response = send(&app, "POST", "/v1/messages", Some(web_search_body())).await?;
     assert_eq!(response.status, StatusCode::OK);
     let body: Value = serde_json::from_slice(&response.bytes)?;
-    assert_eq!(body["content"][0]["search_result"]["url"], "https://example.com/a");
-    assert_eq!(body["content"][1]["search_result"]["url"], "https://example.com/b");
+    let results = body["content"][1]["content"].as_array().expect("results");
+    assert_eq!(results[0]["url"], "https://example.com/a");
+    assert_eq!(results[1]["url"], "https://example.com/b");
     Ok(())
 }
 
