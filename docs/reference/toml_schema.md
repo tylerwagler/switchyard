@@ -94,6 +94,13 @@ server rejects an Anthropic forwarding route called through an OpenAI endpoint,
 or an OpenAI forwarding route called through an Anthropic endpoint, before it
 calls an upstream.
 
+`GET /v1/upstreams` probes every configured client's `base_url` for live TCP
+reachability, reporting `reachable`, `probe_ms`, and an `error` when it fails.
+Probes are connect-and-close (no model call, no credentials, no tokens) and run
+concurrently, so the endpoint costs one timeout at worst however many upstreams
+are down. A refused connect returns immediately; a black-holed host is reported
+as `no response within 1000ms`, so the two are distinguishable.
+
 ## `[targets.<name>]`
 
 | Key | Required | Default | Meaning |

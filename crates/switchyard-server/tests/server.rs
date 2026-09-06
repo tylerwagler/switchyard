@@ -2252,6 +2252,61 @@ async fn json_extractor_statuses_keep_api_specific_error_envelopes() -> TestResu
 }
 
 #[tokio::test]
+async fn upstreams_endpoint_reports_live_reachability() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    // Bind and immediately drop, so the port is known-free: a connect there is
+    // refused rather than black-holed, which keeps the test fast and hermetic.
+    let dead_port = {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.local_addr()?.port()
+    };
+    let state = load_test_config(&format!(
+        r#"
+schema_version = 1
+
+[llm_clients.live]
+format = "openai_chat"
+base_url = "{live}"
+
+[llm_clients.dead]
+format = "openai_chat"
+base_url = "http://127.0.0.1:{dead_port}"
+
+[targets.t]
+id = "m"
+llm_client = "live"
+
+[routes.r]
+id = "m"
+type = "passthrough"
+target = "t"
+"#,
+        live = upstream.base_url,
+    ))?;
+    let app = build_switchyard_router(state);
+
+    let body = send(&app, "GET", "/v1/upstreams", None).await?.json()?;
+    assert_eq!(body["total"], 2);
+    assert_eq!(body["reachable"], 1);
+    let by_name = |name: &str| {
+        body["upstreams"]
+            .as_array()
+            .expect("upstreams array")
+            .iter()
+            .find(|entry| entry["name"] == name)
+            .cloned()
+            .expect("named upstream present")
+    };
+    assert_eq!(by_name("live")["reachable"], true);
+    assert!(by_name("live").get("error").is_none());
+    // an unreachable upstream reports why, so refused and timed-out are
+    // distinguishable when reading the output
+    assert_eq!(by_name("dead")["reachable"], false);
+    assert!(by_name("dead")["error"].as_str().is_some_and(|e| !e.is_empty()));
+    Ok(())
+}
+
+#[tokio::test]
 async fn models_endpoint_reports_declared_route_capabilities_and_null_when_undeclared() -> TestResult
 {
     const CONFIG: &str = r#"

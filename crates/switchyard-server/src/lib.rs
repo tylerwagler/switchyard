@@ -548,6 +548,7 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
         .route("/v1/stats/reset", post(reset_stats))
         .route("/metrics", get(prometheus_metrics))
         .route("/health", get(health))
+        .route("/v1/upstreams", get(upstreams))
         .route("/v1/embeddings", post(auxiliary::embeddings_default))
         .route("/v1/embeddings/{name}", post(auxiliary::embeddings_named))
         .route("/v1/rerank", post(auxiliary::rerank_default))
@@ -1506,6 +1507,70 @@ async fn get_session_stats(
             "routing_session_not_found",
         ),
         Err(error) => server_error(format!("failed to read routing log: {error}")),
+    }
+}
+
+/// Bounds a probe. A liveness check must answer fast enough to be useful
+/// during an outage; a black-holed host would otherwise hang it for the full
+/// TCP connect timeout.
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Live TCP reachability for every configured upstream.
+///
+/// Deliberately a connect-and-close, not a model call: it answers "is that box
+/// accepting connections right now" without spending tokens, needing
+/// credentials, or depending on the model being loaded. Probes run on demand
+/// and concurrently, so the endpoint costs one timeout at worst regardless of
+/// how many upstreams are down.
+async fn upstreams(State(state): State<ServerState>) -> Json<Value> {
+    let entries: Vec<(String, String)> = state
+        .runner
+        .upstreams()
+        .iter()
+        .map(|(name, url)| (name.clone(), url.clone()))
+        .collect();
+    let probes = entries.into_iter().map(|(name, url)| async move {
+        let started = std::time::Instant::now();
+        let outcome = probe_endpoint(&url).await;
+        let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+        let mut entry = json!({
+            "name": name,
+            "base_url": url,
+            "reachable": outcome.is_ok(),
+            "probe_ms": (elapsed * 100.0).round() / 100.0,
+        });
+        if let Err(error) = outcome {
+            entry["error"] = json!(error);
+        }
+        entry
+    });
+    let results = futures_util::future::join_all(probes).await;
+    let reachable = results
+        .iter()
+        .filter(|entry| entry["reachable"] == json!(true))
+        .count();
+    Json(json!({
+        "upstreams": results,
+        "reachable": reachable,
+        "total": results.len(),
+        "probe_timeout_ms": PROBE_TIMEOUT.as_millis() as u64,
+    }))
+}
+
+/// Connect-and-close against the host:port in `base_url`.
+async fn probe_endpoint(base_url: &str) -> std::result::Result<(), String> {
+    let url = reqwest::Url::parse(base_url).map_err(|error| format!("bad url: {error}"))?;
+    let host = url.host_str().ok_or_else(|| "url has no host".to_string())?;
+    let port = url
+        .port_or_known_default()
+        .ok_or_else(|| "url has no port".to_string())?;
+    let connect = tokio::net::TcpStream::connect((host, port));
+    match tokio::time::timeout(PROBE_TIMEOUT, connect).await {
+        Ok(Ok(_stream)) => Ok(()),
+        Ok(Err(error)) => Err(error.to_string()),
+        // A refused connect fails instantly; a black-holed host does not, and
+        // the two are worth telling apart when reading the output.
+        Err(_) => Err(format!("no response within {}ms", PROBE_TIMEOUT.as_millis())),
     }
 }
 

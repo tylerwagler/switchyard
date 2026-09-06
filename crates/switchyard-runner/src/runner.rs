@@ -28,6 +28,10 @@ pub struct Runner {
     embeddings: BTreeMap<String, EmbeddingsConfig>,
     rerank: BTreeMap<String, RerankConfig>,
     search: BTreeMap<String, SearchConfig>,
+    /// Configured llm client name -> base URL, for liveness probing. Every
+    /// other surface is retrospective: this is what answers "is that box
+    /// reachable right now", which is the question an outage actually raises.
+    upstreams: BTreeMap<String, String>,
 }
 
 /// Borrowed model metadata returned while listing routes.
@@ -77,6 +81,7 @@ impl Runner {
             embeddings: BTreeMap::new(),
             rerank: BTreeMap::new(),
             search: BTreeMap::new(),
+            upstreams: BTreeMap::new(),
         }
     }
 
@@ -111,6 +116,16 @@ impl Runner {
     pub(crate) fn with_search(mut self, search: BTreeMap<String, SearchConfig>) -> Self {
         self.search = search;
         self
+    }
+
+    pub(crate) fn with_upstreams(mut self, upstreams: BTreeMap<String, String>) -> Self {
+        self.upstreams = upstreams;
+        self
+    }
+
+    /// Configured llm clients as (name, base URL), for liveness probing.
+    pub fn upstreams(&self) -> &BTreeMap<String, String> {
+        &self.upstreams
     }
 
     /// Returns the resolved hosted web-search settings, if enabled.

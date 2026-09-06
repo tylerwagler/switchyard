@@ -541,7 +541,13 @@ impl DeploymentConfig {
                 Some(config.id.clone())
             }
         };
+        let upstreams = self
+            .llm_clients
+            .iter()
+            .map(|(name, client)| (name.clone(), client.base_url.as_str().to_string()))
+            .collect();
         let runner = Runner::new(routes)
+            .with_upstreams(upstreams)
             .with_default_route(default_route)
             .with_fallback_url(fallback_base_url)
             .with_web_search(web_search)
