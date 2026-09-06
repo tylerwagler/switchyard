@@ -24,6 +24,9 @@ use std::time::Instant;
 use axum::Json;
 use axum::response::{IntoResponse, Response as AxumResponse};
 use opentelemetry::{KeyValue, global};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use serde_json::{Value, json};
@@ -377,21 +380,28 @@ fn search_result_block(result: &Value) -> Value {
     block
 }
 
-/// `srvtoolu_`-prefixed to match the ids Anthropic issues for server tools.
-fn tool_use_id() -> String {
-    format!("srvtoolu_{}", hex(&format!("{:?}", Instant::now())))
+/// Ids must differ per call: a client pairs a `web_search_tool_result` with its
+/// `server_tool_use` by id, so a constant id collides as soon as one
+/// conversation runs two searches. `Instant`'s `Debug` output opens with a
+/// fixed `"Instant { tv_sec"`, so hex-encoding its leading bytes returned the
+/// same id every time.
+static ID_SEQ: AtomicU64 = AtomicU64::new(0);
+
+fn unique_suffix() -> String {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as u64)
+        .unwrap_or(0);
+    format!("{nanos:016x}{:08x}", ID_SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
-fn hex(input: &str) -> String {
-    let mut out = String::new();
-    for byte in input.bytes().take(16) {
-        out.push_str(&format!("{byte:02x}"));
-    }
-    out
+/// `srvtoolu_`-prefixed to match the ids Anthropic issues for server tools.
+fn tool_use_id() -> String {
+    format!("srvtoolu_{}", unique_suffix())
 }
 
 fn message_id() -> String {
-    format!("msg_{}", hex(&format!("{:?}", Instant::now())).chars().take(24).collect::<String>())
+    format!("msg_{}", unique_suffix())
 }
 
 /// Shown instead of "no results" when SearXNG itself fails, so the client can
@@ -672,5 +682,18 @@ mod tests {
         assert!(content[2]["text"].as_str().unwrap().contains("Web search results"));
         // the snippet is readable in the text block for a self-hosted model
         assert!(content[2]["text"].as_str().unwrap().contains("snippet"));
+    }
+
+    #[test]
+    fn ids_are_unique_across_calls() {
+        // A conversation can run several searches; colliding ids would make the
+        // result blocks unpairable with their tool calls.
+        let results = vec![json!({"type":"web_search_result","url":"u","title":"t","content":"c"})];
+        let (first, _) = build_blocks("q", &results);
+        let (second, _) = build_blocks("q", &results);
+        assert_ne!(first[0]["id"], second[0]["id"]);
+        assert_eq!(first[1]["tool_use_id"], first[0]["id"]);
+        assert_eq!(second[1]["tool_use_id"], second[0]["id"]);
+        assert_ne!(message_id(), message_id());
     }
 }
