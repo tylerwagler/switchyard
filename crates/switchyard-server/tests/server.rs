@@ -25,7 +25,9 @@ use switchyard_llm_client::{
 use switchyard_protocol::ModelId;
 use switchyard_protocol::RoutedLlmClient;
 use switchyard_server::config::load_server_state;
-use switchyard_server::{DEFAULT_MAX_REQUEST_BODY_BYTES, ServerState, build_switchyard_router};
+use switchyard_server::{
+    DEFAULT_MAX_REQUEST_BODY_BYTES, ServerState, build_llm_router, build_switchyard_router,
+};
 use tokio::net::TcpListener;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -526,6 +528,42 @@ async fn test_app(routes: &[(&str, &[&str])]) -> TestResult<(MockUpstream, Route
     let upstream = MockUpstream::start().await?;
     let app = build_switchyard_router(random_state(&upstream.base_url, routes)?);
     Ok((upstream, app))
+}
+
+// Embedders expose only the three primary inference endpoints and own every other route.
+#[tokio::test]
+async fn llm_router_exposes_only_primary_llm_endpoints() -> TestResult {
+    let state = random_state("http://127.0.0.1:1/v1", &[(ROUTE_MODEL, &["model/weak"])])?;
+    let app = build_llm_router(state);
+
+    for path in ["/v1/chat/completions", "/v1/messages", "/v1/responses"] {
+        assert_eq!(
+            send(&app, "GET", path, None).await?.status,
+            StatusCode::METHOD_NOT_ALLOWED,
+            "{path} should be registered"
+        );
+    }
+
+    for path in [
+        "/v1/decision",
+        "/v1/messages/count_tokens",
+        "/v1/responses/input_tokens",
+        "/v1/responses/compact",
+        "/v1/models",
+        "/v1/stats",
+        "/v1/stats/reset",
+        "/v1/routing/session-stats",
+        "/metrics",
+        "/health",
+        "/future/provider/endpoint",
+    ] {
+        assert_eq!(
+            send(&app, "POST", path, None).await?.status,
+            StatusCode::NOT_FOUND,
+            "{path} should not be registered"
+        );
+    }
+    Ok(())
 }
 
 fn empty_token_totals() -> Value {
@@ -2512,12 +2550,89 @@ async fn routing_log_prefers_canonical_and_preserves_legacy_fallback() -> TestRe
     Ok(())
 }
 
+/// Two routes serving one model must remain distinguishable in the durable accounting record.
+#[tokio::test]
+async fn routing_log_attributes_shared_models_to_the_requested_route() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let temp_dir = tempfile::tempdir()?;
+    let log_path = temp_dir.path().join("routing.jsonl");
+    let state = load_test_config(&format!(
+        r#"
+schema_version = 1
+
+[llm_clients.upstream]
+format = "openai_chat"
+base_url = "{base_url}"
+
+[targets.shared]
+id = "model/shared"
+llm_client = "upstream"
+
+[targets.capable]
+id = "model/capable"
+llm_client = "upstream"
+
+[routes.passthrough]
+id = "route/passthrough"
+type = "passthrough"
+target = "shared"
+
+[routes.stage]
+id = "route/stage"
+type = "stage_router"
+capable_target = "capable"
+efficient_target = "shared"
+picker = "efficient_first"
+confidence_threshold = 1.0
+"#,
+        base_url = upstream.base_url
+    ))?
+    .with_routing_log(&log_path)?;
+    let app = build_switchyard_router(state);
+
+    for route_id in ["route/passthrough", "route/stage"] {
+        let response = send(
+            &app,
+            "POST",
+            "/v1/chat/completions",
+            Some(json!({
+                "model": route_id,
+                "messages": [{"role": "user", "content": "hello"}]
+            })),
+        )
+        .await?;
+        assert_eq!(response.status, StatusCode::OK, "{route_id}");
+        assert_eq!(
+            response
+                .headers
+                .get("x-model-router-selected-model")
+                .and_then(|value| value.to_str().ok()),
+            Some("model/shared"),
+            "{route_id}"
+        );
+    }
+
+    let records = std::fs::read_to_string(&log_path)?
+        .lines()
+        .map(serde_json::from_str::<Value>)
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["route_id"], "route/passthrough");
+    assert_eq!(records[0]["algorithm"], "passthrough");
+    assert_eq!(records[0]["model"], "model/shared");
+    assert_eq!(records[1]["route_id"], "route/stage");
+    assert_eq!(records[1]["algorithm"], "stage_router");
+    assert_eq!(records[1]["model"], "model/shared");
+    Ok(())
+}
+
 #[tokio::test]
 async fn routing_log_keeps_the_canonical_session_id_until_a_stream_drains() -> TestResult {
     let upstream = MockUpstream::start().await?;
     let temp_dir = tempfile::tempdir()?;
+    let log_path = temp_dir.path().join("routing.jsonl");
     let state = random_state(&upstream.base_url, &[(ROUTE_MODEL, &["model/a"])])?
-        .with_routing_log(temp_dir.path().join("routing.jsonl"))?;
+        .with_routing_log(&log_path)?;
     let app = build_switchyard_router(state);
 
     // `send_with_headers` collects the response body, so the stream wrapper reaches
@@ -2551,6 +2666,10 @@ async fn routing_log_keeps_the_canonical_session_id_until_a_stream_drains() -> T
     assert_eq!(stats["total_cached_tokens"], 7);
     assert_eq!(stats["total_cache_creation_tokens"], 2);
     assert_eq!(stats["total_completion_tokens"], 5);
+
+    let record: Value = serde_json::from_str(&std::fs::read_to_string(log_path)?)?;
+    assert_eq!(record["route_id"], ROUTE_MODEL);
+    assert_eq!(record["algorithm"], "random");
     Ok(())
 }
 
@@ -3219,6 +3338,8 @@ async fn advisor_route_routing_log_records_classifier_tier() -> TestResult {
         .find(|record| record["model"] == "model/advisor")
         .ok_or("consult row present")?;
     assert_eq!(consult["tier"], "classifier");
+    assert_eq!(consult["route_id"], "switchyard/advisor");
+    assert_eq!(consult["algorithm"], "advisor_gate");
     assert_eq!(consult["session_id"], "session-1");
     assert_eq!(consult["prompt_tokens"], 40);
     Ok(())
@@ -3472,5 +3593,77 @@ async fn responses_round_trips_codex_tool_namespaces() -> TestResult {
         .ok_or("stream produced no response.completed event")?;
     assert_eq!(completed["response"]["output"][0]["name"], "search");
     assert_eq!(completed["response"]["output"][0]["namespace"], "mcp__b");
+    Ok(())
+}
+
+// Verifies a route declaring `vision = true` advertises image input, and that an
+// undeclared route still fails closed to text-only.
+//
+// This is not cosmetic metadata. Codex reads `input_modalities` from the model card
+// and, when it reads text-only, replaces an attached image with the literal text
+// "image content omitted because you do not support image input" before sending — so
+// a route whose target can see but which does not say so loses the image in the
+// client, and Switchyard never receives one to forward.
+#[tokio::test]
+async fn models_endpoint_advertises_image_input_only_for_vision_routes() -> TestResult {
+    const CONFIG: &str = r#"
+schema_version = 1
+
+[llm_clients.shared]
+format = "openai_responses"
+base_url = "http://127.0.0.1:1/v1"
+
+[targets.shared]
+id = "shared-model"
+llm_client = "shared"
+
+[routes.sees]
+id = "sees"
+type = "passthrough"
+target = "shared"
+vision = true
+
+[routes.blind]
+id = "blind"
+type = "passthrough"
+target = "shared"
+"#;
+    let app = build_switchyard_router(load_test_config(CONFIG)?);
+    let models = send(&app, "GET", "/v1/models", None).await?;
+    assert_eq!(models.status, StatusCode::OK);
+    let body = models.json()?;
+
+    let codex_metadata = body["models"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| {
+            entry["slug"]
+                .as_str()
+                .map(|slug| (slug.to_string(), entry.clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        codex_metadata["sees"]["input_modalities"],
+        json!(["text", "image"])
+    );
+    assert_eq!(codex_metadata["blind"]["input_modalities"], json!(["text"]));
+
+    // The OpenAI `data` entry reports the raw Option, so an undeclared route stays
+    // distinguishable from one that declared `false`.
+    let capabilities = body["data"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| {
+            entry["id"]
+                .as_str()
+                .map(|id| (id.to_string(), entry["capabilities"].clone()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(capabilities["sees"]["vision"], json!(true));
+    assert_eq!(capabilities["blind"]["vision"], json!(null));
     Ok(())
 }

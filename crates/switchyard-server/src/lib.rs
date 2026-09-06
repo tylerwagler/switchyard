@@ -524,12 +524,18 @@ async fn stamp_request_start(mut request: HttpRequest, next: Next) -> Response {
     next.run(request).await
 }
 
-/// Builds an Axum router for the supported LLM wire formats.
+/// Builds an Axum router containing only the primary LLM inference endpoints.
+///
+/// The registered paths are `/v1/chat/completions`, `/v1/messages`, and `/v1/responses`.
+/// The router excludes operational, discovery, auxiliary, and fallback proxy routes so an
+/// embedding application can mount those capabilities under its own policies.
+pub fn build_llm_router(state: ServerState) -> Router {
+    finish_router(primary_llm_routes(), state)
+}
+
+/// Builds the full Axum router used by the standalone Switchyard server.
 pub fn build_switchyard_router(state: ServerState) -> Router {
-    let mut router = Router::new()
-        .route("/v1/chat/completions", post(openai_chat_completions))
-        .route("/v1/messages", post(anthropic_messages))
-        .route("/v1/responses", post(openai_responses))
+    let mut router = primary_llm_routes()
         .route("/v1/decision", post(decision))
         .route("/v1/messages/count_tokens", post(anthropic_count_tokens))
         .route(
@@ -549,8 +555,20 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
     if state.routing_log.is_some() {
         router = router.route("/v1/routing/session-stats", get(get_session_stats));
     }
+    finish_router(router.fallback(proxy_unmatched), state)
+}
+
+// Keeps the embedded and standalone servers on the same primary route definitions.
+fn primary_llm_routes() -> Router<ServerState> {
+    Router::new()
+        .route("/v1/chat/completions", post(openai_chat_completions))
+        .route("/v1/messages", post(anthropic_messages))
+        .route("/v1/responses", post(openai_responses))
+}
+
+// Applies the serving limits and request timing shared by both public router constructors.
+fn finish_router(router: Router<ServerState>, state: ServerState) -> Router {
     router
-        .fallback(proxy_unmatched)
         .layer(DefaultBodyLimit::max(DEFAULT_MAX_REQUEST_BODY_BYTES))
         // `layer` only wraps routes registered before it, so this stays last.
         .layer(axum::middleware::from_fn(stamp_request_start))
@@ -1036,6 +1054,7 @@ fn resolve_route(
     Ok((route, request))
 }
 
+/// Resolves and executes an LLM request, attaching route identity when durable logging is enabled.
 async fn handle_llm_request(
     state: ServerState,
     started: RequestStart,
@@ -1055,6 +1074,12 @@ async fn handle_llm_request(
         Ok(resolved) => resolved,
         Err(response) => return response,
     };
+    let routing_log_context = routing_log_context.map(|context| {
+        context.with_route(
+            request.llm_request.model.as_deref().unwrap_or_default(),
+            route.algorithm_name(),
+        )
+    });
     // Only the Codex namespace mapping is needed downstream, not the whole request.
     let request_extensions = request.llm_request.extensions.clone();
     let observer = stats_observer(
@@ -1539,6 +1564,7 @@ fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
         "capabilities": {
             "streaming": true,
             "tool_calling": capabilities.tool_calling,
+            "vision": capabilities.vision,
             "context_window": capabilities.context_window,
             "supported_inbound_formats": [
                 "openai-chat-completions",
@@ -1604,7 +1630,13 @@ fn codex_model_entry_json(model: &str, capabilities: ModelCapabilities, priority
         "max_context_window": capabilities.context_window,
         "effective_context_window_percent": 95,
         "experimental_supported_tools": [],
-        "input_modalities": ["text"],
+        // Codex omits an attached image client-side when this says text-only, so a
+        // route whose target can see must declare `vision = true`. Fails closed.
+        "input_modalities": if capabilities.vision.unwrap_or(false) {
+            json!(["text", "image"])
+        } else {
+            json!(["text"])
+        },
         "supports_search_tool": false,
     })
 }
