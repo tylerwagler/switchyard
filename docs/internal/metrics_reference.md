@@ -172,3 +172,22 @@ into label space.
 | `switchyard_algorithms_in_flight` stuck above zero with no traffic | Runs are parked on an internal routing call that never returns. Check the classifier or judge target's upstream. |
 | `switchyard_classifier_fail_open_total` rising | The judge target is failing or returning a response the classifier cannot parse. Check `judge_model` and `reason`. |
 | `switchyard_client_responses_total{outcome="retryable_error"}` rising | Either the upstream is genuinely flaky, or retries are exhausting; compare client responses with retryable upstream attempts. |
+
+## Upstream attribution
+
+`switchyard.llm_calls`, `switchyard.upstream_attempts`, and `switchyard.ttfb_ms`
+carry an `upstream` label naming the configured `[llm_clients.<name>]` that
+handled the call. The name is used, never the base URL, which can carry a
+credential in its query string.
+
+On `switchyard.llm_calls`, `selected_model` is the routing **decision** while
+`upstream` is the box that **answered**, resolved from the served target rather
+than the first choice. They agree on a normal request and disagree on a
+fallback, so a single series carries the pool-churn signal: traffic aimed at one
+box being served by another.
+
+`switchyard.upstream_attempts` is not pre-seeded, because its label values come
+from config that the lazy metrics init cannot see; a seeded series would appear
+as an unlabelled phantom beside the real ones. Like
+`switchyard.routing_fallbacks`, it materializes on first use, so alert rules
+should treat an absent series as zero rather than as "no alert".

@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 use opentelemetry::{KeyValue, global};
 use opentelemetry_sdk::metrics::{Aggregation, Instrument, SdkMeterProvider, Stream};
 use prometheus::{Encoder, Registry, TextEncoder};
-use switchyard_llm_client::metrics::{http_outcome_label, http_status_code_label};
+use switchyard_llm_client::metrics::http_outcome_label;
 
 pub(crate) const CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
 
@@ -116,16 +116,12 @@ fn llm_latency_buckets(instrument: &Instrument) -> Option<Stream> {
 /// The HTTP status codes we seed are somewhat arbitrary.
 fn seed_outcome_metrics() {
     let meter = global::meter("switchyard");
-    let upstream_attempts = meter.u64_counter("switchyard.upstream_attempts").build();
-    for status in [Some(200), Some(404), Some(429), Some(500), Some(504), None] {
-        upstream_attempts.add(
-            0,
-            &[
-                KeyValue::new("outcome", http_outcome_label(status)),
-                KeyValue::new("code", http_status_code_label(status)),
-            ],
-        );
-    }
+    // `switchyard.upstream_attempts` is deliberately NOT seeded. It carries an
+    // `upstream` label whose values come from config, which this lazy global
+    // init cannot see; seeding without the label emitted a second, unlabelled
+    // series family, and `sum by (upstream)` then collected a phantom
+    // empty-label bucket alongside the real boxes. The series appears on first
+    // traffic instead -- so alert rules on it should treat absent as zero.
 
     let client_responses = meter.u64_counter("switchyard.client_responses").build();
     for outcome in [

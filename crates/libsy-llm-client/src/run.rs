@@ -91,9 +91,20 @@ pub async fn run(
         )
         .await;
         let answer_duration = answer_started.elapsed();
+        // `selected_model` stays the routing DECISION; `upstream` is the box that
+        // actually answered, resolved from the served target rather than the
+        // first choice. On a fallback the two disagree, and that disagreement on
+        // one series is the pool-churn signal: traffic aimed at one box being
+        // served by another.
+        let served_model = result
+            .as_ref()
+            .ok()
+            .and_then(Response::served_model)
+            .unwrap_or(&selected_model_id);
         metrics::record_answer_call(
             &algorithm_name,
             &selected_model_id,
+            clients.upstream_name_for(served_model),
             answer_duration,
             &result,
         );

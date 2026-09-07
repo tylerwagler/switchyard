@@ -83,7 +83,7 @@ pub const fn http_status_code_label(status: Option<u16>) -> &'static str {
     }
 }
 
-pub(crate) fn record_upstream_attempt(status: Option<u16>) {
+pub(crate) fn record_upstream_attempt(upstream: Option<&str>, status: Option<u16>) {
     global::meter("switchyard")
         .u64_counter("switchyard.upstream_attempts")
         .build()
@@ -92,6 +92,7 @@ pub(crate) fn record_upstream_attempt(status: Option<u16>) {
             &[
                 KeyValue::new("outcome", http_outcome_label(status)),
                 KeyValue::new("code", http_status_code_label(status)),
+                KeyValue::new("upstream", upstream.unwrap_or(UNKNOWN_UPSTREAM).to_string()),
             ],
         );
 }
@@ -103,6 +104,10 @@ pub(crate) fn record_retry_recovered() {
         .build()
         .add(1, &[]);
 }
+
+/// Label value for a client that reports no configured name, so the dimension
+/// is always present and an alert rule never has to handle a missing label.
+const UNKNOWN_UPSTREAM: &str = "unknown";
 
 /// Records time to first token for a streamed call.
 ///
@@ -159,6 +164,7 @@ pub(crate) fn record_routing_overhead(algorithm: &str, overhead: Duration) {
 pub(crate) fn record_answer_call(
     algorithm: &str,
     selected_model: &ModelId,
+    upstream: Option<&str>,
     duration: Duration,
     result: &Result<Response>,
 ) {
@@ -166,6 +172,9 @@ pub(crate) fn record_answer_call(
         KeyValue::new("algorithm", algorithm.to_string()),
         KeyValue::new("selected_model", selected_model.to_string()),
         KeyValue::new("outcome", if result.is_ok() { "ok" } else { "error" }),
+        // `selected_model` says what was asked for; this says which box answered.
+        // They diverge on every fallback, which is the pool-churn signal.
+        KeyValue::new("upstream", upstream.unwrap_or(UNKNOWN_UPSTREAM).to_string()),
     ];
     let meter = global::meter("switchyard");
     meter

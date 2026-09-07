@@ -352,7 +352,7 @@ impl TranslatingLlmClient {
         let response = match builder.send().await {
             Ok(response) => response,
             Err(error) => {
-                metrics::record_upstream_attempt(None);
+                metrics::record_upstream_attempt(self.upstream_name.as_deref(), None);
                 return Err(AttemptFailure {
                     error: convert_reqwest_error(error),
                     status: None,
@@ -364,13 +364,13 @@ impl TranslatingLlmClient {
         if status.is_success() {
             if streaming {
                 // Streaming body failures happen after the retry boundary.
-                metrics::record_upstream_attempt(Some(status.as_u16()));
+                metrics::record_upstream_attempt(self.upstream_name.as_deref(), Some(status.as_u16()));
                 return Ok(EncodedResponse::Streaming(response));
             }
             let body = match response.bytes().await {
                 Ok(body) => body,
                 Err(error) => {
-                    metrics::record_upstream_attempt(None);
+                    metrics::record_upstream_attempt(self.upstream_name.as_deref(), None);
                     return Err(AttemptFailure {
                         error: convert_reqwest_error(error),
                         status: Some(status),
@@ -378,7 +378,7 @@ impl TranslatingLlmClient {
                     });
                 }
             };
-            metrics::record_upstream_attempt(Some(status.as_u16()));
+            metrics::record_upstream_attempt(self.upstream_name.as_deref(), Some(status.as_u16()));
             return Ok(EncodedResponse::Buffered {
                 status: status.as_u16(),
                 body: body.to_vec(),
@@ -389,7 +389,7 @@ impl TranslatingLlmClient {
         let body = match response.text().await {
             Ok(body) => body,
             Err(error) => {
-                metrics::record_upstream_attempt(None);
+                metrics::record_upstream_attempt(self.upstream_name.as_deref(), None);
                 return Err(AttemptFailure {
                     error: convert_reqwest_error(error),
                     status: Some(status),
@@ -398,7 +398,7 @@ impl TranslatingLlmClient {
             }
         };
         let body = backend.redact_forwarded_auth(body, metadata);
-        metrics::record_upstream_attempt(Some(status.as_u16()));
+        metrics::record_upstream_attempt(self.upstream_name.as_deref(), Some(status.as_u16()));
         let error =
             if status == reqwest::StatusCode::BAD_REQUEST && backend.is_context_overflow(&body) {
                 LlmClientError::ContextWindowExceeded {
