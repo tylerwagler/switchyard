@@ -215,6 +215,9 @@ async fn call_first_available(
             Err(error) if index + 1 == models.len() => return Err(error),
             Err(error) => match fallback_reason(&error) {
                 Some(reason) => {
+                    // Metric first: it is emitted for every hop including the
+                    // routing phase, where the observer channel is unavailable.
+                    metrics::record_routing_fallback(algorithm, reason);
                     on_fallback(reason);
                     tracing::info!(
                     from = %target,

@@ -12,7 +12,7 @@ use std::{
 use opentelemetry::metrics::ObservableGauge;
 use opentelemetry::{KeyValue, global};
 use switchyard_libsy::Result;
-use switchyard_protocol::{ModelId, Response};
+use switchyard_protocol::{ModelId, Response, RoutingFallbackReason};
 
 static TOTAL_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_ERRORS: AtomicU64 = AtomicU64::new(0);
@@ -102,6 +102,26 @@ pub(crate) fn record_retry_recovered() {
         .u64_counter("switchyard.router_retry_recovered")
         .build()
         .add(1, &[]);
+}
+
+/// Records one routing fallback: a candidate failed and the next was tried.
+///
+/// Emitted alongside the /v1/stats counter, not instead of it. The two answer
+/// different questions: /v1/stats is a windowed snapshot you read during an
+/// incident, this is the monotonic series you alert on. `switchyard.upstream_attempts`
+/// is not a substitute -- it counts attempts, so a retry against a single
+/// candidate is indistinguishable from a hop to the next one.
+pub(crate) fn record_routing_fallback(algorithm: &str, reason: RoutingFallbackReason) {
+    global::meter("switchyard")
+        .u64_counter("switchyard.routing_fallbacks")
+        .build()
+        .add(
+            1,
+            &[
+                KeyValue::new("algorithm", algorithm.to_string()),
+                KeyValue::new("reason", reason.as_str()),
+            ],
+        );
 }
 
 /// Records the time needed to produce the routing outcome, including classifier calls,
