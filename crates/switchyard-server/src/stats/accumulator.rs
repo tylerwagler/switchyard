@@ -99,6 +99,12 @@ impl StatsAccumulator {
         stats.total_latency.record(total_latency_ms);
     }
 
+    /// Records time to first token for a streamed answer call.
+    pub(crate) fn record_ttfb(&self, model: impl Into<ModelId>, ttfb_ms: f64) {
+        let mut inner = self.lock();
+        inner.model_stats_mut(model.into()).ttfb.record(ttfb_ms);
+    }
+
     /// Attributes one answer call to the upstream that handled it.
     ///
     /// `models` answers "what was asked for"; this answers "which box served".
@@ -292,6 +298,8 @@ struct ModelStats {
     seen_prefixes: HashSet<u64>,
     model_call_latency: LatencyHistogram,
     total_latency: LatencyHistogram,
+    /// Streamed responses only; see `LlmCallObservation::ttfb`.
+    ttfb: LatencyHistogram,
 }
 
 impl ModelStats {
@@ -446,6 +454,9 @@ pub(crate) struct ModelStatsSnapshot {
     pub theoretical_cache_hit_rate: f64,
     pub model_call_latency: LatencyHistogramSnapshot,
     pub total_latency: LatencyHistogramSnapshot,
+    /// Time to first token, streamed responses only. Empty when every response
+    /// was buffered -- a count of 0 means "not applicable", not "instant".
+    pub ttfb: LatencyHistogramSnapshot,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
@@ -499,6 +510,7 @@ fn build_model_snapshots(
                     stats.prompt_tokens,
                 ),
                 model_call_latency: stats.model_call_latency.snapshot(),
+                ttfb: stats.ttfb.snapshot(),
                 total_latency: stats.total_latency.snapshot(),
             };
             (model.clone(), snapshot)
@@ -636,6 +648,25 @@ mod tests {
             stats.prefix_eligibility(&ModelId::from("model/a"), &probe),
             0.0
         );
+    }
+
+    #[test]
+    fn ttfb_is_recorded_separately_from_call_latency() {
+        let stats = StatsAccumulator::default();
+        // a streamed call: fast first token, long total
+        stats.record_success("model/a", 3000.0);
+        stats.record_ttfb("model/a", 200.0);
+        // a buffered call: no TTFB to report
+        stats.record_success("model/a", 1000.0);
+
+        let snapshot = stats.snapshot();
+        let model = &snapshot.models[&ModelId::from("model/a")];
+        // TTFB counts only the streamed call, and does not contaminate the
+        // call-latency histogram that both calls land in.
+        assert_eq!(model.ttfb.count, 1);
+        assert_eq!(model.ttfb.max_ms, 200.0);
+        assert_eq!(model.model_call_latency.count, 2);
+        assert_eq!(model.model_call_latency.max_ms, 3000.0);
     }
 
     #[test]

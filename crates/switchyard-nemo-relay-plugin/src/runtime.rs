@@ -1000,6 +1000,7 @@ mod tests {
                 RunObservation::LlmCall(LlmCallObservation {
                     selected_model: ModelId::from("routing-model"),
                     upstream: None,
+                    ttfb: None,
                     is_success: false,
                     duration: std::time::Duration::from_millis(12),
                     usage: Some(Usage {
@@ -1092,6 +1093,7 @@ mod tests {
         let call = LlmCallObservation {
             selected_model: ModelId::from("judge-model"),
             upstream: None,
+            ttfb: None,
             is_success: true,
             duration: std::time::Duration::from_millis(1),
             usage: Some(Usage {
@@ -1154,6 +1156,7 @@ mod tests {
             vec![RunObservation::AnswerCall(LlmCallObservation {
                 selected_model: ModelId::from("selected-target"),
                 upstream: None,
+                ttfb: None,
                 is_success: true,
                 duration: std::time::Duration::from_millis(2),
                 usage: Some(Usage {

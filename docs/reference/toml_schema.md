@@ -94,6 +94,14 @@ server rejects an Anthropic forwarding route called through an OpenAI endpoint,
 or an OpenAI forwarding route called through an Anthropic endpoint, before it
 calls an upstream.
 
+Each model in `GET /v1/stats` also carries a `ttfb` histogram: time to the first
+decoded event, recorded for **streamed responses only**. It is kept apart from
+`model_call_latency` because blending them hides a prefix-cache miss, which
+shows up as a large TTFB at an otherwise normal streaming rate. A `ttfb` count of
+`0` means no streamed response has been served, not that the first token was
+instant. The same measurement is exported as the `switchyard.ttfb_ms` histogram,
+labelled by `selected_model` and `upstream`.
+
 `GET /v1/stats` reports per-upstream attribution under `upstreams`, keyed by the
 `[llm_clients.<name>]` name: `calls` for answer calls a box served and `errors`
 for ones it failed. This is distinct from `models`, which reports what was

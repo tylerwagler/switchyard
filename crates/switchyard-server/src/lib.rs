@@ -483,6 +483,9 @@ fn stats_observer(
             if let Some(upstream) = call.upstream.as_deref() {
                 stats.record_upstream_call(upstream, call.is_success);
             }
+            if let Some(ttfb) = call.ttfb {
+                stats.record_ttfb(&call.selected_model, ttfb.as_secs_f64() * 1_000.0);
+            }
             if call.is_success {
                 stats.record_success(&call.selected_model, latency_ms);
             } else {
@@ -1845,6 +1848,7 @@ mod tests {
             let observation = LlmCallObservation {
                 selected_model: ModelId::from(model),
                 upstream: None,
+                ttfb: None,
                 is_success: true,
                 duration: Duration::from_millis(3),
                 usage: Some(Usage {

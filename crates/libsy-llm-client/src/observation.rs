@@ -23,6 +23,14 @@ pub struct LlmCallObservation {
     pub is_success: bool,
     /// Time spent waiting for the model call to resolve.
     pub duration: Duration,
+    /// Time to the first decoded event, for streamed responses only.
+    ///
+    /// Separated from `duration` deliberately: a prefill that missed the prefix
+    /// cache shows up as a large TTFB at an otherwise normal streaming rate,
+    /// and one blended number hides exactly that. `None` for buffered
+    /// responses, where the whole body arrives at once and there is no first
+    /// token to be early or late.
+    pub ttfb: Option<Duration>,
     /// Normalized usage for a buffered successful response.
     pub usage: Option<Usage>,
 }

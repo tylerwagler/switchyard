@@ -15,14 +15,12 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use http::StatusCode;
 use parking_lot::Mutex;
 use switchyard_libsy::{Algorithm, CallModel, LibsyError, Result, RoutingOutcome, drive};
-use switchyard_protocol::{
-    LlmClientError, ModelId, Request, Response, RoutedLlmClient, RoutingFallbackReason,
-};
+use switchyard_protocol::{LlmClientError, ModelId, Request, Response, RoutedLlmClient, RoutingFallbackReason, LlmResponse};
 use switchyard_translation::prepare_request_for_target;
 
 use crate::observation::{LlmCallObservation, RunObservation, RunObserver};
@@ -309,11 +307,19 @@ async fn call_one(
         response
     });
     let result = observability::observe_client_call(result);
+    if let Some(ttfb) = ttfb_of(&result, duration) {
+        metrics::record_ttfb(algorithm, model_id, clients.upstream_name_for(model_id), ttfb);
+    }
     observe(LlmCallObservation {
         selected_model: model_id.clone(),
         // Resolved per attempt, so a fallback attributes each hop to the box
         // that actually handled it rather than to the first choice.
         upstream: clients.upstream_name_for(model_id).map(str::to_string),
+        // The client does not return a stream until it has pulled and
+        // classified the first event, so for a stream `duration` IS the time to
+        // first token. For a buffered response it is the whole generation, and
+        // reporting that as TTFB would defeat the point of separating them.
+        ttfb: ttfb_of(&result, duration),
         is_success: result.is_ok(),
         duration,
         usage: result
@@ -326,6 +332,20 @@ async fn call_one(
 }
 
 /// Whether a failed candidate is worth routing around.
+/// TTFB for a streamed response, `None` for a buffered one.
+///
+/// The client does not return a stream until it has pulled and classified the
+/// first event, so for a stream the call duration IS the time to first token.
+/// For a buffered response that same number is the whole generation, and
+/// reporting it as TTFB would defeat the point of separating them.
+fn ttfb_of(result: &Result<Response>, duration: Duration) -> Option<Duration> {
+    result
+        .as_ref()
+        .ok()
+        .filter(|response| matches!(response.llm_response, LlmResponse::Stream(_)))
+        .map(|_| duration)
+}
+
 fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
     let LibsyError::ClientCall { source, .. } = error else {
         return None;

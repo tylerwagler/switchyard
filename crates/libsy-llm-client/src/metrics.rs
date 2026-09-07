@@ -104,6 +104,25 @@ pub(crate) fn record_retry_recovered() {
         .add(1, &[]);
 }
 
+/// Records time to first token for a streamed call.
+///
+/// Separate from `switchyard.model_call_duration_ms` on purpose: blending
+/// prefill into one latency number hides a prefix-cache miss, which is a large
+/// TTFB at an otherwise normal streaming rate.
+pub(crate) fn record_ttfb(algorithm: &str, selected_model: &ModelId, upstream: Option<&str>, ttfb: Duration) {
+    global::meter("switchyard")
+        .f64_histogram("switchyard.ttfb_ms")
+        .build()
+        .record(
+            ttfb.as_secs_f64() * 1_000.0,
+            &[
+                KeyValue::new("algorithm", algorithm.to_string()),
+                KeyValue::new("selected_model", selected_model.to_string()),
+                KeyValue::new("upstream", upstream.unwrap_or("unknown").to_string()),
+            ],
+        );
+}
+
 /// Records one routing fallback: a candidate failed and the next was tried.
 ///
 /// Emitted alongside the /v1/stats counter, not instead of it. The two answer
