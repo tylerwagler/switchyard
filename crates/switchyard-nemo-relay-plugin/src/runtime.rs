@@ -999,6 +999,7 @@ mod tests {
             vec![
                 RunObservation::LlmCall(LlmCallObservation {
                     selected_model: ModelId::from("routing-model"),
+                    upstream: None,
                     is_success: false,
                     duration: std::time::Duration::from_millis(12),
                     usage: Some(Usage {
@@ -1090,6 +1091,7 @@ mod tests {
     fn token_usage_metrics_distinguish_routing_and_answer_targets() {
         let call = LlmCallObservation {
             selected_model: ModelId::from("judge-model"),
+            upstream: None,
             is_success: true,
             duration: std::time::Duration::from_millis(1),
             usage: Some(Usage {
@@ -1151,6 +1153,7 @@ mod tests {
             &mut events,
             vec![RunObservation::AnswerCall(LlmCallObservation {
                 selected_model: ModelId::from("selected-target"),
+                upstream: None,
                 is_success: true,
                 duration: std::time::Duration::from_millis(2),
                 usage: Some(Usage {

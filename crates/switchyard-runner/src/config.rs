@@ -591,7 +591,8 @@ impl DeploymentConfig {
         for (name, model_configs) in models_by_client {
             let client = Arc::new(
                 TranslatingLlmClient::new(&model_configs)
-                    .map_err(|error| RunnerError::configuration(error.to_string()))?,
+                    .map_err(|error| RunnerError::configuration(error.to_string()))?
+                    .with_upstream_name(name.clone()),
             );
             clients.insert(name, client);
         }

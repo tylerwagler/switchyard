@@ -99,6 +99,22 @@ impl StatsAccumulator {
         stats.total_latency.record(total_latency_ms);
     }
 
+    /// Attributes one answer call to the upstream that handled it.
+    ///
+    /// `models` answers "what was asked for"; this answers "which box served".
+    /// They diverge whenever one model id is reachable on more than one
+    /// upstream -- and a fallback means the box that served is not the box that
+    /// was selected.
+    pub(crate) fn record_upstream_call(&self, upstream: &str, is_success: bool) {
+        let mut inner = self.lock();
+        let stats = inner.by_upstream.entry(upstream.to_string()).or_default();
+        if is_success {
+            stats.calls = stats.calls.saturating_add(1);
+        } else {
+            stats.errors = stats.errors.saturating_add(1);
+        }
+    }
+
     /// Records one routing fallback: a candidate failed and the next was tried.
     ///
     /// Revived deliberately. Upstream deprecated these counters in favour of a
@@ -186,6 +202,7 @@ struct StatsAccumulatorInner {
     /// Unix seconds of the last routed request, so a stalled gateway is
     /// distinguishable from a quiet one.
     last_request: Option<u64>,
+    by_upstream: BTreeMap<String, UpstreamStats>,
     total_requests: u64,
     total_errors: u64,
     routing_overhead: LatencyHistogram,
@@ -200,6 +217,7 @@ impl StatsAccumulatorInner {
     fn new<'a>(registry: Registry, algorithms: impl IntoIterator<Item = &'a str>) -> Self {
         Self {
             by_model: BTreeMap::new(),
+            by_upstream: BTreeMap::new(),
             started_at: unix_now(),
             last_request: None,
             total_requests: 0,
@@ -232,6 +250,7 @@ impl StatsAccumulatorInner {
             started_at: self.started_at,
             uptime_s: unix_now().saturating_sub(self.started_at),
             last_request: self.last_request,
+            upstreams: self.by_upstream.clone(),
             total_requests: self.total_requests,
             total_errors: self.total_errors,
             total_tokens,
@@ -245,6 +264,7 @@ impl StatsAccumulatorInner {
 
     fn reset(&mut self) {
         self.by_model.clear();
+        self.by_upstream.clear();
         self.started_at = unix_now();
         self.last_request = None;
         self.total_requests = 0;
@@ -360,6 +380,8 @@ pub(crate) struct StatsSnapshot {
     pub started_at: u64,
     pub uptime_s: u64,
     pub last_request: Option<u64>,
+    /// Per-upstream attribution: which configured box actually served.
+    pub upstreams: BTreeMap<String, UpstreamStats>,
     pub total_requests: u64,
     pub total_errors: u64,
     pub total_tokens: TokenTotals,
@@ -368,6 +390,13 @@ pub(crate) struct StatsSnapshot {
     pub routing_fallbacks: RoutingFallbackStats,
     pub classifier: ClassifierStatsSnapshot,
     pub algorithm_stats: AlgorithmStatsSnapshot,
+}
+
+/// Calls attributed to one configured upstream.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+pub(crate) struct UpstreamStats {
+    pub calls: u64,
+    pub errors: u64,
 }
 
 /// Fallback counters: how many times a candidate failed and the next was tried.

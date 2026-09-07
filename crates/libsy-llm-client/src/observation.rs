@@ -13,6 +13,12 @@ use switchyard_protocol::{ModelId, Usage, RoutingFallbackReason};
 pub struct LlmCallObservation {
     /// Model selected for the completed call.
     pub selected_model: ModelId,
+    /// Configured upstream that served (or failed) this call.
+    ///
+    /// `selected_model` names *what* was asked for; this names *which box*
+    /// answered. They differ whenever one model id is served by more than one
+    /// upstream, which is exactly the redundant-pair case attribution is for.
+    pub upstream: Option<String>,
     /// Whether the call completed successfully.
     pub is_success: bool,
     /// Time spent waiting for the model call to resolve.

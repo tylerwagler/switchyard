@@ -119,6 +119,7 @@ impl AuxiliaryOperation {
 /// [`reqwest::Client`], and decodes the response back to the neutral IR (buffered
 /// or streamed).
 pub struct TranslatingLlmClient {
+    upstream_name: Option<String>,
     model_to_config: HashMap<ModelId, ModelConfig>,
     client: reqwest::Client,
     forward_auth_client: reqwest::Client,
@@ -152,10 +153,18 @@ impl TranslatingLlmClient {
             .collect();
 
         Ok(Self {
+            upstream_name: None,
             model_to_config,
             client,
             forward_auth_client,
         })
+    }
+
+    /// Names the upstream this client talks to, for observability attribution.
+    #[must_use]
+    pub fn with_upstream_name(mut self, name: impl Into<String>) -> Self {
+        self.upstream_name = Some(name.into());
+        self
     }
 
     /// The backend serving `model` over `format` — the default backend when its
@@ -583,6 +592,10 @@ impl TranslatingLlmClient {
 
 #[async_trait]
 impl RoutedLlmClient for TranslatingLlmClient {
+    fn upstream_name(&self) -> Option<&str> {
+        self.upstream_name.as_deref()
+    }
+
     async fn call(&self, request: Request) -> Result<Response> {
         self.call_rewrite_model(request, None).await
     }

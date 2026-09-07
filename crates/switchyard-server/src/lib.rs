@@ -480,6 +480,9 @@ fn stats_observer(
     Arc::new(move |observation| match observation {
         RunObservation::AnswerCall(call) => {
             let latency_ms = call.duration.as_secs_f64() * 1_000.0;
+            if let Some(upstream) = call.upstream.as_deref() {
+                stats.record_upstream_call(upstream, call.is_success);
+            }
             if call.is_success {
                 stats.record_success(&call.selected_model, latency_ms);
             } else {
@@ -1841,6 +1844,7 @@ mod tests {
         let call = |model: &str, answer: bool| {
             let observation = LlmCallObservation {
                 selected_model: ModelId::from(model),
+                upstream: None,
                 is_success: true,
                 duration: Duration::from_millis(3),
                 usage: Some(Usage {

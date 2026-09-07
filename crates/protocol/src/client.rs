@@ -139,4 +139,12 @@ impl RoutingFallbackReason {
 pub trait RoutedLlmClient: Send + Sync {
     /// Make a request
     async fn call(&self, request: Request) -> Result<Response, LlmClientError>;
+
+    /// Configured name of the upstream this client talks to, when known.
+    ///
+    /// The *name*, never the base URL: a base URL can carry a credential in its
+    /// query string, and this value is used as a metric label.
+    fn upstream_name(&self) -> Option<&str> {
+        None
+    }
 }

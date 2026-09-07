@@ -613,6 +613,7 @@ async fn stats_exposes_the_exact_empty_schema_and_no_legacy_alias() -> TestResul
                 "context_window": 0,
                 "unavailable": 0
             },
+            "upstreams": {},
             "classifier": {
                 "total_requests": 0,
                 "total_errors": 0,
@@ -2795,6 +2796,10 @@ async fn unavailable_target_fails_over_across_endpoints_and_stops_when_exhausted
     // walked its dead first candidate before the second served.
     assert_eq!(stats["routing_fallbacks"]["unavailable"], 3);
     assert_eq!(stats["routing_fallbacks"]["context_window"], 0);
+    // Attribution is per box, not per model: the dead first candidate wears the
+    // errors and the box that actually served wears the calls.
+    assert_eq!(stats["upstreams"]["mock"]["calls"], 3);
+    assert_eq!(stats["upstreams"]["mock"]["errors"], 3);
     assert_eq!(stats["models"]["model/strong"]["calls"], 3);
     assert_eq!(stats["models"]["model/weak"]["errors"], 3);
 

@@ -94,6 +94,12 @@ server rejects an Anthropic forwarding route called through an OpenAI endpoint,
 or an OpenAI forwarding route called through an Anthropic endpoint, before it
 calls an upstream.
 
+`GET /v1/stats` reports per-upstream attribution under `upstreams`, keyed by the
+`[llm_clients.<name>]` name: `calls` for answer calls a box served and `errors`
+for ones it failed. This is distinct from `models`, which reports what was
+*asked for* -- the two diverge on any fallback, where the box that served is not
+the box that was selected.
+
 `GET /v1/upstreams` probes every configured client's `base_url` for live TCP
 reachability, reporting `reachable`, `probe_ms`, and an `error` when it fails.
 Probes are connect-and-close (no model call, no credentials, no tokens) and run

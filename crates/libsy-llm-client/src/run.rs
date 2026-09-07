@@ -311,6 +311,9 @@ async fn call_one(
     let result = observability::observe_client_call(result);
     observe(LlmCallObservation {
         selected_model: model_id.clone(),
+        // Resolved per attempt, so a fallback attributes each hop to the box
+        // that actually handled it rather than to the first choice.
+        upstream: clients.upstream_name_for(model_id).map(str::to_string),
         is_success: result.is_ok(),
         duration,
         usage: result
@@ -371,6 +374,14 @@ enum Routing {
 }
 
 impl ClientRouter {
+    /// Configured upstream name serving `model`, when the client reports one.
+    pub fn upstream_name_for(&self, model: &ModelId) -> Option<&str> {
+        match &self.inner.routing {
+            Routing::Single(client) => client.upstream_name(),
+            Routing::ByModel(by_model) => by_model.get(model).and_then(|c| c.upstream_name()),
+        }
+    }
+
     /// Build a router over `model name -> client`, for targets spread across providers.
     pub fn new(by_model: HashMap<ModelId, Arc<dyn RoutedLlmClient>>) -> Self {
         Self::new_with_target_prompts(by_model, HashMap::new(), None)
