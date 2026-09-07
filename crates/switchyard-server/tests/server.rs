@@ -582,8 +582,19 @@ async fn stats_exposes_the_exact_empty_schema_and_no_legacy_alias() -> TestResul
     let (_upstream, app) = test_app(&[(ROUTE_MODEL, &["model/a"])]).await?;
     let response = send(&app, "GET", "/v1/stats", None).await?;
     assert_eq!(response.status, StatusCode::OK);
+    let mut body = response.json()?;
+    // The counting window is time-dependent: assert it separately, then compare
+    // the rest of the schema exactly.
+    let object = body.as_object_mut().expect("stats object");
+    let started_at = object.remove("started_at").expect("started_at present");
+    let uptime_s = object.remove("uptime_s").expect("uptime_s present");
+    let last_request = object.remove("last_request").expect("last_request present");
+    assert!(started_at.as_u64().is_some_and(|value| value > 0));
+    assert!(uptime_s.as_u64().is_some());
+    // no request has been routed yet
+    assert_eq!(last_request, Value::Null);
     assert_eq!(
-        response.json()?,
+        body,
         json!({
             "total_requests": 0,
             "total_errors": 0,
@@ -2780,8 +2791,9 @@ async fn unavailable_target_fails_over_across_endpoints_and_stops_when_exhausted
     }
 
     let stats = send(&app, "GET", "/v1/stats", None).await?.json()?;
-    // Fallback causes are logged rather than accumulated in the legacy stats counters.
-    assert_eq!(stats["routing_fallbacks"]["unavailable"], 0);
+    // Fallbacks are counted as well as logged: one per case above, each having
+    // walked its dead first candidate before the second served.
+    assert_eq!(stats["routing_fallbacks"]["unavailable"], 3);
     assert_eq!(stats["routing_fallbacks"]["context_window"], 0);
     assert_eq!(stats["models"]["model/strong"]["calls"], 3);
     assert_eq!(stats["models"]["model/weak"]["errors"], 3);

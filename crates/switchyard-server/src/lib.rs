@@ -508,6 +508,9 @@ fn stats_observer(
                 stats.record_classifier_error(call.selected_model);
             }
         }
+        RunObservation::RoutingFallback(reason) => {
+            stats.record_routing_fallback(reason);
+        }
         RunObservation::RoutingOverhead(duration) => {
             stats.record_routing_overhead(duration.as_secs_f64() * 1_000.0);
         }

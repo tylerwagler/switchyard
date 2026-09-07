@@ -246,6 +246,9 @@ impl SwitchyardRuntime {
                     call_index += 1;
                     self.routing_call_events(events, call, call_index, metadata);
                 }
+                // Relay owns its own telemetry; the fallback is already on the
+                // tracing log, so there is nothing extra to forward here.
+                RunObservation::RoutingFallback(_) => {}
                 RunObservation::RoutingOverhead(duration) => {
                     let latency_ms = duration.as_secs_f64() * 1_000.0;
                     events.push(RoutingEvent::Mark(RoutingMark {

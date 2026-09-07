@@ -77,6 +77,11 @@ pub async fn run(
                 observer(RunObservation::AnswerCall(observation));
             }
         };
+        let on_fallback = |reason| {
+            if let Some(observer) = &observer {
+                observer(RunObservation::RoutingFallback(reason));
+            }
+        };
         let result = call_first_available(
             &clients,
             &algorithm_name,
@@ -84,6 +89,7 @@ pub async fn run(
             &outcome.selected_model_ids,
             CallPhase::Completion,
             &observe,
+            &on_fallback,
         )
         .await;
         let answer_duration = answer_started.elapsed();
@@ -157,6 +163,10 @@ async fn serve(
             observations.lock().push(observation);
         }
     };
+    // Routing-phase (classifier/judge) fallbacks are not counted: `serve` holds
+    // the LlmCallObservation sink, not the RunObserver. Routes that make no
+    // routing calls -- passthrough and random -- are unaffected.
+    let on_fallback = |_reason| {};
     let result = call_first_available(
         &clients,
         &call.algorithm,
@@ -164,6 +174,7 @@ async fn serve(
         &call.models,
         CallPhase::Routing,
         &observe,
+        &on_fallback,
     )
     .await;
     call.respond(result)
@@ -182,6 +193,7 @@ async fn call_first_available(
     models: &[ModelId],
     phase: CallPhase,
     observe: &(dyn Fn(LlmCallObservation) + Send + Sync),
+    on_fallback: &(dyn Fn(RoutingFallbackReason) + Send + Sync),
 ) -> Result<Response> {
     for (index, target) in models.iter().enumerate() {
         let request = match phase {
@@ -202,12 +214,15 @@ async fn call_first_available(
             Ok(response) => return Ok(response),
             Err(error) if index + 1 == models.len() => return Err(error),
             Err(error) => match fallback_reason(&error) {
-                Some(reason) => tracing::info!(
+                Some(reason) => {
+                    on_fallback(reason);
+                    tracing::info!(
                     from = %target,
                     to = %models[index + 1],
                     reason = reason.as_str(),
                     "model call failed; trying next candidate"
-                ),
+                    );
+                }
                 None => return Err(error),
             },
         }

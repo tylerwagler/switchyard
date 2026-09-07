@@ -12,7 +12,7 @@ use serde::Serialize;
 
 use super::algorithms::{AlgorithmStats, AlgorithmStatsSnapshot};
 use super::cache_eligibility::PrefixProbe;
-use switchyard_protocol::ModelId;
+use switchyard_protocol::{ModelId, RoutingFallbackReason};
 
 const MAX_LATENCY_SAMPLES: usize = 10_000;
 
@@ -39,6 +39,14 @@ impl Default for StatsAccumulator {
     }
 }
 
+/// Unix seconds, saturating to 0 if the clock is before the epoch.
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_secs())
+        .unwrap_or(0)
+}
+
 impl StatsAccumulator {
     /// Creates a stats store for the supplied algorithm names.
     pub(crate) fn new<'a>(
@@ -54,6 +62,7 @@ impl StatsAccumulator {
     pub(crate) fn record_success(&self, model: impl Into<ModelId>, backend_latency_ms: f64) {
         let mut inner = self.lock();
         inner.total_requests = inner.total_requests.saturating_add(1);
+        inner.last_request = Some(unix_now());
         let stats = inner.model_stats_mut(model.into());
         stats.calls = stats.calls.saturating_add(1);
         stats.model_call_latency.record(backend_latency_ms);
@@ -64,6 +73,7 @@ impl StatsAccumulator {
         let mut inner = self.lock();
         inner.total_requests = inner.total_requests.saturating_add(1);
         inner.total_errors = inner.total_errors.saturating_add(1);
+        inner.last_request = Some(unix_now());
         let stats = inner.model_stats_mut(model.into());
         stats.errors = stats.errors.saturating_add(1);
     }
@@ -87,6 +97,25 @@ impl StatsAccumulator {
         let stats = inner.model_stats_mut(model.into());
         stats.add_usage(usage);
         stats.total_latency.record(total_latency_ms);
+    }
+
+    /// Records one routing fallback: a candidate failed and the next was tried.
+    ///
+    /// Revived deliberately. Upstream deprecated these counters in favour of a
+    /// log line, which leaves `/v1/stats` reporting a hard zero while fallbacks
+    /// are actively happening -- worse than omitting the field, because a
+    /// silent pool-churn failure is exactly what it looks like it would catch.
+    pub(crate) fn record_routing_fallback(&self, reason: RoutingFallbackReason) {
+        let mut inner = self.lock();
+        let fallbacks = &mut inner.routing_fallbacks;
+        match reason {
+            RoutingFallbackReason::ContextWindow => {
+                fallbacks.context_window = fallbacks.context_window.saturating_add(1);
+            }
+            RoutingFallbackReason::Unavailable => {
+                fallbacks.unavailable = fallbacks.unavailable.saturating_add(1);
+            }
+        }
     }
 
     /// Records routing time for one completed algorithm run.
@@ -149,6 +178,14 @@ impl StatsAccumulator {
 
 struct StatsAccumulatorInner {
     by_model: BTreeMap<ModelId, ModelStats>,
+    /// Unix seconds when this counting window opened. Counters are
+    /// process-lifetime and reset with them, and a count without its window is
+    /// not a rate -- "9 requests" means nothing until you know whether that is
+    /// since a minute ago or since last month.
+    started_at: u64,
+    /// Unix seconds of the last routed request, so a stalled gateway is
+    /// distinguishable from a quiet one.
+    last_request: Option<u64>,
     total_requests: u64,
     total_errors: u64,
     routing_overhead: LatencyHistogram,
@@ -163,6 +200,8 @@ impl StatsAccumulatorInner {
     fn new<'a>(registry: Registry, algorithms: impl IntoIterator<Item = &'a str>) -> Self {
         Self {
             by_model: BTreeMap::new(),
+            started_at: unix_now(),
+            last_request: None,
             total_requests: 0,
             total_errors: 0,
             routing_overhead: LatencyHistogram::default(),
@@ -190,6 +229,9 @@ impl StatsAccumulatorInner {
             self.classifier_errors,
         );
         StatsSnapshot {
+            started_at: self.started_at,
+            uptime_s: unix_now().saturating_sub(self.started_at),
+            last_request: self.last_request,
             total_requests: self.total_requests,
             total_errors: self.total_errors,
             total_tokens,
@@ -203,6 +245,8 @@ impl StatsAccumulatorInner {
 
     fn reset(&mut self) {
         self.by_model.clear();
+        self.started_at = unix_now();
+        self.last_request = None;
         self.total_requests = 0;
         self.total_errors = 0;
         self.routing_overhead = LatencyHistogram::default();
@@ -313,6 +357,9 @@ impl LatencyHistogram {
 /// Full JSON stats snapshot.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub(crate) struct StatsSnapshot {
+    pub started_at: u64,
+    pub uptime_s: u64,
+    pub last_request: Option<u64>,
     pub total_requests: u64,
     pub total_errors: u64,
     pub total_tokens: TokenTotals,
@@ -323,9 +370,10 @@ pub(crate) struct StatsSnapshot {
     pub algorithm_stats: AlgorithmStatsSnapshot,
 }
 
-/// Legacy fallback counters retained in the stats response shape.
+/// Fallback counters: how many times a candidate failed and the next was tried.
 ///
-/// New fallback details are logged instead.
+/// Upstream deprecated these in favour of a log line; this fork keeps them
+/// populated, because a fallback is a state you want to alert on, not grep for.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub(crate) struct RoutingFallbackStats {
     pub context_window: u64,
@@ -541,11 +589,39 @@ mod tests {
 
         stats.reset();
 
-        assert_eq!(stats.snapshot(), StatsSnapshot::default());
+        let snapshot = stats.snapshot();
+        // Reset restarts the counting window rather than zeroing it, so a
+        // reset snapshot is deliberately NOT the zero value: the counters are
+        // cleared but `started_at` marks the new window.
+        assert!(snapshot.started_at > 0);
+        assert_eq!(snapshot.last_request, None);
+        assert_eq!(
+            StatsSnapshot {
+                started_at: 0,
+                uptime_s: 0,
+                ..snapshot.clone()
+            },
+            StatsSnapshot::default()
+        );
         assert_eq!(
             stats.prefix_eligibility(&ModelId::from("model/a"), &probe),
             0.0
         );
+    }
+
+    #[test]
+    fn routing_fallbacks_count_by_reason_and_clear_on_reset() {
+        let stats = StatsAccumulator::default();
+        stats.record_routing_fallback(RoutingFallbackReason::Unavailable);
+        stats.record_routing_fallback(RoutingFallbackReason::Unavailable);
+        stats.record_routing_fallback(RoutingFallbackReason::ContextWindow);
+
+        let snapshot = stats.snapshot();
+        assert_eq!(snapshot.routing_fallbacks.unavailable, 2);
+        assert_eq!(snapshot.routing_fallbacks.context_window, 1);
+
+        stats.reset();
+        assert_eq!(stats.snapshot().routing_fallbacks, RoutingFallbackStats::default());
     }
 
     #[test]

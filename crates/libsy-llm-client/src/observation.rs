@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use switchyard_protocol::{ModelId, Usage};
+use switchyard_protocol::{ModelId, Usage, RoutingFallbackReason};
 
 /// One completed model call observed while serving an algorithm run.
 #[derive(Clone, Debug)]
@@ -30,6 +30,9 @@ pub enum RunObservation {
     AnswerCall(LlmCallObservation),
     /// Routing time recorded by the `switchyard.routing_overhead_ms` metric.
     RoutingOverhead(Duration),
+    /// A candidate failed and the next one was tried. Emitted per fallback
+    /// hop, so a request that walks two dead candidates emits two.
+    RoutingFallback(RoutingFallbackReason),
 }
 
 /// Request-scoped callback for algorithm-run observations.
