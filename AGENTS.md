@@ -1,9 +1,9 @@
 # AGENTS.md — Switchyard
 
-Switchyard is a Python library for LLM traffic orchestration. It sits between client applications (Claude Code, OpenAI / Anthropic SDK clients, Codex CLI) and LLM backends, handling routing, format translation, logging, A/B testing, and health-aware multi-endpoint serving.
+Switchyard is a Rust proxy and library for LLM traffic orchestration, with Python bindings. It sits between client applications (Claude Code, OpenAI / Anthropic SDK clients, Codex CLI) and LLM backends, handling routing, format translation, logging, A/B testing, and ordered multi-target fallback.
 
-> **Note:** The public distribution is `nemo-switchyard`. All imports use `switchyard.*`,
-> and the CLI command is `switchyard` (registered via `pyproject.toml` scripts).
+> **Note:** The public Python distribution is `nemo-switchyard`; all imports use `switchyard.*`.
+> There is no Python CLI — the only executable is the native `switchyard-server` binary.
 
 ## Engineering Guidelines
 
@@ -165,6 +165,8 @@ crates/protocol/                    # provider-neutral protocol types
 crates/switchyard-server/           # native HTTP server and TOML config
 crates/switchyard-translation/      # wire-format codecs
 crates/switchyard-py/               # libsy and server PyO3 bindings
+crates/switchyard-skill-distillation/  # contracts for turning agent trajectories into skills
+crates/switchyard-soak/             # soak/load tester with release gates for a live server
 
 tests/                              # Unit tests (pytest)
 ```
@@ -202,6 +204,7 @@ switchyard-server --config routes.toml --port 4000
 
 ```bash
 # Unit tests — no API keys needed
+# (pytest is configured with addopts = "-x": it stops on the first failure)
 uv run pytest tests/ -v
 
 # Single test file / function
@@ -214,6 +217,8 @@ uv run pytest tests/test_libsy_minimal_bindings.py -v
 # Lint / type check (run before every commit)
 uv run ruff check .
 uv run mypy switchyard
+cargo fmt --all --check
+cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
