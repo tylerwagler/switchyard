@@ -8,8 +8,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use axum::Router;
 use axum::Json;
+use axum::Router;
 use axum::body::Body;
 use axum::extract::{Query, State};
 use axum::http::{Request as HttpRequest, StatusCode};
@@ -118,9 +118,7 @@ async fn upstream_messages(Json(_body): Json<Value>) -> impl IntoResponse {
 /// `upstream` and `searxng` are the mock HTTP endpoints.
 fn deployment(upstream: &str, searxng: &str, web_search_enabled: bool) -> String {
     let web_search = if web_search_enabled {
-        format!(
-            "\n[web_search]\nenabled = true\nsearxng_url = \"{searxng}\"\nmax_results = 3\n"
-        )
+        format!("\n[web_search]\nenabled = true\nsearxng_url = \"{searxng}\"\nmax_results = 3\n")
     } else {
         String::new()
     };
@@ -279,13 +277,22 @@ async fn web_search_accepts_array_content_blocks() -> TestResult {
     let upstream = UpstreamApp::start().await?;
     let app = started_router(&stub.base_url, &upstream.base_url, true).await?;
 
-    let response = send(&app, "POST", "/v1/messages", Some(web_search_block_content_body())).await?;
+    let response = send(
+        &app,
+        "POST",
+        "/v1/messages",
+        Some(web_search_block_content_body()),
+    )
+    .await?;
     assert_eq!(response.status, StatusCode::OK);
     let body: Value = serde_json::from_slice(&response.bytes)?;
     let content = body["content"].as_array().expect("content array");
     assert_eq!(content[0]["type"], "server_tool_use");
     // The query must come from the text block, not be empty.
-    assert_eq!(stub.recorded_queries().await, vec!["biggest AI news this week"]);
+    assert_eq!(
+        stub.recorded_queries().await,
+        vec!["biggest AI news this week"]
+    );
     Ok(())
 }
 
@@ -300,9 +307,18 @@ async fn web_search_streaming_emits_anthropic_sse() -> TestResult {
     let response = send(&app, "POST", "/v1/messages", Some(body)).await?;
     assert_eq!(response.status, StatusCode::OK);
     let text = String::from_utf8(response.bytes)?;
-    assert!(text.contains("message_start"), "missing message_start: {text}");
-    assert!(text.contains("content_block_start"), "missing content_block_start");
-    assert!(text.contains("server_tool_use"), "missing server_tool_use block");
+    assert!(
+        text.contains("message_start"),
+        "missing message_start: {text}"
+    );
+    assert!(
+        text.contains("content_block_start"),
+        "missing content_block_start"
+    );
+    assert!(
+        text.contains("server_tool_use"),
+        "missing server_tool_use block"
+    );
     assert!(text.contains("message_stop"), "missing message_stop");
     Ok(())
 }
@@ -350,7 +366,10 @@ async fn web_search_retries_transient_searxng_failures() -> TestResult {
     assert_eq!(response.status, StatusCode::OK);
     let body: Value = serde_json::from_slice(&response.bytes)?;
     assert_eq!(body["content"][0]["type"], "server_tool_use");
-    assert_eq!(body["content"][1]["content"][0]["url"], "https://example.com/a");
+    assert_eq!(
+        body["content"][1]["content"][0]["url"],
+        "https://example.com/a"
+    );
     Ok(())
 }
 
@@ -376,7 +395,10 @@ async fn web_search_outage_is_reported_not_masked_as_empty_results() -> TestResu
         "expected no results on outage: {all}"
     );
     let text = body["content"][2]["text"].as_str().unwrap_or("");
-    assert!(text.contains("temporarily unavailable"), "expected outage notice: {text}");
+    assert!(
+        text.contains("temporarily unavailable"),
+        "expected outage notice: {text}"
+    );
     assert!(
         text.contains("search returned 400"),
         "expected the error detail in the notice: {text}"
@@ -415,7 +437,14 @@ async fn web_search_reranks_candidates_best_first() -> TestResult {
         .iter()
         .filter_map(|r| r["url"].as_str())
         .collect();
-    assert_eq!(urls, vec!["https://example.com/b", "https://example.com/c", "https://example.com/a"]);
+    assert_eq!(
+        urls,
+        vec![
+            "https://example.com/b",
+            "https://example.com/c",
+            "https://example.com/a"
+        ]
+    );
     Ok(())
 }
 

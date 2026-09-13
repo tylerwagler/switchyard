@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use switchyard_protocol::{ModelId, Usage, RoutingFallbackReason};
+use switchyard_protocol::{ModelId, RoutingFallbackReason, Usage};
 
 /// One completed model call observed while serving an algorithm run.
 #[derive(Clone, Debug)]

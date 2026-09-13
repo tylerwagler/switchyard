@@ -114,7 +114,12 @@ const UNKNOWN_UPSTREAM: &str = "unknown";
 /// Separate from `switchyard.model_call_duration_ms` on purpose: blending
 /// prefill into one latency number hides a prefix-cache miss, which is a large
 /// TTFB at an otherwise normal streaming rate.
-pub(crate) fn record_ttfb(algorithm: &str, selected_model: &ModelId, upstream: Option<&str>, ttfb: Duration) {
+pub(crate) fn record_ttfb(
+    algorithm: &str,
+    selected_model: &ModelId,
+    upstream: Option<&str>,
+    ttfb: Duration,
+) {
     global::meter("switchyard")
         .f64_histogram("switchyard.ttfb_ms")
         .build()

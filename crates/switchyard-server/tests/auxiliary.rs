@@ -9,11 +9,11 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use axum::Json;
+use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
 use axum::http::{Request as HttpRequest, StatusCode};
-use axum::routing::{get, post};
-use axum::Router;
+use axum::routing::post;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
 use switchyard_runner::Runner;
@@ -44,7 +44,9 @@ impl EchoStub {
             id: id.to_string(),
             received: Arc::clone(&received),
         };
-        let app = Router::new().route(path, post(echo_handler)).with_state(state);
+        let app = Router::new()
+            .route(path, post(echo_handler))
+            .with_state(state);
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let addr = listener.local_addr()?;
         let task = tokio::spawn(async move {
@@ -73,7 +75,10 @@ async fn echo_handler(
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     state.received.lock().unwrap().push(body.clone());
-    (StatusCode::OK, Json(json!({ "echo_id": state.id, "got": body })))
+    (
+        StatusCode::OK,
+        Json(json!({ "echo_id": state.id, "got": body })),
+    )
 }
 
 // --- deployment ---------------------------------------------------------------
@@ -135,7 +140,12 @@ async fn send(app: &Router, method: &str, path: &str, body: Option<Value>) -> Te
     Ok(Response { status, bytes })
 }
 
-async fn started(embed_a: &EchoStub, embed_b: &EchoStub, rerank: &EchoStub, search: &EchoStub) -> TestResult<Router> {
+async fn started(
+    embed_a: &EchoStub,
+    embed_b: &EchoStub,
+    rerank: &EchoStub,
+    search: &EchoStub,
+) -> TestResult<Router> {
     let state = ServerState::from_runner(Runner::from_toml(&deployment(
         &embed_a.base_url,
         &embed_b.base_url,
@@ -195,10 +205,21 @@ async fn embeddings_unknown_name_is_404() -> TestResult {
     let s = EchoStub::start("s", "/search").await?;
     let app = started(&a, &b, &r, &s).await?;
 
-    let response = send(&app, "POST", "/v1/embeddings/nope", Some(json!({ "input": [] }))).await?;
+    let response = send(
+        &app,
+        "POST",
+        "/v1/embeddings/nope",
+        Some(json!({ "input": [] })),
+    )
+    .await?;
     assert_eq!(response.status, StatusCode::NOT_FOUND);
     let result: Value = serde_json::from_slice(&response.bytes)?;
-    assert!(result["error"]["message"].as_str().unwrap().contains("embeddings backend named nope"));
+    assert!(
+        result["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("embeddings backend named nope")
+    );
     Ok(())
 }
 

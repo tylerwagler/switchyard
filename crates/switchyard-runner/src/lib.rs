@@ -10,16 +10,17 @@ mod route;
 mod runner;
 
 pub use algorithm::{
-    AdvisorTriggerConfig, AlgorithmConfigError, AlgorithmSpec, ClassifierMode,
+    AdvisorTriggerConfig, AlgorithmConfigError, AlgorithmSpec, CategoryModelConfig, ClassifierMode,
     ClassifierPolicyConfig, LlmClassifierRouteConfig, StageClassifierConfig, SubagentRouteConfig,
 };
 pub use failure::{RouteErrorKind, RouteErrorPhase, RouteErrorSummary, stream_error_summary};
-pub use route::{
-    AuxiliaryTarget, CallerAuthKind, ModelCapabilities, Route, RunOutput, RunnerError,
-};
+// Re-exported because `Route::new` takes it, so a host wiring routes does not need a libsy dep.
 pub use config::{
     CacheConfig, EmbeddingsConfig, RerankConfig, ResolvedCache, ResolvedRerank, ResolvedWebSearch,
-    SearchConfig,
-    WebSearchConfig,
+    SearchConfig, WebSearchConfig,
+};
+pub use libsy::RuntimeModels;
+pub use route::{
+    AuxiliaryTarget, CallerAuthKind, ModelCapabilities, Route, RunOutput, RunnerError,
 };
 pub use runner::{DecisionDescription, DecisionTarget, ModelInfo, Runner};

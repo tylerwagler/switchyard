@@ -104,16 +104,17 @@ fn content_text(content: &Value) -> String {
 /// declared tool is a web-search tool, or the single user message is the literal
 /// "Perform a web search for the query: …" instruction.
 pub(crate) fn is_dedicated_web_search(body: &Value) -> bool {
-    if let Some(tools) = body.get("tools").and_then(Value::as_array) {
-        if !tools.is_empty() && tools.iter().all(is_web_tool) {
-            return true;
-        }
+    if let Some(tools) = body.get("tools").and_then(Value::as_array)
+        && !tools.is_empty()
+        && tools.iter().all(is_web_tool)
+    {
+        return true;
     }
     let messages = body.get("messages").and_then(Value::as_array);
-    if let Some([message]) = messages.map(|m| m.as_slice()) {
-        if let Some(content) = message.get("content") {
-            return parse_instruction(&content_text(content)).is_some();
-        }
+    if let Some([message]) = messages.map(|m| m.as_slice())
+        && let Some(content) = message.get("content")
+    {
+        return parse_instruction(&content_text(content)).is_some();
     }
     false
 }
@@ -322,7 +323,11 @@ async fn rerank(
         .iter()
         .filter_map(|(index, _)| candidates.get(*index).cloned())
         .collect();
-    if ranked.is_empty() { None } else { Some(ranked) }
+    if ranked.is_empty() {
+        None
+    } else {
+        Some(ranked)
+    }
 }
 
 fn record_rerank_error() {
@@ -355,7 +360,10 @@ fn build_blocks(query: &str, results: &[Value]) -> (Vec<Value>, String) {
                 }
             })
             .collect();
-        format!("Web search results for \u{201c}{query}\u{201d}:\n{}", lines.join("\n"))
+        format!(
+            "Web search results for \u{201c}{query}\u{201d}:\n{}",
+            lines.join("\n")
+        )
     };
 
     let blocks = vec![
@@ -546,8 +554,6 @@ fn sse_from_content(model: &str, content: &[Value]) -> RawEventStream {
     Box::pin(stream) as RawEventStream
 }
 
-
-
 // --- result cache -------------------------------------------------------------
 
 /// Lazily built, and deliberately NOT cached on failure: `get_or_try_init`
@@ -617,7 +623,11 @@ async fn cache_put(cache: &ResolvedCache, query: &str, take: usize, results: &[V
     };
     let key = cache_key(cache, query, take);
     let mut command = redis::cmd("SET");
-    command.arg(&key).arg(payload).arg("EX").arg(cache.ttl.as_secs());
+    command
+        .arg(&key)
+        .arg(payload)
+        .arg("EX")
+        .arg(cache.ttl.as_secs());
     if tokio::time::timeout(CACHE_TIMEOUT, command.query_async::<()>(&mut conn))
         .await
         .is_err()
@@ -675,16 +685,20 @@ pub(crate) async fn maybe_short_circuit(
             let ranked = match settings.rerank.as_ref() {
                 Some(backend) => {
                     match rerank(&query, &candidates, backend, state.web_search_client()).await {
-                        Some(ranked) => {
-                            ranked.into_iter().take(settings.max_results).collect::<Vec<_>>()
-                        }
+                        Some(ranked) => ranked
+                            .into_iter()
+                            .take(settings.max_results)
+                            .collect::<Vec<_>>(),
                         None => candidates
                             .into_iter()
                             .take(settings.max_results)
                             .collect::<Vec<_>>(),
                     }
                 }
-                None => candidates.into_iter().take(settings.max_results).collect::<Vec<_>>(),
+                None => candidates
+                    .into_iter()
+                    .take(settings.max_results)
+                    .collect::<Vec<_>>(),
             };
             record("ok", started);
             build_blocks(&query, &ranked).0
@@ -773,12 +787,21 @@ mod tests {
         assert_eq!(results[0]["type"], "web_search_result");
         assert_eq!(results[0]["url"], "https://example.com");
         assert_eq!(results[0]["title"], "Example");
-        assert!(results[0]["encrypted_content"].as_str().is_some_and(|v| !v.is_empty()));
+        assert!(
+            results[0]["encrypted_content"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty())
+        );
         // no result is emitted as a bare server_tool_use block
         assert!(content.iter().all(|b| b.get("search_result").is_none()));
         assert_eq!(body["usage"]["server_tool_use"]["web_search_requests"], 1);
         assert_eq!(content[2]["type"], "text");
-        assert!(content[2]["text"].as_str().unwrap().contains("Web search results"));
+        assert!(
+            content[2]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Web search results")
+        );
         // the snippet is readable in the text block for a self-hosted model
         assert!(content[2]["text"].as_str().unwrap().contains("snippet"));
     }

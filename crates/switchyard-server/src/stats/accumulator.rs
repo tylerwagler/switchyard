@@ -681,7 +681,10 @@ mod tests {
         assert_eq!(snapshot.routing_fallbacks.context_window, 1);
 
         stats.reset();
-        assert_eq!(stats.snapshot().routing_fallbacks, RoutingFallbackStats::default());
+        assert_eq!(
+            stats.snapshot().routing_fallbacks,
+            RoutingFallbackStats::default()
+        );
     }
 
     #[test]

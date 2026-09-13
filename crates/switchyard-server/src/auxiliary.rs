@@ -36,7 +36,15 @@ pub(crate) async fn embeddings_named(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    relay_kind(&state, "embeddings", EMBEDDINGS_PATH, Some(&name), &headers, body).await
+    relay_kind(
+        &state,
+        "embeddings",
+        EMBEDDINGS_PATH,
+        Some(&name),
+        &headers,
+        body,
+    )
+    .await
 }
 
 pub(crate) async fn rerank_default(
@@ -62,15 +70,20 @@ fn pick_embeddings(
     name: Option<&str>,
 ) -> Option<(String, String, Option<String>)> {
     match name {
-        Some(name) => state
-            .embeddings()
-            .get(name)
-            .map(|config| (name.to_string(), config.base_url.clone(), config.api_key_env.clone())),
-        None => state
-            .embeddings()
-            .iter()
-            .next()
-            .map(|(name, config)| (name.clone(), config.base_url.clone(), config.api_key_env.clone())),
+        Some(name) => state.embeddings().get(name).map(|config| {
+            (
+                name.to_string(),
+                config.base_url.clone(),
+                config.api_key_env.clone(),
+            )
+        }),
+        None => state.embeddings().iter().next().map(|(name, config)| {
+            (
+                name.clone(),
+                config.base_url.clone(),
+                config.api_key_env.clone(),
+            )
+        }),
     }
 }
 
@@ -109,8 +122,15 @@ async fn relay_kind(
     };
 
     let started = Instant::now();
-    match relay_request(state.http_client(), &base_url, path, api_key_env.as_deref(), headers, body)
-        .await
+    match relay_request(
+        state.http_client(),
+        &base_url,
+        path,
+        api_key_env.as_deref(),
+        headers,
+        body,
+    )
+    .await
     {
         Ok((status, content_type, bytes)) => {
             record(kind, &selected_name, "ok", started);
@@ -118,7 +138,9 @@ async fn relay_kind(
             if let Some(content_type) = content_type {
                 builder = builder.header("content-type", content_type);
             }
-            builder.body(Body::from(bytes)).unwrap_or_else(|_| internal_error())
+            builder
+                .body(Body::from(bytes))
+                .unwrap_or_else(|_| internal_error())
         }
         Err(error) => {
             tracing::warn!(kind, %error, "aux relay failed");
@@ -147,12 +169,11 @@ async fn relay_request(
     {
         request = request.header("content-type", content_type);
     }
-    if let Some(key_env) = api_key_env {
-        if let Ok(token) = std::env::var(key_env) {
-            if !token.trim().is_empty() {
-                request = request.header("authorization", format!("Bearer {token}"));
-            }
-        }
+    if let Some(key_env) = api_key_env
+        && let Ok(token) = std::env::var(key_env)
+        && !token.trim().is_empty()
+    {
+        request = request.header("authorization", format!("Bearer {token}"));
     }
     let response = request.send().await.map_err(|error| error.to_string())?;
     let status = response.status();
