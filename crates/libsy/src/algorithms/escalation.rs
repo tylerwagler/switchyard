@@ -7,9 +7,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use switchyard_protocol::{
-    AggLlmResponse, Category, LlmClientError, LlmResponse, Message, Request, Response, Role,
+    AggLlmResponse, Category, LlmClientError, Message, Request, Response, Role,
 };
 
+use super::util::buffered_response::buffer_response;
 use super::util::classifier_contract::ClassifierContractConfig;
 use super::util::decisive;
 use super::util::escalation::{self, EscalationJudge, EscalationJudgeConfig, EscalationPolicy};
@@ -107,35 +108,39 @@ impl Classifier<State> for EscalationClassifier {
             }
             Err(e) => return Err(e),
         };
-        // The call resolves when its stream handle arrives; transport can still fail while
-        // buffering. Fall back only for that availability failure and keep other errors typed.
-        let agg = match efficient_response.llm_response.into_agg().await {
-            Ok(agg) => agg,
-            Err(LlmClientError::Transport { .. }) => {
+        // The call resolves when its stream handle arrives; context and transport failures can
+        // still occur while buffering.
+        let efficient_response = match buffer_response(efficient.as_str(), efficient_response).await
+        {
+            Ok(response) => response,
+            Err(LibsyError::ClientCall {
+                source: LlmClientError::ContextWindowExceeded { .. },
+                ..
+            }) => {
+                driver.set_evidence(serde_json::json!({
+                    "source": "fallback",
+                    "reason_code": "context_window",
+                }));
+                return Ok((decisive(&capable), None));
+            }
+            Err(LibsyError::ClientCall {
+                source: LlmClientError::Transport { .. },
+                ..
+            }) => {
                 driver.set_evidence(serde_json::json!({
                     "source": "fallback",
                     "reason_code": "transport",
                 }));
                 return Ok((decisive(&capable), None));
             }
-            Err(source) => {
-                return Err(LibsyError::client_call(efficient.clone(), source));
-            }
+            Err(error) => return Err(error),
         };
         // Append the efficient reply so the judge reads this turn's completed trajectory.
         let mut judge_request = request.clone();
         judge_request
             .llm_request
             .messages
-            .push(assistant_message(&agg));
-        let efficient_response = Response {
-            llm_response: if request.llm_request.stream {
-                LlmResponse::Stream(agg.into_stream())
-            } else {
-                LlmResponse::Agg(agg)
-            },
-            metadata: efficient_response.metadata,
-        };
+            .push(assistant_message(&efficient_response.agg));
 
         let (classification, _) = self.judge.score(state, &mut judge_request, driver).await?;
 
@@ -166,7 +171,10 @@ impl Classifier<State> for EscalationClassifier {
             }));
         }
 
-        Ok((decisive(&efficient), Some(efficient_response)))
+        Ok((
+            decisive(&efficient),
+            Some(efficient_response.into_response()),
+        ))
     }
 }
 
@@ -216,6 +224,7 @@ mod tests {
                 Ok(Response {
                     llm_response: LlmResponse::Agg(text_response(None, queue.take())),
                     metadata: request.metadata,
+                    upstream_headers: http::HeaderMap::new(),
                 })
             }
         }
@@ -264,6 +273,7 @@ mod tests {
                 Err(error),
             ]))),
             metadata: None,
+            upstream_headers: http::HeaderMap::new(),
         }
     }
 
@@ -383,30 +393,38 @@ mod tests {
 
     #[tokio::test]
     async fn falls_back_to_capable_when_efficient_overflows() -> Result<()> {
-        let serve = |target: ModelId, _request: Request| async move {
-            match target.as_str() {
-                "efficient" => Err(LlmClientError::ContextWindowExceeded {
-                    model: target,
-                    message: "prompt is too long".to_string(),
-                }),
-                "judge" => panic!("the judge must not be consulted when efficient overflows"),
-                _ => Ok(reply("capable answer")),
-            }
-        };
+        for streamed in [false, true] {
+            let serve = move |target: ModelId, _request: Request| async move {
+                match target.as_str() {
+                    "efficient" if streamed => {
+                        Ok(streamed_then_error(LlmClientError::ContextWindowExceeded {
+                            model: target,
+                            message: "prompt is too long".to_string(),
+                        }))
+                    }
+                    "efficient" => Err(LlmClientError::ContextWindowExceeded {
+                        model: target,
+                        message: "prompt is too long".to_string(),
+                    }),
+                    "judge" => {
+                        panic!("the judge must not be consulted when efficient overflows")
+                    }
+                    _ => Ok(reply("capable answer")),
+                }
+            };
+            let mut request = classify_request();
+            request.llm_request.stream = streamed;
 
-        let (selected_model, response) = test_drive_with_models(
-            escalation_router()?,
-            classify_request(),
-            runtime_models(),
-            serve,
-        )
-        .await?;
+            let (selected_model, response) =
+                test_drive_with_models(escalation_router()?, request, runtime_models(), serve)
+                    .await?;
 
-        assert_eq!(selected_model, "capable");
-        assert_eq!(
-            response.llm_response.as_agg().map(completion_text),
-            Some("capable answer".to_string())
-        );
+            assert_eq!(selected_model, "capable");
+            assert_eq!(
+                response.llm_response.as_agg().map(completion_text),
+                Some("capable answer".to_string())
+            );
+        }
         Ok(())
     }
 

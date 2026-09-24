@@ -716,6 +716,7 @@ pub(crate) async fn maybe_short_circuit(
             frame_stream(
                 sse_from_content(&model, &content),
                 WireFormat::AnthropicMessages,
+                state.redactor.clone(),
             )
             .into_response(),
         )

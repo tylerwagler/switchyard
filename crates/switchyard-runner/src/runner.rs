@@ -32,6 +32,7 @@ pub struct Runner {
     /// other surface is retrospective: this is what answers "is that box
     /// reachable right now", which is the question an outage actually raises.
     upstreams: BTreeMap<String, String>,
+    provider_api_keys: Vec<String>,
 }
 
 /// Borrowed model metadata returned while listing routes.
@@ -82,12 +83,25 @@ impl Runner {
             rerank: BTreeMap::new(),
             search: BTreeMap::new(),
             upstreams: BTreeMap::new(),
+            provider_api_keys: Vec::new(),
         }
     }
 
     pub(crate) fn with_default_route(mut self, default_route: Option<ModelId>) -> Self {
         self.default_route = default_route;
         self
+    }
+
+    /// Registers deployment-owned API keys for serving-surface output redaction.
+    /// TOML loading registers these automatically; programmatic hosts must supply them.
+    pub fn with_provider_api_keys(mut self, keys: Vec<String>) -> Self {
+        self.provider_api_keys = keys;
+        self
+    }
+
+    /// Returns deployment-owned secrets for serving-surface output redactors.
+    pub fn provider_api_keys(&self) -> &[String] {
+        &self.provider_api_keys
     }
 
     pub(crate) fn with_fallback_url(mut self, fallback_base_url: Option<String>) -> Self {
@@ -197,7 +211,24 @@ impl Runner {
         outcome: &RoutingOutcome,
     ) -> Option<DecisionDescription> {
         let route = self.route(model.as_str())?;
-        let resolve = |selected: &ModelId| route.decision_target(selected);
+        let resolve = |selected: &ModelId| {
+            let mut target = route.decision_target(selected)?;
+            let mut url = reqwest::Url::parse(&target.base_url).ok()?;
+            let query: Vec<_> = url
+                .query_pairs()
+                .filter(|(name, _)| !matches!(name.as_ref(), "key" | "api_key"))
+                .map(|(name, value)| (name.into_owned(), value.into_owned()))
+                .collect();
+            if query.len() != url.query_pairs().count() {
+                url.set_query(None);
+                if !query.is_empty() {
+                    url.query_pairs_mut().extend_pairs(query);
+                }
+                // Only the returned metadata changes; inference still needs its credentials.
+                target.base_url = url.into();
+            }
+            Some(target)
+        };
         let mut model_ids = outcome.selected_model_ids.iter();
         Some(DecisionDescription {
             selected: resolve(model_ids.next()?)?,

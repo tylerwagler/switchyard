@@ -3,7 +3,9 @@
 
 //! Metric labelling inherited from Python
 
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+use futures::{StreamExt, stream};
 use std::{
     sync::OnceLock,
     sync::atomic::{AtomicU64, Ordering},
@@ -12,7 +14,9 @@ use std::{
 use opentelemetry::metrics::ObservableGauge;
 use opentelemetry::{KeyValue, global};
 use switchyard_libsy::Result;
-use switchyard_protocol::{ModelId, Response, RoutingFallbackReason};
+use switchyard_protocol::{
+    LlmResponse, LlmResponseChunk, ModelId, Response, RoutingFallbackReason,
+};
 
 static TOTAL_REQUESTS: AtomicU64 = AtomicU64::new(0);
 static TOTAL_ERRORS: AtomicU64 = AtomicU64::new(0);
@@ -165,18 +169,98 @@ pub(crate) fn record_routing_overhead(algorithm: &str, overhead: Duration) {
         );
 }
 
+/// Records the final outcome, retaining ownership until a streamed answer ends or is dropped.
+pub(crate) fn observe_routed_request(
+    algorithm: &str,
+    selected_model: &ModelId,
+    upstream: Option<&str>,
+    answer_duration: Option<Duration>,
+    result: Result<Response>,
+) -> Result<Response> {
+    let mut call = RoutedCallMetrics {
+        algorithm: algorithm.to_owned(),
+        model: selected_model.clone(),
+        upstream: upstream.map(str::to_owned),
+        duration: answer_duration,
+        started: Instant::now(),
+        outcome: Some(result.is_ok()),
+    };
+    result.map(|mut response| {
+        if let LlmResponse::Stream(stream) = response.llm_response {
+            call.outcome = None;
+            response.llm_response = LlmResponse::Stream(Box::pin(stream::unfold(
+                (stream, call),
+                |(mut stream, mut call)| async move {
+                    let Some(item) = stream.next().await else {
+                        call.outcome.get_or_insert(true);
+                        return None;
+                    };
+                    match &item {
+                        Err(_) => call.outcome = Some(false),
+                        Ok(event) => {
+                            for chunk in event.normalized() {
+                                match chunk {
+                                    LlmResponseChunk::StreamError { .. }
+                                    | LlmResponseChunk::DecodeError { .. } => {
+                                        call.outcome = Some(false)
+                                    }
+                                    LlmResponseChunk::MessageStop { .. } => {
+                                        call.outcome.get_or_insert(true);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+                    Some((item, (stream, call)))
+                },
+            )));
+        }
+        response
+    })
+}
+
+struct RoutedCallMetrics {
+    algorithm: String,
+    model: ModelId,
+    upstream: Option<String>,
+    duration: Option<Duration>,
+    started: Instant,
+    // Dropping an open stream is a failure; a terminal message permits a successful drop.
+    outcome: Option<bool>,
+}
+
+impl Drop for RoutedCallMetrics {
+    fn drop(&mut self) {
+        let is_success = self.outcome.unwrap_or(false);
+        let duration = self
+            .duration
+            .map(|duration| duration + self.started.elapsed());
+        if let Some(duration) = duration {
+            record_answer_call(
+                &self.algorithm,
+                &self.model,
+                self.upstream.as_deref(),
+                duration,
+                is_success,
+            );
+        }
+        record_routed_request(&self.model, duration, is_success);
+    }
+}
+
 /// Records one terminal model call made after routing, preserving the libsy call metric surface.
 pub(crate) fn record_answer_call(
     algorithm: &str,
     selected_model: &ModelId,
     upstream: Option<&str>,
     duration: Duration,
-    result: &Result<Response>,
+    is_success: bool,
 ) {
     let attributes = [
         KeyValue::new("algorithm", algorithm.to_string()),
         KeyValue::new("selected_model", selected_model.to_string()),
-        KeyValue::new("outcome", if result.is_ok() { "ok" } else { "error" }),
+        KeyValue::new("outcome", if is_success { "ok" } else { "error" }),
         // `selected_model` says what was asked for; this says which box answered.
         // They diverge on every fallback, which is the pool-churn signal.
         KeyValue::new("upstream", upstream.unwrap_or(UNKNOWN_UPSTREAM).to_string()),
@@ -196,12 +280,12 @@ pub(crate) fn record_answer_call(
 pub(crate) fn record_routed_request(
     selected_model: &ModelId,
     answer_duration: Option<Duration>,
-    result: &Result<Response>,
+    is_success: bool,
 ) {
     TOTAL_REQUESTS.fetch_add(1, Ordering::Relaxed);
     let attributes = [KeyValue::new("model", selected_model.to_string())];
     let meter = global::meter("switchyard");
-    if result.is_ok() {
+    if is_success {
         meter
             .u64_counter("switchyard.requests")
             .build()

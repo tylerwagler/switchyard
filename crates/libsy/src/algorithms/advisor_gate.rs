@@ -51,6 +51,7 @@ mod transcript;
 mod trigger;
 mod turn;
 
+use super::util::buffered_response::{BufferedResponse, buffer_response};
 use budget::{ReviewBudget, ScopeKey, budget_scope, stall_key};
 use signals::{GateSignalProcessor, GateSignals};
 use telemetry::{
@@ -61,7 +62,7 @@ use transcript::{VERDICT_PATTERN, Verdict, advisor_reply_text, parse_verdict, re
 use trigger::TriggerClassifier;
 #[cfg(test)]
 use turn::has_tool_use;
-use turn::{GatedTurn, buffer_turn, reasoning_text, visible_text};
+use turn::{reasoning_text, visible_text};
 
 /// APPROVE/REDO reviewer contract sent as the advisor's system prompt.
 pub const REVIEWER_SYSTEM_PROMPT: &str =
@@ -238,7 +239,7 @@ impl AdvisorGate {
             .served_model()
             .cloned()
             .unwrap_or_else(|| executor.clone());
-        let turn = buffer_turn(served_executor.as_str(), response).await?;
+        let turn = buffer_response(served_executor.as_str(), response).await?;
 
         // Response-side signals fold in after it: the terminal turn never
         // appears on a later request, so the trigger runs on this event.
@@ -249,11 +250,14 @@ impl AdvisorGate {
         let decision = self.trigger.classify(&signals);
         // The stall checkpoint fires once per conversation regardless of the
         // turn's shape. Only a stall with no simultaneous trigger latches
-        // (atomically — one winner per conversation), so a refunded review
-        // leaves the checkpoint re-armed.
+        // (atomically — one winner per conversation). The latch is provisional
+        // until a review completes: a refunded consult or a spent budget
+        // re-arms it so a later eligible turn is reviewed instead of silently
+        // passing through.
+        let stall_key = stall_key(&request);
         let stall = decision.fired.is_none()
             && decision.stalled
-            && self.budget.try_mark_stall_fired(stall_key(&request));
+            && self.budget.try_mark_stall_fired(stall_key);
         if decision.fired.is_none() && !stall {
             return Ok(RoutingOutcome::answered(
                 served_executor.clone(),
@@ -262,6 +266,9 @@ impl AdvisorGate {
             ));
         }
         if !self.budget.try_reserve(scope) {
+            if stall {
+                self.budget.clear_stall_fired(stall_key);
+            }
             return Ok(RoutingOutcome::answered(
                 served_executor.clone(),
                 request,
@@ -306,6 +313,9 @@ impl AdvisorGate {
             }
             Ok(ConsultOutcome::Failed { reason }) => {
                 self.budget.refund_failure(scope);
+                if stall {
+                    self.budget.clear_stall_fired(stall_key);
+                }
                 driver.set_evidence(serde_json::json!({
                     "source": "advisor",
                     "verdict": "fail_open",
@@ -320,6 +330,9 @@ impl AdvisorGate {
             }
             Err(error) => {
                 self.budget.refund_failure(scope);
+                if stall {
+                    self.budget.clear_stall_fired(stall_key);
+                }
                 Err(error)
             }
         }
@@ -334,7 +347,7 @@ impl AdvisorGate {
         executor_fallbacks: &[ModelId],
         served_executor: &ModelId,
         request: Request,
-        turn: GatedTurn,
+        turn: BufferedResponse,
         plan: &str,
     ) -> RoutingOutcome {
         record_discarded(&turn.agg.usage);

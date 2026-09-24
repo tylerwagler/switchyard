@@ -6,6 +6,7 @@
 mod algorithm;
 mod config;
 mod failure;
+mod provider_key_redactor;
 mod route;
 mod runner;
 
@@ -20,6 +21,7 @@ pub use config::{
     SearchConfig, WebSearchConfig,
 };
 pub use libsy::RuntimeModels;
+pub use provider_key_redactor::ProviderKeyRedactor;
 pub use route::{
     AuxiliaryTarget, CallerAuthKind, ModelCapabilities, Route, RunOutput, RunnerError,
 };

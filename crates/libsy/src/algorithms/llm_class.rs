@@ -150,14 +150,35 @@ fn window_start(tail: &[&Message], recent_turn_window: usize) -> usize {
 
 /// Keeps the opening task and the latest user follow-up when they differ.
 fn task_messages(messages: &[Message]) -> Vec<Message> {
-    let mut user_messages = messages.iter().filter(|message| message.role == Role::User);
+    // Decoders also use the user role for tool results. Select ordinary user content
+    // first, so a tool result cannot replace the opening task or latest follow-up.
+    let is_task_content = |block: &ContentBlock| {
+        !matches!(
+            block,
+            ContentBlock::ToolCall(_)
+                | ContentBlock::ToolResult(_)
+                | ContentBlock::Reasoning { .. }
+        )
+    };
+    let mut user_messages = messages.iter().filter(|message| {
+        message.role == Role::User && message.content.iter().any(is_task_content)
+    });
     let Some(opening_task) = user_messages.next() else {
         return Vec::new();
     };
-    match user_messages.next_back() {
-        Some(latest_follow_up) => vec![opening_task.clone(), latest_follow_up.clone()],
-        None => vec![opening_task.clone()],
-    }
+    [Some(opening_task), user_messages.next_back()]
+        .into_iter()
+        .flatten()
+        .map(|message| Message {
+            role: Role::User,
+            content: message
+                .content
+                .iter()
+                .filter(|block| is_task_content(block))
+                .cloned()
+                .collect(),
+        })
+        .collect()
 }
 
 /// Selects the task messages shown to capability and custom-schema classifiers.
@@ -397,10 +418,12 @@ impl TaskClassifierConfig {
                 message: "max_output_tokens must be at least 1".to_string(),
             });
         }
-        if self.message_hash_fallback && self.classify_trigger != ClassifyTrigger::NewSession {
+        // Only `every_request` is rejected: it retains no target, so a fallback identity has nothing to key on. Both retaining triggers can key the retained target on a message hash when the caller sends no session id.
+        if self.message_hash_fallback && self.classify_trigger == ClassifyTrigger::EveryRequest {
             return Err(LibsyError::AlgorithmError {
-                message: "message_hash_fallback requires classify_trigger = new_session"
-                    .to_string(),
+                message:
+                    "message_hash_fallback requires classify_trigger = new_session or user_turn"
+                        .to_string(),
             });
         }
         Ok(())
@@ -469,10 +492,12 @@ impl CustomClassifierConfig {
                 message: "max_output_tokens must be at least 1".to_string(),
             });
         }
-        if self.message_hash_fallback && self.classify_trigger != ClassifyTrigger::NewSession {
+        // Only `every_request` is rejected: it retains no target, so a fallback identity has nothing to key on. Both retaining triggers can key the retained target on a message hash when the caller sends no session id.
+        if self.message_hash_fallback && self.classify_trigger == ClassifyTrigger::EveryRequest {
             return Err(LibsyError::AlgorithmError {
-                message: "message_hash_fallback requires classify_trigger = new_session"
-                    .to_string(),
+                message:
+                    "message_hash_fallback requires classify_trigger = new_session or user_turn"
+                        .to_string(),
             });
         }
         Ok(())
@@ -692,10 +717,13 @@ impl LlmTaskClassifier {
         inner: Arc<dyn Classifier<State>>,
         config: ClassifierRouteConfig,
     ) -> Result<Self> {
-        if config.message_hash_fallback && config.classify_trigger != ClassifyTrigger::NewSession {
+        // Only `every_request` is rejected: it retains no target, so a fallback identity has nothing to key on. Both retaining triggers can key the retained target on a message hash when the caller sends no session id.
+        if config.message_hash_fallback && config.classify_trigger == ClassifyTrigger::EveryRequest
+        {
             return Err(LibsyError::AlgorithmError {
-                message: "message_hash_fallback requires classify_trigger = new_session"
-                    .to_string(),
+                message:
+                    "message_hash_fallback requires classify_trigger = new_session or user_turn"
+                        .to_string(),
             });
         }
         // Affinity comes first so a retained assignment short-circuits the judge call.
@@ -886,6 +914,7 @@ mod tests {
                     Ok(Response {
                         llm_response: LlmResponse::Agg(text_response(None, completion)),
                         metadata: request.metadata,
+                        upstream_headers: http::HeaderMap::new(),
                     })
                 }
             }
@@ -904,6 +933,7 @@ mod tests {
             Ok(Response {
                 llm_response: LlmResponse::Agg(text_response(None, format!("answer from {model}"))),
                 metadata: request.metadata,
+                upstream_headers: http::HeaderMap::new(),
             })
         }
     }
@@ -1125,6 +1155,7 @@ mod tests {
                     Ok(Response {
                         llm_response: LlmResponse::Agg(text_response(None, text)),
                         metadata: None,
+                        upstream_headers: Default::default(),
                     })
                 }
             }
@@ -1250,6 +1281,40 @@ mod tests {
                 config: test_config(base_threshold),
             })?;
         }
+        Ok(())
+    }
+
+    #[test]
+    fn message_hash_fallback_accepts_retaining_triggers() -> Result<()> {
+        // Only `every_request` is rejected: it retains no target, so a fallback
+        // identity has nothing to key on. Both retaining triggers may key the
+        // retained target on a message hash when the caller sends no session id.
+        for trigger in [ClassifyTrigger::NewSession, ClassifyTrigger::UserTurn] {
+            let config = TaskClassifierConfig {
+                base_threshold: 0.5,
+                classify_trigger: trigger,
+                message_hash_fallback: true,
+                ..TaskClassifierConfig::default()
+            };
+            LlmTaskClassifier::new(LlmClassifierConfig::Capability { config }).map_err(
+                |error| LibsyError::AlgorithmError {
+                    message: format!("{trigger:?} with message_hash_fallback rejected: {error}"),
+                },
+            )?;
+        }
+        let every_request = TaskClassifierConfig {
+            base_threshold: 0.5,
+            classify_trigger: ClassifyTrigger::EveryRequest,
+            message_hash_fallback: true,
+            ..TaskClassifierConfig::default()
+        };
+        assert!(
+            LlmTaskClassifier::new(LlmClassifierConfig::Capability {
+                config: every_request
+            })
+            .is_err(),
+            "every_request with message_hash_fallback should stay rejected"
+        );
         Ok(())
     }
 
@@ -1393,6 +1458,41 @@ mod tests {
                 is_error: None,
             })],
         }
+    }
+
+    #[test]
+    fn default_task_input_keeps_user_content_around_tool_results() {
+        let mut result = tool_result("call-1");
+        result.role = Role::User;
+        let mut mixed = result.clone();
+        mixed.content.push(ContentBlock::Text {
+            text: "latest follow-up".to_string(),
+        });
+        let input = TaskInput {
+            recent_turn_window: None,
+        };
+        let mut request = Request {
+            llm_request: LlmRequest {
+                messages: vec![
+                    result.clone(),
+                    Message::text(Role::User, "initial task"),
+                    tool_call("call-1"),
+                    mixed,
+                    result.clone(),
+                ],
+                ..LlmRequest::default()
+            },
+            ..Request::default()
+        };
+        assert_eq!(
+            input.build_messages(&State::default(), &request),
+            vec![
+                Message::text(Role::User, "initial task"),
+                Message::text(Role::User, "latest follow-up"),
+            ]
+        );
+        request.llm_request.messages = vec![result];
+        assert!(input.build_messages(&State::default(), &request).is_empty());
     }
 
     /// A count-based window can begin on a tool result, which leaves the call that
