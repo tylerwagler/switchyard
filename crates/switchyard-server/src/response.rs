@@ -19,14 +19,14 @@ type BoxError = Box<dyn Error + Send + Sync>;
 
 /// Encodes a libsy response into the endpoint's wire format, reporting
 /// `served_model` as the response model so the body names the model that
-/// answered rather than the route the caller addressed. `answer_safeguards`
-/// adds the reply to a Claude Code `safeguards` request.
-pub(crate) fn into_http_response(
+/// answered rather than the route the caller addressed. `safeguards` answers
+/// a Claude Code `safeguards` request on the reply.
+pub(crate) async fn into_http_response(
     response: AlgorithmResponse,
     target_format: WireFormat,
     served_model: Option<String>,
     request_extensions: ProviderExtensions,
-    answer_safeguards: bool,
+    safeguards: Option<crate::safeguards::Answer>,
     redactor: Arc<crate::redaction::Redactor>,
 ) -> Result<HttpResponse, BoxError> {
     match response.llm_response {
@@ -37,8 +37,8 @@ pub(crate) fn into_http_response(
                 served_model.as_deref(),
                 &request_extensions,
             )?;
-            if answer_safeguards {
-                crate::safeguards::add_to_message(&mut body);
+            if let Some(answer) = safeguards {
+                crate::safeguards::add_to_message(&mut body, answer).await;
             }
             Ok(Json(body).into_response())
         }
@@ -49,8 +49,8 @@ pub(crate) fn into_http_response(
                 served_model,
                 &request_extensions,
             )?;
-            if answer_safeguards {
-                events = crate::safeguards::add_to_stream(events);
+            if let Some(answer) = safeguards {
+                events = crate::safeguards::add_to_stream(events, answer);
             }
             Ok(frame_stream(events, target_format, redactor).into_response())
         }
