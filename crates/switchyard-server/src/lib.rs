@@ -1100,8 +1100,12 @@ async fn handle_llm_request(
     wire_format: WireFormat,
     routing_log_context: Option<routing_log::RoutingLogContext>,
 ) -> Response {
-    let answer_safeguards =
-        wire_format == WireFormat::AnthropicMessages && safeguards::take_request(&mut body);
+    let safeguards = if wire_format == WireFormat::AnthropicMessages {
+        safeguards::take_request(&mut body)
+            .map(|context| safeguards::answer(&state, context, &body))
+    } else {
+        None
+    };
     let cache_probe = state.track_cache_eligibility.then(|| prefix_probe(&body));
     // Hosted web search: dedicated `web_search` requests are served here, before
     // routing or any model call (server-side search tools carry no input_schema,
@@ -1172,9 +1176,11 @@ async fn handle_llm_request(
         wire_format,
         response_model,
         request_extensions,
-        answer_safeguards,
+        safeguards,
         Arc::clone(&state.redactor),
-    ) {
+    )
+    .await
+    {
         Ok(response) => response,
         Err(error) => return server_error(error.to_string()),
     };

@@ -311,6 +311,38 @@ async fn upstream_chat(
         return Sse::new(stream).into_response();
     }
 
+    if model == "model/judge" {
+        // The safeguards judge sees the tool call in its user message: tests
+        // script the verdict (or an outage) through the tool's name.
+        let haystack = body["messages"].to_string();
+        if haystack.contains("judge_down") {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": {"message": "judge is unavailable"}})),
+            )
+                .into_response();
+        }
+        let verdict = if haystack.contains("judge_garbage") {
+            "looks fine"
+        } else if haystack.contains("rm_everything") {
+            "<block>yes</block><reason>[Test Rule] deletes everything</reason>"
+        } else {
+            "<block>no</block>"
+        };
+        return Json(json!({
+            "id": "chatcmpl-judge",
+            "object": "chat.completion",
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": verdict},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 4, "total_tokens": 14}
+        }))
+        .into_response();
+    }
+
     if model == "model/advisor" {
         // The review consult carries the serialized transcript in its user
         // message, so the original prompt text rides inside it: tests script
@@ -1038,6 +1070,121 @@ async fn safeguards_are_answered_here_and_never_reach_the_backend() -> TestResul
         assert_eq!(calls[1], calls[0], "safeguards changed the upstream body");
         calls.clear();
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn safeguards_judge_decides_each_tool_use() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let app = build_switchyard_router(load_test_config(&format!(
+        r#"
+schema_version = 1
+[llm_clients.mock]
+format = "openai_chat"
+base_url = "{base_url}"
+max_retries = 0
+[targets.main]
+id = "model/a"
+llm_client = "mock"
+[targets.judge]
+id = "model/judge"
+llm_client = "mock"
+[routes.main]
+id = "{ROUTE_MODEL}"
+type = "passthrough"
+target = "main"
+[routes.judge]
+id = "switchyard/safeguards-judge"
+type = "passthrough"
+target = "judge"
+[safeguards]
+judge_route = "judge"
+"#,
+        base_url = upstream.base_url,
+    ))?);
+    let cases = [
+        (
+            "search",
+            json!({"type": "evaluated", "outcome": "not_flagged"}),
+        ),
+        (
+            "rm_everything",
+            json!({"type": "evaluated", "outcome": "flagged",
+                "explanation": "[Test Rule] deletes everything"}),
+        ),
+        (
+            "judge_down",
+            json!({"type": "unavailable", "reason": "error"}),
+        ),
+        (
+            "judge_garbage",
+            json!({"type": "unavailable", "reason": "error"}),
+        ),
+    ];
+    for stream in [false, true] {
+        for (tool, verdict) in &cases {
+            let body = json!({
+                "model": ROUTE_MODEL,
+                "max_tokens": 16,
+                "stream": stream,
+                "tools": [{"name": tool, "input_schema": {"type": "object"}}],
+                "messages": [{"role": "user", "content": "mcp-tool-call"}],
+                "safeguards": [{"type": "dangerous_tool_use",
+                    "classifier_context": {"v": 1, "permission_mode": "auto"}}]
+            });
+            let response = send(&app, "POST", "/v1/messages", Some(body)).await?;
+            assert_eq!(response.status, StatusCode::OK, "{tool}");
+            let (id, results) = if stream {
+                let events: Vec<Value> = response
+                    .text()?
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|data| serde_json::from_str(data).ok())
+                    .collect();
+                let id = events
+                    .iter()
+                    .find_map(|event| event["content_block"]["id"].as_str())
+                    .ok_or("missing tool_use")?
+                    .to_string();
+                let delta = events
+                    .iter()
+                    .find(|event| event["type"] == "message_delta")
+                    .ok_or("missing message_delta")?;
+                (id, delta["delta"]["safeguard_results"].clone())
+            } else {
+                let message = response.json()?;
+                let id = message["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find_map(|block| block["id"].as_str())
+                    .ok_or("missing tool_use")?
+                    .to_string();
+                (id, message["safeguard_results"].clone())
+            };
+            assert_eq!(
+                results,
+                json!([{"type": "dangerous_tool_use", "status": {"type": "available",
+                    "tool_uses": {id: verdict}}}]),
+                "{tool} stream={stream}"
+            );
+        }
+    }
+    let calls = upstream.calls.lock().await;
+    let judged: Vec<_> = calls
+        .iter()
+        .filter(|call| call["model"] == "model/judge")
+        .collect();
+    assert_eq!(judged.len(), cases.len() * 2);
+    assert!(
+        calls
+            .iter()
+            .all(|call| !call.to_string().contains("\"safeguards\""))
+    );
+    assert!(judged.iter().all(|call| {
+        let text = call["messages"].to_string();
+        text.contains("<action>") && text.contains("permission_mode")
+    }));
     Ok(())
 }
 

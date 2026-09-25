@@ -74,6 +74,28 @@ pub(crate) struct DeploymentConfig {
     embeddings: BTreeMap<String, EmbeddingsConfig>,
     #[serde(default)]
     cache: BTreeMap<String, CacheConfig>,
+    #[serde(default)]
+    safeguards: Option<SafeguardsConfig>,
+}
+
+/// Claude Code's server-side auto mode check. `judge_route` names the
+/// `[routes.<name>]` entry whose model decides whether each tool use in a reply
+/// is dangerous. Absent means Switchyard answers that it does not run the check.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SafeguardsConfig {
+    judge_route: String,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+/// The judge for Claude Code's server-side auto mode check.
+#[derive(Debug, Clone)]
+pub struct SafeguardsJudge {
+    /// Route id the judge requests are sent to.
+    pub model: ModelId,
+    /// Time allowed for one verdict.
+    pub timeout: std::time::Duration,
 }
 
 /// Opt-in hosted web search: serves Claude Code's server-side `web_search` tool
@@ -239,6 +261,10 @@ const fn default_web_search_max_results() -> usize {
 const fn default_web_search_timeout_ms() -> u64 {
     15_000
 }
+
+// A verdict gates a tool call the user is waiting on; Claude Code's own
+// classifier deadline is of the same order.
+const DEFAULT_SAFEGUARDS_TIMEOUT_MS: u64 = 60_000;
 
 const fn default_search_max_results() -> usize {
     20
@@ -586,6 +612,23 @@ impl DeploymentConfig {
                 Some(config.id.clone())
             }
         };
+        let safeguards = match self.safeguards {
+            None => None,
+            Some(config) => {
+                let route = self.routes.get(&config.judge_route).ok_or_else(|| {
+                    RunnerError::configuration(format!(
+                        "safeguards.judge_route references unknown [routes.{}]",
+                        config.judge_route
+                    ))
+                })?;
+                Some(SafeguardsJudge {
+                    model: route.id.clone(),
+                    timeout: std::time::Duration::from_millis(
+                        config.timeout_ms.unwrap_or(DEFAULT_SAFEGUARDS_TIMEOUT_MS),
+                    ),
+                })
+            }
+        };
         let upstreams = self
             .llm_clients
             .iter()
@@ -596,6 +639,7 @@ impl DeploymentConfig {
             .with_default_route(default_route)
             .with_fallback_url(fallback_base_url)
             .with_web_search(web_search)
+            .with_safeguards(safeguards)
             .with_embeddings(self.embeddings)
             .with_rerank(self.rerank)
             .with_search(self.search)
@@ -2434,6 +2478,23 @@ target = "t"
     #[test]
     fn default_route_rejects_unknown_route_name() {
         let toml = format!("default_route = \"missing\"{BASE}");
+        assert!(error_message(&toml).contains("unknown [routes.missing]"));
+    }
+
+    #[test]
+    fn safeguards_judge_resolves_to_the_route_id() {
+        let runner = runner_from_toml(BASE).expect("base config loads");
+        assert!(runner.safeguards().is_none());
+        let toml = format!("{BASE}\n[safeguards]\njudge_route = \"r\"\ntimeout_ms = 5000\n");
+        let runner = runner_from_toml(&toml).expect("safeguards resolves");
+        let judge = runner.safeguards().expect("safeguards configured");
+        assert!(runner.exact_route(judge.model.as_str()).is_some());
+        assert_eq!(judge.timeout, std::time::Duration::from_millis(5000));
+    }
+
+    #[test]
+    fn safeguards_rejects_unknown_judge_route() {
+        let toml = format!("{BASE}\n[safeguards]\njudge_route = \"missing\"\n");
         assert!(error_message(&toml).contains("unknown [routes.missing]"));
     }
 

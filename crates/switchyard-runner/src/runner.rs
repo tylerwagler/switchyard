@@ -13,7 +13,7 @@ use switchyard_protocol::{ModelId, WireFormat};
 use crate::config;
 use crate::{
     EmbeddingsConfig, ModelCapabilities, RerankConfig, ResolvedWebSearch, Route, RunnerError,
-    SearchConfig,
+    SafeguardsJudge, SearchConfig,
 };
 
 /// Immutable named route table.
@@ -25,6 +25,7 @@ pub struct Runner {
     default_route: Option<ModelId>,
     fallback_base_url: Option<String>,
     web_search: Option<ResolvedWebSearch>,
+    safeguards: Option<SafeguardsJudge>,
     embeddings: BTreeMap<String, EmbeddingsConfig>,
     rerank: BTreeMap<String, RerankConfig>,
     search: BTreeMap<String, SearchConfig>,
@@ -79,6 +80,7 @@ impl Runner {
             default_route: None,
             fallback_base_url: None,
             web_search: None,
+            safeguards: None,
             embeddings: BTreeMap::new(),
             rerank: BTreeMap::new(),
             search: BTreeMap::new(),
@@ -114,6 +116,11 @@ impl Runner {
         self
     }
 
+    pub(crate) fn with_safeguards(mut self, safeguards: Option<SafeguardsJudge>) -> Self {
+        self.safeguards = safeguards;
+        self
+    }
+
     pub(crate) fn with_embeddings(
         mut self,
         embeddings: BTreeMap<String, EmbeddingsConfig>,
@@ -145,6 +152,11 @@ impl Runner {
     /// Returns the resolved hosted web-search settings, if enabled.
     pub fn web_search(&self) -> Option<&ResolvedWebSearch> {
         self.web_search.as_ref()
+    }
+
+    /// The judge for Claude Code's server-side auto mode check, if configured.
+    pub fn safeguards(&self) -> Option<&SafeguardsJudge> {
+        self.safeguards.as_ref()
     }
 
     /// Named embeddings backends (`[embeddings.*]`).
