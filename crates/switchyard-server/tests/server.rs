@@ -1189,6 +1189,122 @@ judge_route = "judge"
 }
 
 #[tokio::test]
+async fn safeguards_shadow_mode_logs_both_verdicts_and_answers_unsupported() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let temp_dir = tempfile::tempdir()?;
+    let log_path = temp_dir.path().join("shadow/safeguards.jsonl");
+    let app = build_switchyard_router(load_test_config(&format!(
+        r#"
+schema_version = 1
+[llm_clients.mock]
+format = "openai_chat"
+base_url = "{base_url}"
+max_retries = 0
+[targets.main]
+id = "model/a"
+llm_client = "mock"
+[targets.judge]
+id = "model/judge"
+llm_client = "mock"
+[routes.main]
+id = "{ROUTE_MODEL}"
+type = "passthrough"
+target = "main"
+[routes.judge]
+id = "switchyard/safeguards-judge"
+type = "passthrough"
+target = "judge"
+[safeguards]
+judge_route = "judge"
+shadow_log = "{log_path}"
+"#,
+        base_url = upstream.base_url,
+        log_path = log_path.display(),
+    ))?);
+    let session = [("x-claude-code-session-id", "shadow-session")];
+    for stream in [false, true] {
+        let body = json!({
+            "model": ROUTE_MODEL,
+            "max_tokens": 16,
+            "stream": stream,
+            "tools": [{"name": "rm_everything", "input_schema": {"type": "object"}}],
+            "messages": [{"role": "user", "content": "mcp-tool-call"}],
+            "safeguards": [{"type": "dangerous_tool_use",
+                "classifier_context": {"v": 1, "permission_mode": "auto"}}]
+        });
+        let response =
+            send_with_headers(&app, "POST", "/v1/messages", Some(body), &session).await?;
+        assert_eq!(response.status, StatusCode::OK);
+        let unsupported =
+            json!([{"type": "dangerous_tool_use", "status": {"type": "unsupported"}}]);
+        if stream {
+            let delta = response
+                .text()?
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                .find(|event| event["type"] == "message_delta")
+                .ok_or("missing message_delta")?;
+            assert_eq!(delta["delta"]["safeguard_results"], unsupported);
+        } else {
+            assert_eq!(response.json()?["safeguard_results"], unsupported);
+        }
+
+        // Claude Code's own classifier request, told to answer with <block>.
+        let classifier = json!({
+            "model": ROUTE_MODEL,
+            "max_tokens": 16,
+            "stream": stream,
+            "system": [{"type": "text", "text": "Your ENTIRE response MUST begin with <block>."}],
+            "messages": [{"role": "user", "content": "classify this"}]
+        });
+        let response =
+            send_with_headers(&app, "POST", "/v1/messages", Some(classifier), &session).await?;
+        assert_eq!(response.status, StatusCode::OK);
+    }
+
+    // The judge runs in the background; wait for its records.
+    let mut records: Vec<Value> = Vec::new();
+    for _ in 0..100 {
+        records = std::fs::read_to_string(&log_path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        if records.iter().filter(|r| r["kind"] == "judge").count() == 2 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let judged: Vec<_> = records.iter().filter(|r| r["kind"] == "judge").collect();
+    assert_eq!(judged.len(), 2, "{records:?}");
+    for record in &judged {
+        assert_eq!(record["session_id"], "shadow-session");
+        assert_eq!(record["name"], "rm_everything");
+        assert_eq!(record["input"], json!({"q": "rust"}));
+        assert_eq!(record["verdict"]["outcome"], "flagged");
+        assert!(record["ts"].is_string());
+    }
+    let classified: Vec<_> = records
+        .iter()
+        .filter(|r| r["kind"] == "client_classifier")
+        .collect();
+    assert_eq!(classified.len(), 2, "{records:?}");
+    for record in &classified {
+        assert_eq!(record["session_id"], "shadow-session");
+        assert_eq!(record["request"]["messages"][0]["content"], "classify this");
+        assert!(!record["reply"].as_str().unwrap_or_default().is_empty());
+    }
+    // Only the classifier request is recorded as one; the main request is not.
+    assert!(
+        records
+            .iter()
+            .all(|r| !r.to_string().contains("mcp-tool-call") || r["kind"] == "judge")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn caller_metadata_cannot_replace_upstream_request() -> TestResult {
     let upstream = MockUpstream::start().await?;
     let app = buffered_responses_app(&upstream, "model/fallback", false, false)?;

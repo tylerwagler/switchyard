@@ -13,9 +13,16 @@
 //! decides it. Without one, the answer is `unsupported` and Claude Code runs its
 //! own classifier requests. A verdict that cannot be reached is reported as
 //! `unavailable`, never as allowed.
+//!
+//! In shadow mode the answer stays `unsupported`. The judge still runs, in the
+//! background, and its verdicts are logged next to Claude Code's own
+//! classifier exchanges, so a judge can be graded before it decides anything.
 
 use std::collections::BTreeMap;
-use std::time::Duration;
+use std::io::Write;
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, SystemTime};
 
 use futures_util::StreamExt;
 use futures_util::future::{BoxFuture, join_all};
@@ -46,6 +53,37 @@ pub(crate) struct ToolUse {
 /// Computes `safeguard_results` for the tool uses of one reply.
 pub(crate) type Answer = Box<dyn FnOnce(Vec<ToolUse>) -> BoxFuture<'static, Value> + Send>;
 
+/// Receives the text of a reply once it is complete.
+pub(crate) type TextTap = Box<dyn FnOnce(String) + Send>;
+
+/// Shadow mode's append-only JSONL file.
+pub(crate) struct ShadowLog(parking_lot::Mutex<std::fs::File>);
+
+impl ShadowLog {
+    pub(crate) fn open(path: &Path) -> std::io::Result<Self> {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            std::fs::create_dir_all(parent)?;
+        }
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        Ok(Self(parking_lot::Mutex::new(file)))
+    }
+
+    fn append(&self, mut record: Value) {
+        record["ts"] =
+            Value::String(humantime::format_rfc3339_millis(SystemTime::now()).to_string());
+        let line = format!("{record}\n");
+        if let Err(error) = self.0.lock().write_all(line.as_bytes()) {
+            tracing::warn!(%error, "safeguards shadow log append failed");
+        }
+    }
+}
+
 /// Removes `safeguards` from an Anthropic request body. Returns the
 /// `classifier_context` when it asked for the `dangerous_tool_use` check, which
 /// the reply must answer.
@@ -67,7 +105,12 @@ pub(crate) fn take_request(body: &mut Value) -> Option<Value> {
 }
 
 /// Builds the answer for one request: the configured judge, or `unsupported`.
-pub(crate) fn answer(state: &ServerState, context: Value, body: &Value) -> Answer {
+pub(crate) fn answer(
+    state: &ServerState,
+    context: Value,
+    body: &Value,
+    session_id: Option<String>,
+) -> Answer {
     let Some(judge) = state.runner.safeguards() else {
         return Box::new(|_| Box::pin(async { unsupported() }));
     };
@@ -78,7 +121,97 @@ pub(crate) fn answer(state: &ServerState, context: Value, body: &Value) -> Answe
         context,
         transcript: render_transcript(body),
     };
-    Box::new(move |tool_uses| Box::pin(async move { judge.results(tool_uses).await }))
+    let Some(log) = state.safeguards_shadow.clone() else {
+        return Box::new(move |tool_uses| Box::pin(async move { judge.results(tool_uses).await }));
+    };
+    Box::new(move |tool_uses| {
+        Box::pin(async move {
+            if !tool_uses.is_empty() {
+                tokio::spawn(shadow_judge(judge, tool_uses, session_id, log));
+            }
+            unsupported()
+        })
+    })
+}
+
+async fn shadow_judge(
+    judge: Judge,
+    tool_uses: Vec<ToolUse>,
+    session_id: Option<String>,
+    log: Arc<ShadowLog>,
+) {
+    let results = judge.results(tool_uses.clone()).await;
+    let verdicts = &results[0]["status"]["tool_uses"];
+    for tool in &tool_uses {
+        log.append(json!({
+            "kind": "judge",
+            "session_id": session_id,
+            "tool_use_id": tool.id,
+            "name": tool.name,
+            "input": tool.input,
+            "verdict": verdicts[&tool.id],
+        }));
+    }
+}
+
+/// In shadow mode, recognizes Claude Code's own classifier request and returns
+/// a tap that logs the request with the classifier's reply. The classifier's
+/// system prompt tells the model to answer with `<block>`; Claude Code's
+/// conversation prompt never does.
+pub(crate) fn client_classifier_tap(
+    state: &ServerState,
+    body: &Value,
+    session_id: Option<String>,
+) -> Option<TextTap> {
+    let log = state.safeguards_shadow.clone()?;
+    let system = match &body["system"] {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect(),
+        _ => String::new(),
+    };
+    if !system.contains("<block>") {
+        return None;
+    }
+    let request = json!({"system": body["system"], "messages": body["messages"]});
+    Some(Box::new(move |reply| {
+        log.append(json!({
+            "kind": "client_classifier",
+            "session_id": session_id,
+            "request": request,
+            "reply": reply,
+        }));
+    }))
+}
+
+/// Hands the text of a buffered Anthropic message to `tap`.
+pub(crate) fn tap_message(message: &Value, tap: TextTap) {
+    tap(message["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|block| block["text"].as_str())
+        .collect());
+}
+
+/// Hands the text of a streamed Anthropic reply to `tap` when the stream ends.
+pub(crate) fn tap_stream(events: RawEventStream, tap: TextTap) -> RawEventStream {
+    Box::pin(async_stream::stream! {
+        let mut events = events;
+        let mut text = String::new();
+        while let Some(item) = events.next().await {
+            if let Ok(event) = &item
+                && event["type"] == "content_block_delta"
+                && let Some(delta) = event["delta"]["text"].as_str()
+            {
+                text.push_str(delta);
+            }
+            yield item;
+        }
+        tap(text);
+    })
 }
 
 fn unsupported() -> Value {

@@ -174,6 +174,7 @@ pub struct ServerState {
     embeddings: BTreeMap<String, EmbeddingsConfig>,
     rerank: BTreeMap<String, RerankConfig>,
     search: BTreeMap<String, SearchConfig>,
+    safeguards_shadow: Option<Arc<safeguards::ShadowLog>>,
 }
 
 #[derive(Clone)]
@@ -227,6 +228,20 @@ impl ServerState {
         let rerank = runner.rerank().clone();
         let search = runner.search().clone();
         let redactor = redaction::Redactor::new(runner.provider_api_keys());
+        let safeguards_shadow = match runner
+            .safeguards()
+            .and_then(|judge| judge.shadow_log.as_ref())
+        {
+            None => None,
+            Some(path) => Some(Arc::new(safeguards::ShadowLog::open(path).map_err(
+                |error| {
+                    ServerError::new(format!(
+                        "cannot open safeguards shadow log {}: {error}",
+                        path.display()
+                    ))
+                },
+            )?)),
+        };
         Ok(Self {
             redactor: Arc::new(redactor),
             runner: Arc::new(runner),
@@ -239,6 +254,7 @@ impl ServerState {
             embeddings,
             rerank,
             search,
+            safeguards_shadow,
         })
     }
 
@@ -1100,11 +1116,15 @@ async fn handle_llm_request(
     wire_format: WireFormat,
     routing_log_context: Option<routing_log::RoutingLogContext>,
 ) -> Response {
-    let safeguards = if wire_format == WireFormat::AnthropicMessages {
-        safeguards::take_request(&mut body)
-            .map(|context| safeguards::answer(&state, context, &body))
+    let (safeguards, classifier_tap) = if wire_format == WireFormat::AnthropicMessages {
+        let session_id = metadata.session_id.clone();
+        (
+            safeguards::take_request(&mut body)
+                .map(|context| safeguards::answer(&state, context, &body, session_id.clone())),
+            safeguards::client_classifier_tap(&state, &body, session_id),
+        )
     } else {
-        None
+        (None, None)
     };
     let cache_probe = state.track_cache_eligibility.then(|| prefix_probe(&body));
     // Hosted web search: dedicated `web_search` requests are served here, before
@@ -1177,6 +1197,7 @@ async fn handle_llm_request(
         response_model,
         request_extensions,
         safeguards,
+        classifier_tap,
         Arc::clone(&state.redactor),
     )
     .await

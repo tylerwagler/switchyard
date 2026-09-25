@@ -81,12 +81,19 @@ pub(crate) struct DeploymentConfig {
 /// Claude Code's server-side auto mode check. `judge_route` names the
 /// `[routes.<name>]` entry whose model decides whether each tool use in a reply
 /// is dangerous. Absent means Switchyard answers that it does not run the check.
+///
+/// `shadow_log` turns on shadow mode, for grading a judge before it decides
+/// anything: Switchyard still answers that it does not run the check, runs the
+/// judge in the background, and appends its verdicts and Claude Code's own
+/// classifier exchanges to this JSONL file.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SafeguardsConfig {
     judge_route: String,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    shadow_log: Option<std::path::PathBuf>,
 }
 
 /// The judge for Claude Code's server-side auto mode check.
@@ -96,6 +103,8 @@ pub struct SafeguardsJudge {
     pub model: ModelId,
     /// Time allowed for one verdict.
     pub timeout: std::time::Duration,
+    /// Shadow mode's JSONL file. When set, the judge's verdicts are only logged.
+    pub shadow_log: Option<std::path::PathBuf>,
 }
 
 /// Opt-in hosted web search: serves Claude Code's server-side `web_search` tool
@@ -626,6 +635,7 @@ impl DeploymentConfig {
                     timeout: std::time::Duration::from_millis(
                         config.timeout_ms.unwrap_or(DEFAULT_SAFEGUARDS_TIMEOUT_MS),
                     ),
+                    shadow_log: config.shadow_log,
                 })
             }
         };
@@ -2490,6 +2500,14 @@ target = "t"
         let judge = runner.safeguards().expect("safeguards configured");
         assert!(runner.exact_route(judge.model.as_str()).is_some());
         assert_eq!(judge.timeout, std::time::Duration::from_millis(5000));
+        assert!(judge.shadow_log.is_none());
+        let toml = format!("{BASE}\n[safeguards]\njudge_route = \"r\"\nshadow_log = \"s.jsonl\"\n");
+        let runner = runner_from_toml(&toml).expect("shadow safeguards resolves");
+        let judge = runner.safeguards().expect("safeguards configured");
+        assert_eq!(
+            judge.shadow_log.as_deref(),
+            Some(std::path::Path::new("s.jsonl"))
+        );
     }
 
     #[test]
