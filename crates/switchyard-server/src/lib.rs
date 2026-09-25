@@ -11,6 +11,7 @@ mod observability;
 mod redaction;
 mod response;
 mod routing_log;
+mod safeguards;
 mod shutdown;
 mod sse;
 mod stats;
@@ -1095,10 +1096,12 @@ async fn handle_llm_request(
     state: ServerState,
     started: RequestStart,
     metadata: Metadata,
-    body: Value,
+    mut body: Value,
     wire_format: WireFormat,
     routing_log_context: Option<routing_log::RoutingLogContext>,
 ) -> Response {
+    let answer_safeguards =
+        wire_format == WireFormat::AnthropicMessages && safeguards::take_request(&mut body);
     let cache_probe = state.track_cache_eligibility.then(|| prefix_probe(&body));
     // Hosted web search: dedicated `web_search` requests are served here, before
     // routing or any model call (server-side search tools carry no input_schema,
@@ -1169,6 +1172,7 @@ async fn handle_llm_request(
         wire_format,
         response_model,
         request_extensions,
+        answer_safeguards,
         Arc::clone(&state.redactor),
     ) {
         Ok(response) => response,

@@ -997,6 +997,51 @@ id = "{ROUTE_MODEL}"
 }
 
 #[tokio::test]
+async fn safeguards_are_answered_here_and_never_reach_the_backend() -> TestResult {
+    let (upstream, app) = test_app(&[(ROUTE_MODEL, &["model/a"])]).await?;
+    let answer = json!([{"type": "dangerous_tool_use", "status": {"type": "unsupported"}}]);
+    for stream in [false, true] {
+        let mut body = json!({
+            "model": ROUTE_MODEL,
+            "messages": [{"role": "user", "content": "visible request"}],
+            "max_tokens": 16, "stream": stream
+        });
+        let plain = send(&app, "POST", "/v1/messages", Some(body.clone())).await?;
+        assert_eq!(plain.status, StatusCode::OK);
+        assert!(!plain.text()?.contains("safeguard_results"));
+
+        body["safeguards"] = json!([{"type": "dangerous_tool_use",
+            "classifier_context": {"v": 1, "permission_mode": "auto"}}]);
+        let asked = send(&app, "POST", "/v1/messages", Some(body)).await?;
+        assert_eq!(asked.status, StatusCode::OK);
+        if stream {
+            let delta = asked
+                .text()?
+                .lines()
+                .filter_map(|line| line.strip_prefix("data: "))
+                .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                .find(|event| event["type"] == "message_delta")
+                .ok_or("missing message_delta")?;
+            assert_eq!(delta["delta"]["safeguard_results"], answer);
+            assert_eq!(asked.text()?.matches("safeguard_results").count(), 1);
+        } else {
+            assert_eq!(asked.json()?["safeguard_results"], answer);
+        }
+
+        let mut calls = upstream.calls.lock().await;
+        assert_eq!(calls.len(), 2);
+        assert!(
+            calls
+                .iter()
+                .all(|call| !call.to_string().contains("safeguards"))
+        );
+        assert_eq!(calls[1], calls[0], "safeguards changed the upstream body");
+        calls.clear();
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn caller_metadata_cannot_replace_upstream_request() -> TestResult {
     let upstream = MockUpstream::start().await?;
     let app = buffered_responses_app(&upstream, "model/fallback", false, false)?;
