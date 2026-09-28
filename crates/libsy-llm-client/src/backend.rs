@@ -215,9 +215,14 @@ impl Backend {
     /// Applies this backend's configured auth and version headers to a request builder.
     ///
     /// OpenAI variants use `Authorization: Bearer <key>`; Anthropic uses
-    /// `x-api-key: <key>` plus the required `anthropic-version` header. A backend
-    /// with `forward_auth` uses the caller's provider credential instead.
-    pub fn apply_auth(&self, mut builder: RequestBuilder) -> RequestBuilder {
+    /// `x-api-key: <key>` plus an `anthropic-version` header, which is the caller's
+    /// when it sends one and the default otherwise. A backend with `forward_auth`
+    /// uses the caller's provider credential instead.
+    pub fn apply_auth(
+        &self,
+        mut builder: RequestBuilder,
+        metadata: Option<&Metadata>,
+    ) -> RequestBuilder {
         let api_key = self.configured_api_key();
         match self {
             Backend::OpenAiChat(_) | Backend::OpenAiResponses(_) => {
@@ -226,7 +231,14 @@ impl Backend {
                 }
             }
             Backend::Anthropic(_) => {
-                builder = builder.header("anthropic-version", ANTHROPIC_VERSION);
+                // Send the caller's API version. Pinning our own would silently
+                // downgrade a client built against a newer one.
+                let version = metadata
+                    .and_then(|metadata| metadata.http_headers.as_ref())
+                    .and_then(|headers| headers.get("anthropic-version"))
+                    .cloned()
+                    .unwrap_or_else(|| HeaderValue::from_static(ANTHROPIC_VERSION));
+                builder = builder.header("anthropic-version", version);
                 if let Some(api_key) = api_key {
                     builder = builder.header("x-api-key", api_key);
                 }
@@ -541,7 +553,7 @@ mod tests {
                 .validate_configured_headers("model")
                 .expect("unused API key must not fail validation");
             let request = backend
-                .apply_auth(client.get("https://example.test"))
+                .apply_auth(client.get("https://example.test"), None)
                 .build()
                 .expect("request");
             assert!(!request.headers().contains_key("authorization"));

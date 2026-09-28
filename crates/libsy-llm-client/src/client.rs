@@ -418,7 +418,7 @@ impl TranslatingLlmClient {
         let builder = forward_metadata_headers(builder, metadata, backend);
         let builder = backend.apply_forwarded_auth(builder, metadata);
         let builder = apply_extra_headers(builder, backend);
-        let builder = backend.apply_auth(builder);
+        let builder = backend.apply_auth(builder, metadata);
 
         let response = match builder.send().await {
             Ok(response) => response,
@@ -2319,6 +2319,107 @@ mod tests {
         Ok(())
     }
 
+    // The caller's API version goes out as given. Pinning our own would silently
+    // downgrade a client built against a newer version.
+    #[tokio::test]
+    async fn anthropic_requests_forward_the_callers_api_version()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        const VERSION: &str = "2026-01-15";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&anthropic_map(&server.uri()))?;
+        let mut headers = http::HeaderMap::new();
+        headers.insert("anthropic-version", http::HeaderValue::from_static(VERSION));
+        client
+            .call_rewrite_model_raw(
+                json!({
+                    "model": "client-facing",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 7
+                }),
+                Some(headers),
+                Some(&ModelId::from("claude")),
+                WireFormat::AnthropicMessages,
+            )
+            .await?;
+
+        let received = server
+            .received_requests()
+            .await
+            .ok_or("request recording should be enabled")?;
+        let received = received.first().ok_or("expected one upstream request")?;
+        assert_eq!(
+            received
+                .headers
+                .get("anthropic-version")
+                .and_then(|value| value.to_str().ok()),
+            Some(VERSION)
+        );
+        Ok(())
+    }
+
+    // With no caller version the default still goes out, so an upstream that
+    // requires the header keeps working.
+    #[tokio::test]
+    async fn anthropic_requests_default_the_api_version_when_absent()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&anthropic_map(&server.uri()))?;
+        client
+            .call_rewrite_model_raw(
+                json!({
+                    "model": "client-facing",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "max_tokens": 7
+                }),
+                None,
+                Some(&ModelId::from("claude")),
+                WireFormat::AnthropicMessages,
+            )
+            .await?;
+
+        let received = server
+            .received_requests()
+            .await
+            .ok_or("request recording should be enabled")?;
+        let received = received.first().ok_or("expected one upstream request")?;
+        assert_eq!(
+            received
+                .headers
+                .get("anthropic-version")
+                .and_then(|value| value.to_str().ok()),
+            Some("2023-06-01")
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn streaming_openai_chat_aggregates()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
@@ -2893,7 +2994,7 @@ mod tests {
                         .headers
                         .get("anthropic-version")
                         .and_then(|value| value.to_str().ok())
-                        == Some("2023-06-01")
+                        == Some("caller-version")
             })
             .respond_with(ResponseTemplate::new(401).set_body_json(json!({
                 "error": {"message": "rejected client-google-key"}
