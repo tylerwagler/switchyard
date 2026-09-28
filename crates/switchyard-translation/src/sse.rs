@@ -53,9 +53,17 @@ pub(crate) fn is_terminal_event(format: WireFormat, event: &Value) -> bool {
                     .and_then(Value::as_str)
                     .is_some()
             }),
-        WireFormat::AnthropicMessages => {
-            event.get("type").and_then(Value::as_str) == Some("message_stop")
-        }
+        WireFormat::AnthropicMessages => match event.get("type").and_then(Value::as_str) {
+            Some("message_stop") => true,
+            // A body that stops after a `message_delta` carrying a stop_reason is
+            // complete too: the reader keeps that stop_reason and treats the
+            // response as finished, so a missing `message_stop` is not a truncation.
+            // A later usage-only delta with a null stop_reason does not clear it.
+            Some("message_delta") => event
+                .pointer("/delta/stop_reason")
+                .is_some_and(|reason| !reason.is_null()),
+            _ => false,
+        },
         WireFormat::OpenAiResponses => matches!(
             event
                 .get("type")
@@ -202,6 +210,26 @@ mod tests {
         assert!(is_terminal_event(
             WireFormat::AnthropicMessages,
             &json!({"type": "message_stop"})
+        ));
+        // A body that ends after a stop_reason-carrying message_delta is complete,
+        // even with no message_stop: a truncation ends earlier than this.
+        assert!(is_terminal_event(
+            WireFormat::AnthropicMessages,
+            &json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}})
+        ));
+        // A usage-only delta carries no stop_reason, so it does not complete one.
+        assert!(!is_terminal_event(
+            WireFormat::AnthropicMessages,
+            &json!({"type": "message_delta", "delta": {"stop_reason": null}})
+        ));
+        assert!(!is_terminal_event(
+            WireFormat::AnthropicMessages,
+            &json!({"type": "message_delta", "usage": {"output_tokens": 3}})
+        ));
+        // Content events never complete a stream.
+        assert!(!is_terminal_event(
+            WireFormat::AnthropicMessages,
+            &json!({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "x"}})
         ));
         assert!(is_terminal_event(
             WireFormat::OpenAiResponses,

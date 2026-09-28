@@ -845,6 +845,26 @@ mod tests {
         Ok(())
     }
 
+    // The spec treats a body that ends after a `message_delta` carrying a
+    // stop_reason, with no block open, as complete even without `message_stop`.
+    #[test]
+    fn anthropic_stream_without_message_stop_is_complete() -> Result<(), BoxError> {
+        let sse = b"data: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"content\":[]}}\n\n\
+             data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n\
+             data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"hi\"}}\n\n\
+             data: {\"type\":\"content_block_stop\",\"index\":0}\n\n\
+             data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usage\":{\"output_tokens\":1}}\n\n".to_vec();
+        let bytes = stream::once(async move { Ok::<Vec<u8>, LlmClientError>(sse) });
+        let results =
+            block_on(decode_stream(bytes, WireFormat::AnthropicMessages)?.collect::<Vec<_>>());
+
+        assert!(
+            results.iter().all(Result::is_ok),
+            "a stop_reason-carrying message_delta completes the stream"
+        );
+        Ok(())
+    }
+
     #[test]
     fn responses_failed_before_done_remains_a_stream_error() -> Result<(), BoxError> {
         let sse = b"data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"upstream failed\"}}}\n\ndata: [DONE]\n\n".to_vec();
