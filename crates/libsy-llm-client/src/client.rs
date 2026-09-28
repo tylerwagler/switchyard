@@ -263,8 +263,8 @@ impl TranslatingLlmClient {
         if matches!(backend, Backend::OpenAiResponses(_)) {
             sanitize_openai_responses_provider_body(&mut body);
         }
-        // Strip before `merge_extra_body` so a target can reinstate either field
-        // deliberately via `extra_body`.
+        // Strip OpenAI-only fields before `merge_extra_body` so a target can
+        // reinstate `reasoning_effort` deliberately via `extra_body`.
         if matches!(backend, Backend::Anthropic(_)) {
             strip_anthropic_incompatible_fields(&mut body);
             strip_unsigned_thinking_blocks(&mut body);
@@ -1049,17 +1049,17 @@ fn ensure_responses_function_tool_description(object: &mut Map<String, Value>) {
     }
 }
 
-// Drops fields accepted by OpenAI-like APIs but rejected by Anthropic Messages.
+// Drops OpenAI-only fields that Anthropic Messages rejects.
 //
 // A router can serve earlier turns of a session from an OpenAI-format target and
-// later turns from an Anthropic one. Clients such as Claude Code send
-// `context_management` on every turn, so the Anthropic leg must strip it or the
-// upstream rejects the request (for example `clear_thinking_20251015` strategy
-// requires `thinking` to be enabled or adaptive).
+// later turns from an Anthropic one, so the caller keeps sending fields such as
+// `reasoning_effort` that only the OpenAI leg accepts.
+//
+// Anthropic's own beta fields are forwarded, including `context_management`. A
+// target whose upstream rejects one opts out with `omit_body_fields`.
 fn strip_anthropic_incompatible_fields(body: &mut Value) {
     if let Value::Object(object) = body {
         object.remove("reasoning_effort");
-        object.remove("context_management");
     }
 }
 
@@ -2210,7 +2210,7 @@ mod tests {
 
     // A router can serve earlier turns from an OpenAI target and later turns from
     // an Anthropic one, so the Anthropic leg must drop OpenAI-only fields the
-    // caller keeps sending or the upstream rejects the whole request.
+    // caller keeps sending. Anthropic's own beta fields travel through.
     #[tokio::test]
     async fn anthropic_requests_drop_openai_only_fields()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
@@ -2219,7 +2219,9 @@ mod tests {
             .and(path("/v1/messages"))
             .and(|request: &wiremock::Request| {
                 let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
-                body.get("context_management").is_none() && body.get("reasoning_effort").is_none()
+                body.get("reasoning_effort").is_none()
+                    && body.get("context_management")
+                        == Some(&json!({"edits": [{"type": "clear_thinking_20251015"}]}))
             })
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "msg_1",
