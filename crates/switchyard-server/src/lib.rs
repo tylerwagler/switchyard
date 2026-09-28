@@ -83,6 +83,14 @@ const FORWARDED_UPSTREAM_HEADER_PREFIXES: &[&str] =
     &["anthropic-ratelimit-", "x-ratelimit-", "x-upstream-"];
 const MAX_ROUTING_HEADER_VALUE_LEN: usize = 512;
 
+/// Marks a rejection the client can recover from on its own.
+///
+/// When a gateway rebuilds an upstream error into its own envelope, the client
+/// can no longer match the upstream's wording. A stable token in the message
+/// restores that: the client reads `prompt_too_long` as "compact and retry"
+/// instead of surfacing an unrecoverable error.
+const CAPABILITY_REJECTED_PROMPT_TOO_LONG: &str = "capability_rejected: prompt_too_long";
+
 /// Whether an upstream header is safe and useful to expose downstream.
 fn should_forward_upstream_header(name: &HeaderName) -> bool {
     let name = name.as_str();
@@ -1389,7 +1397,7 @@ fn client_error(error: &LlmClientError) -> Response {
         ),
         LlmClientError::ContextWindowExceeded { message, .. } => error_response(
             StatusCode::BAD_REQUEST,
-            message,
+            format!("{CAPABILITY_REJECTED_PROMPT_TOO_LONG}: {message}"),
             "invalid_request_error",
             "context_length_exceeded",
         ),
@@ -2245,5 +2253,29 @@ mod tests {
         }
         let secret: HeaderName = "authorization".parse().expect("header name");
         assert!(!should_forward_upstream_header(&secret));
+    }
+
+    // Rebuilding an upstream error into our own envelope costs the client the
+    // upstream's wording, so a recoverable rejection must be marked. Without the
+    // token an over-window request is a dead end instead of a compaction.
+    #[tokio::test]
+    async fn context_overflow_carries_the_capability_rejected_token() {
+        let response = client_error(&LlmClientError::ContextWindowExceeded {
+            model: ModelId::from("model/weak"),
+            message: "Prompt has 200000 tokens, but the configured context size is 131072 tokens"
+                .to_string(),
+        });
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let body: Value = serde_json::from_slice(&body).expect("error json");
+        let message = body["error"]["message"].as_str().expect("message");
+        assert!(
+            message.contains(CAPABILITY_REJECTED_PROMPT_TOO_LONG),
+            "{message}"
+        );
+        // The upstream's own text still reaches the user.
+        assert!(message.contains("configured context size"), "{message}");
+        assert_eq!(body["error"]["code"], json!("context_length_exceeded"));
     }
 }

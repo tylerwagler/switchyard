@@ -35,11 +35,15 @@ const OPENAI_OVERFLOW_PHRASES: &[&str] = &[
 ];
 
 // Anthropic has no structured `error.code`, so detection is phrase-based only.
+// "configured context size" is pulsar-server's wording; it does not match
+// Anthropic's own, so without it an over-window request is not recognised as an
+// overflow and the client never gets the token that triggers compaction.
 const ANTHROPIC_OVERFLOW_PHRASES: &[&str] = &[
     "prompt is too long",
     "maximum number of tokens",
     "context window",
     "context length",
+    "configured context size",
 ];
 
 /// Shared HTTP configuration for one upstream backend.
@@ -597,6 +601,12 @@ mod tests {
                 r#"{"error":{"message":"prompt is too long: 200000 tokens"}}"#
             )
         );
+        // pulsar-server's own wording. It matches none of Anthropic's phrases, so
+        // without an explicit entry an over-window request is not classified as an
+        // overflow and the client never receives the recovery token.
+        assert!(backend.is_context_overflow(
+            r#"{"type":"error","error":{"type":"invalid_request_error","message":"Prompt has 200000 tokens, but the configured context size is 131072 tokens","n_prompt_tokens":200000,"n_ctx":131072}}"#
+        ));
         assert!(!backend.is_context_overflow(r#"{"error":{"message":"overloaded"}}"#));
     }
 }
