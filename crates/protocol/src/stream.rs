@@ -286,6 +286,7 @@ fn push_checked_chunk(
         LlmResponseChunk::StreamError { message } => Err(LlmClientError::UpstreamHttp {
             status: MID_STREAM_UPSTREAM_STATUS,
             body: message,
+            headers: Box::new(http::HeaderMap::new()),
         }),
         chunk => {
             accumulator.push(chunk);

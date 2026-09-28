@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use futures_util::{StreamExt, stream};
 use http::StatusCode;
 use reqwest::RequestBuilder;
-use reqwest::header::{HeaderMap, RETRY_AFTER};
+use reqwest::header::{HeaderMap, HeaderValue, RETRY_AFTER};
 use serde_json::{Map, Value, json};
 use switchyard_protocol::{
     LlmRequest, LlmResponse, LlmResponseChunk, LlmResponseStream, LlmResponseStreamEvent, Metadata,
@@ -477,6 +477,9 @@ impl TranslatingLlmClient {
         }
 
         let retry_after = retry_after_delay(response.headers());
+        // Captured before the body is consumed: a failure still has to carry the
+        // headers the client reads for retry and rate-limit decisions.
+        let upstream_headers = forwardable_error_headers(response.headers());
         let body = match response.text().await {
             Ok(body) => body,
             Err(error) => {
@@ -497,7 +500,11 @@ impl TranslatingLlmClient {
                     message: body,
                 }
             } else {
-                LlmClientError::UpstreamHttp { status, body }
+                LlmClientError::UpstreamHttp {
+                    status,
+                    body,
+                    headers: Box::new(upstream_headers),
+                }
             };
         Err(AttemptFailure {
             error,
@@ -586,6 +593,7 @@ impl TranslatingLlmClient {
                                         metadata.as_ref(),
                                         backend.is_forwarding_auth(),
                                     ),
+                                    headers: Box::new(upstream_headers.clone()),
                                 }
                             }
                             error => LlmClientError::ResponseTranslation(error.to_string()),
@@ -826,6 +834,28 @@ fn first_event_overflow(
             }
             _ => None,
         })
+}
+
+// Captures an upstream failure's response headers so the caller can forward the
+// ones a client reads. `retry-after` is normalised to whole seconds: the client
+// reads seconds, so an upstream that answers with an HTTP date would be ignored.
+fn forwardable_error_headers(headers: &HeaderMap) -> HeaderMap {
+    let mut forwarded = headers.clone();
+    if let Some(value) = headers
+        .get(RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        && value.parse::<u64>().is_err()
+        && let Ok(retry_at) = httpdate::parse_http_date(value)
+    {
+        let seconds = retry_at
+            .duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO)
+            .as_secs();
+        if let Ok(value) = HeaderValue::from_str(&seconds.to_string()) {
+            forwarded.insert(RETRY_AFTER, value);
+        }
+    }
+    forwarded
 }
 
 // Uses Retry-After when supplied, capped so an upstream cannot stall a request indefinitely.
@@ -2573,7 +2603,8 @@ mod tests {
             error,
             LlmClientError::UpstreamHttp {
                 status: StatusCode::UNAUTHORIZED,
-                body
+                body,
+                ..
             } if body == "invalid key"
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
@@ -2609,7 +2640,8 @@ mod tests {
             error,
             LlmClientError::UpstreamHttp {
                 status: StatusCode::INTERNAL_SERVER_ERROR,
-                body
+                body,
+                ..
             } if body == "attempt 3"
         ));
         assert_eq!(calls.load(Ordering::SeqCst), 3);
@@ -2719,6 +2751,7 @@ mod tests {
                 error: LlmClientError::UpstreamHttp {
                     status,
                     body: String::new(),
+                    headers: Box::new(http::HeaderMap::new()),
                 },
                 status: Some(status),
                 retry_after: None,
@@ -2736,6 +2769,7 @@ mod tests {
                 error: LlmClientError::UpstreamHttp {
                     status,
                     body: String::new(),
+                    headers: Box::new(http::HeaderMap::new()),
                 },
                 status: Some(status),
                 retry_after: None,
@@ -2863,6 +2897,7 @@ mod tests {
         let LlmClientError::UpstreamHttp {
             status,
             body: actual,
+            ..
         } = error
         else {
             panic!("expected the upstream HTTP error, got {error:?}");
@@ -3393,5 +3428,31 @@ mod tests {
             )
             .await?;
         Ok(())
+    }
+
+    // The client reads `retry-after` as whole seconds, so an upstream that answers
+    // with an HTTP date has to be normalised or the hint is silently lost.
+    #[test]
+    fn retry_after_date_is_normalised_to_seconds() {
+        let mut headers = HeaderMap::new();
+        let in_two_minutes = SystemTime::now() + Duration::from_secs(120);
+        headers.insert(
+            RETRY_AFTER,
+            HeaderValue::from_str(&httpdate::fmt_http_date(in_two_minutes)).expect("http date"),
+        );
+        let seconds: u64 = forwardable_error_headers(&headers)[RETRY_AFTER]
+            .to_str()
+            .expect("value")
+            .parse()
+            .expect("whole seconds");
+        assert!((119..=120).contains(&seconds), "got {seconds}");
+
+        // A bare integer is forwarded unchanged, as are unrelated headers.
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("42"));
+        headers.insert("x-should-retry", HeaderValue::from_static("true"));
+        let forwarded = forwardable_error_headers(&headers);
+        assert_eq!(forwarded[RETRY_AFTER], "42");
+        assert_eq!(forwarded["x-should-retry"], "true");
     }
 }

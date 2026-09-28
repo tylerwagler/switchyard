@@ -95,6 +95,13 @@ pub enum LlmClientError {
         status: http::StatusCode,
         /// Raw upstream error body.
         body: String,
+        /// The upstream's response headers. A gateway forwards the ones the client
+        /// reads for retry and rate-limit decisions, and those matter most on a
+        /// failure, so they travel with the error instead of being dropped.
+        ///
+        /// Boxed because this error is returned from nearly every call path, and
+        /// carrying the map inline makes the `Err` variant large for every one.
+        headers: Box<http::HeaderMap>,
     },
 
     /// The upstream returned a response the client could not decode.

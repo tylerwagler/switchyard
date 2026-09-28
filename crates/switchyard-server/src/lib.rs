@@ -74,10 +74,13 @@ const FORWARDED_UPSTREAM_HEADERS: &[&str] = &[
     "openai-processing-ms",
     // Anthropic spells its correlation id without the `x-` prefix.
     "request-id",
+    // Retry hints are read on failures as much as on successes.
+    "retry-after",
     "traceparent",
     "tracestate",
     "x-litellm-response-cost",
     "x-request-id",
+    "x-should-retry",
 ];
 const FORWARDED_UPSTREAM_HEADER_PREFIXES: &[&str] =
     &["anthropic-ratelimit-", "x-ratelimit-", "x-upstream-"];
@@ -98,6 +101,20 @@ fn should_forward_upstream_header(name: &HeaderName) -> bool {
         || FORWARDED_UPSTREAM_HEADER_PREFIXES
             .iter()
             .any(|prefix| name.starts_with(prefix))
+}
+
+/// Appends the upstream headers this server forwards to a response.
+///
+/// Used for successes in the handler and for upstream failures where the error is
+/// rendered, so a client sees retry and rate-limit hints either way. A failure is
+/// where those hints matter most, and the error would otherwise carry none.
+fn append_forwarded_upstream_headers(response: &mut Response, headers: &HeaderMap) {
+    let response_headers = response.headers_mut();
+    for (name, value) in headers.iter() {
+        if should_forward_upstream_header(name) {
+            response_headers.append(name.clone(), value.clone());
+        }
+    }
 }
 /// Non-standard status used only in logs and metrics for a request whose
 /// downstream client disconnected before any response was written.
@@ -1205,13 +1222,7 @@ async fn handle_llm_request(
     };
     // Forward upstream headers before Switchyard writes its own so any header
     // this server emits always overrides an upstream echo of the same name.
-    let response_headers = response.headers_mut();
-    for (name, value) in upstream_headers.iter() {
-        if !should_forward_upstream_header(name) {
-            continue;
-        }
-        response_headers.append(name.clone(), value.clone());
-    }
+    append_forwarded_upstream_headers(&mut response, &upstream_headers);
     if let Some(served_model) = served_model.as_ref() {
         attach_routing_headers(&mut response, served_model.as_str());
     }
@@ -1401,7 +1412,15 @@ fn client_error(error: &LlmClientError) -> Response {
             "invalid_request_error",
             "context_length_exceeded",
         ),
-        LlmClientError::UpstreamHttp { status, body } => upstream_error(*status, body),
+        LlmClientError::UpstreamHttp {
+            status,
+            body,
+            headers,
+        } => {
+            let mut response = upstream_error(*status, body);
+            append_forwarded_upstream_headers(&mut response, headers);
+            response
+        }
         LlmClientError::Transport { source } | LlmClientError::InvalidResponse { source } => {
             error_response(
                 StatusCode::BAD_GATEWAY,
@@ -2219,6 +2238,7 @@ mod tests {
             body: format!(
                 r#"{{"error":{{"message":"validation failed: {LEAKED}","code":"invalid_request_{LEAKED}"}}}}"#
             ),
+            headers: Box::new(http::HeaderMap::new()),
         };
         for wire_format in [
             WireFormat::OpenAiChat,
@@ -2277,5 +2297,41 @@ mod tests {
         // The upstream's own text still reaches the user.
         assert!(message.contains("configured context size"), "{message}");
         assert_eq!(body["error"]["code"], json!("context_length_exceeded"));
+    }
+
+    // A failure must carry the upstream's retry and rate-limit hints, not just its
+    // status and body: that is where a client decides whether and when to retry.
+    #[tokio::test]
+    async fn upstream_error_forwards_retry_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("retry-after", HeaderValue::from_static("17"));
+        headers.insert("x-should-retry", HeaderValue::from_static("true"));
+        headers.insert(
+            "anthropic-ratelimit-unified-status",
+            HeaderValue::from_static("allowed"),
+        );
+        headers.insert("authorization", HeaderValue::from_static("secret"));
+
+        let response = client_error(&LlmClientError::UpstreamHttp {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            body: r#"{"error":{"message":"slow down"}}"#.to_string(),
+            headers: Box::new(headers),
+        });
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        let headers = response.headers();
+        assert_eq!(headers.get("retry-after").expect("retry-after"), "17");
+        assert_eq!(
+            headers.get("x-should-retry").expect("x-should-retry"),
+            "true"
+        );
+        assert_eq!(
+            headers
+                .get("anthropic-ratelimit-unified-status")
+                .expect("rate-limit header"),
+            "allowed"
+        );
+        // Only the allowlist travels upstream-to-client.
+        assert!(headers.get("authorization").is_none());
     }
 }

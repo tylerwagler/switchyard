@@ -185,6 +185,7 @@ mod tests {
             source: LlmClientError::UpstreamHttp {
                 status: reqwest::StatusCode::SERVICE_UNAVAILABLE,
                 body: format!("upstream response: {SECRET}"),
+                headers: Default::default(),
             },
         });
 

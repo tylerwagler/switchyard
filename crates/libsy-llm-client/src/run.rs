@@ -395,6 +395,7 @@ async fn buffer_routing_stream(
                     return Err(LlmClientError::UpstreamHttp {
                         status: StatusCode::BAD_GATEWAY,
                         body: message.clone(),
+                        headers: Box::new(http::HeaderMap::new()),
                     });
                 }
                 _ => {}
@@ -429,7 +430,7 @@ fn fallback_reason(error: &LibsyError) -> Option<RoutingFallbackReason> {
         LlmClientError::Transport { .. } => Some(RoutingFallbackReason::Unavailable),
         // A policy denial can be specific to one provider. Preserve its HTTP
         // error, but allow another candidate to serve the request.
-        LlmClientError::UpstreamHttp { status, body }
+        LlmClientError::UpstreamHttp { status, body, .. }
             if *status == StatusCode::BAD_REQUEST
                 && serde_json::from_str::<serde_json::Value>(body).is_ok_and(|value| {
                     value["error"]["code"].as_str() == Some("content_policy_violation")
@@ -1061,10 +1062,12 @@ mod tests {
                     FirstOutcome::ContentPolicy => Err(LlmClientError::UpstreamHttp {
                         status: StatusCode::BAD_REQUEST,
                         body: r#"{"error":{"code":"content_policy_violation","message":"request blocked by content policy","type":"invalid_request_error"},"metadata":{"documentation_section":"context window"}}"#.to_string(),
+                        headers: Box::new(http::HeaderMap::new()),
                     }),
                     FirstOutcome::Unauthorized => Err(LlmClientError::UpstreamHttp {
                         status: StatusCode::UNAUTHORIZED,
                         body: "unauthorized".to_string(),
+                        headers: Box::new(http::HeaderMap::new()),
                     }),
                     FirstOutcome::StreamSuccess => Ok(stream_response(vec![
                         LlmResponseChunk::TextDelta {
@@ -1969,6 +1972,7 @@ mod tests {
                 fallback_reason(&error(LlmClientError::UpstreamHttp {
                     status,
                     body: "failed".to_string(),
+                    headers: Box::new(http::HeaderMap::new()),
                 })),
                 Some(RoutingFallbackReason::Unavailable)
             );
@@ -1989,6 +1993,7 @@ mod tests {
                 fallback_reason(&error(LlmClientError::UpstreamHttp {
                     status: StatusCode::BAD_REQUEST,
                     body: body.to_string(),
+                    headers: Box::new(http::HeaderMap::new()),
                 })),
                 expected,
                 "{body}"
@@ -2006,6 +2011,7 @@ mod tests {
                 fallback_reason(&error(LlmClientError::UpstreamHttp {
                     status,
                     body: "failed".to_string(),
+                    headers: Box::new(http::HeaderMap::new()),
                 })),
                 None
             );
