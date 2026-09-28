@@ -40,6 +40,8 @@ pub struct ModelInfo<'a> {
     pub id: &'a ModelId,
     pub algorithm: &'a str,
     pub capabilities: ModelCapabilities,
+    /// Base URLs of the upstreams serving this route, deduplicated.
+    pub base_urls: Vec<&'a str>,
 }
 
 /// Fully resolved routing decision.
@@ -196,6 +198,12 @@ impl Runner {
             id,
             algorithm: route.algorithm_name(),
             capabilities: route.capabilities(),
+            base_urls: {
+                let mut urls: Vec<&str> = route.base_urls().collect();
+                urls.sort_unstable();
+                urls.dedup();
+                urls
+            },
         })
     }
 

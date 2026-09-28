@@ -3294,6 +3294,25 @@ target = "openai"
 }
 
 #[tokio::test]
+async fn available_models_leave_out_routes_whose_upstream_is_down() -> TestResult {
+    let (_upstream, live) = test_app(&[("switchyard/general", &["model/general"])]).await?;
+    let models = send(&live, "GET", "/v1/models?available=true", None).await?;
+    assert_eq!(models.status, StatusCode::OK);
+    assert_eq!(models.json()?["model_pool"], json!(["switchyard/general"]));
+
+    // Nothing listens on port 1.
+    let down = build_switchyard_router(random_state(
+        "http://127.0.0.1:1/v1",
+        &[("switchyard/general", &["model/general"])],
+    )?);
+    let models = send(&down, "GET", "/v1/models?available=true", None).await?;
+    assert_eq!(models.json()?["data"], json!([]));
+    let all = send(&down, "GET", "/v1/models", None).await?;
+    assert_eq!(all.json()?["model_pool"], json!(["switchyard/general"]));
+    Ok(())
+}
+
+#[tokio::test]
 async fn routes_dispatch_and_discovery_endpoints_are_stable() -> TestResult {
     let (upstream, app) = test_app(&[
         ("switchyard/coding", &["model/code"]),

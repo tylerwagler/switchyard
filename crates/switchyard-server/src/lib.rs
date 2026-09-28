@@ -57,6 +57,7 @@ use crate::response::into_http_response;
 use crate::stats::{StatsAccumulator, StatsSnapshot, prefix_probe, tracking_enabled_from_env};
 
 pub use observability::{flush_observability, initialize_observability};
+pub use usage_metrics::{UsageReport, UsageSink};
 
 /// Default TCP listen backlog used by the Rust server.
 pub const DEFAULT_LISTEN_BACKLOG: u32 = 65_535;
@@ -349,12 +350,21 @@ impl ServerRunOptions {
 
 /// Validates the runtime and starts the HTTP server unless `dry_run` is set.
 pub async fn run_server(state: ServerState, options: ServerRunOptions) -> ServerResult<()> {
+    run_server_with(state, options, |router| router).await
+}
+
+/// Runs the server like [`run_server`], with its router wrapped by `wrap` first.
+pub async fn run_server_with(
+    state: ServerState,
+    options: ServerRunOptions,
+    wrap: impl FnOnce(Router) -> Router,
+) -> ServerResult<()> {
     if options.dry_run {
         println!("{}", dry_run_summary(&state));
         return Ok(());
     }
 
-    let server = BoundServer::bind(state, options)?;
+    let server = BoundServer::bind(state, options)?.map_router(wrap);
     println!("{}", server.startup_banner(std::io::stdout().is_terminal()));
     server.serve(shutdown::signal()).await
 }
@@ -378,6 +388,12 @@ impl BoundServer {
             options: ServerRunOptions { addr, ..options },
             state,
         })
+    }
+
+    /// Wraps the prepared router, for example with authentication layers.
+    pub fn map_router(mut self, wrap: impl FnOnce(Router) -> Router) -> Self {
+        self.router = wrap(self.router);
+        self
     }
 
     /// Returns the actual bound address, including an OS-selected port.
@@ -422,7 +438,8 @@ async fn serve_tls(
     let handle = axum_server::Handle::new();
     let server = server
         .handle(handle.clone())
-        .serve(router.into_make_service());
+        // Handlers and layers can see the caller's address (ConnectInfo<SocketAddr>).
+        .serve(router.into_make_service_with_connect_info::<SocketAddr>());
     serve_until_shutdown(server, handle, shutdown_timeout, shutdown).await
 }
 
@@ -437,7 +454,8 @@ async fn serve(
     let handle = axum_server::Handle::new();
     let server = server
         .handle(handle.clone())
-        .serve(router.into_make_service());
+        // Handlers and layers can see the caller's address (ConnectInfo<SocketAddr>).
+        .serve(router.into_make_service_with_connect_info::<SocketAddr>());
     serve_until_shutdown(server, handle, shutdown_timeout, shutdown).await
 }
 
@@ -462,9 +480,10 @@ async fn serve_until_shutdown(
     }
 }
 
-/// Ingress timestamp for one request, taken before any body is read.
-#[derive(Clone, Copy)]
-struct RequestStart(Instant);
+/// Ingress timestamp for one request, taken before any body is read, and the
+/// request's usage sink when an outer layer supplied one.
+#[derive(Clone)]
+struct RequestStart(Instant, Option<UsageSink>);
 
 /// Routing-log marker distinguishing classifier and judge calls from answer calls.
 const CLASSIFIER_TIER: &str = "classifier";
@@ -531,9 +550,10 @@ fn stats_observer(
 /// so it executes before the handlers' `Json` extractor buffers the body —
 /// request-latency measurements therefore include body read and decode.
 async fn stamp_request_start(mut request: HttpRequest, next: Next) -> Response {
+    let sink = request.extensions().get::<UsageSink>().cloned();
     request
         .extensions_mut()
-        .insert(RequestStart(Instant::now()));
+        .insert(RequestStart(Instant::now(), sink));
     next.run(request).await
 }
 
@@ -1157,6 +1177,7 @@ async fn handle_llm_request(
             state.stats,
             cache_eligible,
             state.routing_log.zip(routing_log_context),
+            started.1,
         )
     } else {
         response
@@ -1506,7 +1527,20 @@ fn error_response(
     ApiError::new(status, message, error_type, code).into_response(WireFormat::OpenAiChat)
 }
 
-async fn models(State(state): State<ServerState>) -> Json<Value> {
+#[derive(Deserialize)]
+struct ModelsQuery {
+    /// Only chat routes with a reachable upstream; non-chat backends are left out.
+    #[serde(default)]
+    available: bool,
+}
+
+async fn models(
+    State(state): State<ServerState>,
+    query: std::result::Result<Query<ModelsQuery>, QueryRejection>,
+) -> Json<Value> {
+    if query.is_ok_and(|Query(query)| query.available) {
+        return Json(available_models(&state).await);
+    }
     let mut payload = model_list_payload(
         state
             .runner
@@ -1519,6 +1553,33 @@ async fn models(State(state): State<ServerState>) -> Json<Value> {
         data.extend(auxiliary::capability_entries(&state));
     }
     Json(payload)
+}
+
+/// The chat routes a caller can use right now: at least one of the route's upstreams
+/// accepts connections (the same probe as `/v1/upstreams`, each upstream probed once).
+async fn available_models(state: &ServerState) -> Value {
+    let mut urls: Vec<&str> = state
+        .runner
+        .models()
+        .flat_map(|model| model.base_urls)
+        .collect();
+    urls.sort_unstable();
+    urls.dedup();
+    let probes = urls
+        .into_iter()
+        .map(|url| async move { probe_endpoint(url).await.is_ok().then_some(url) });
+    let reachable: Vec<&str> = futures_util::future::join_all(probes)
+        .await
+        .into_iter()
+        .flatten()
+        .collect();
+    model_list_payload(
+        state
+            .runner
+            .models()
+            .filter(|model| model.base_urls.iter().any(|url| reachable.contains(url)))
+            .map(|model| (model.id.as_str(), model.capabilities)),
+    )
 }
 
 async fn get_stats(State(state): State<ServerState>) -> Json<StatsSnapshot> {

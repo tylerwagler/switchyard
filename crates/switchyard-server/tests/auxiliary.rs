@@ -267,3 +267,24 @@ async fn models_lists_non_chat_capabilities() -> TestResult {
     assert!(kinds.contains(&("s_a".into(), "search".into())));
     Ok(())
 }
+
+#[tokio::test]
+async fn available_models_leave_out_non_chat_capabilities() -> TestResult {
+    let a = EchoStub::start("a", "/embeddings").await?;
+    let b = EchoStub::start("b", "/embeddings").await?;
+    let r = EchoStub::start("r", "/rerank").await?;
+    let s = EchoStub::start("s", "/search").await?;
+    let app = started(&a, &b, &r, &s).await?;
+
+    let response = send(&app, "GET", "/v1/models?available=true", None).await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let payload: Value = serde_json::from_slice(&response.bytes)?;
+    assert!(
+        payload["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|entry| entry.get("kind").is_none())
+    );
+    Ok(())
+}

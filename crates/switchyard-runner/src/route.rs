@@ -161,6 +161,13 @@ impl Route {
         self.capabilities
     }
 
+    /// Base URLs of the upstreams this route's targets are served by.
+    pub fn base_urls(&self) -> impl Iterator<Item = &str> {
+        self.decision_targets
+            .iter()
+            .map(|target| target.base_url.as_str())
+    }
+
     /// Returns the forwarded caller credential family.
     pub fn caller_auth(&self) -> Option<CallerAuthKind> {
         self.caller_auth

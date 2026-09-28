@@ -3,6 +3,7 @@
 
 //! Response usage and full-turn latency metrics for routed requests.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use futures_util::StreamExt;
@@ -13,6 +14,64 @@ use crate::SharedRoutingLog;
 use crate::routing_log::RoutingLogContext;
 use crate::stats::{StatsAccumulator, TokenUsage};
 
+/// Final usage for one served request, handed to a [`UsageSink`].
+#[derive(Clone, Debug)]
+pub struct UsageReport {
+    /// Model that served the request.
+    pub model: String,
+    /// Usage the provider reported. `None` when a stream ended before usage arrived.
+    pub usage: Option<Usage>,
+    /// Streamed text, reasoning, and tool-call deltas seen. Zero for non-streaming responses.
+    pub output_deltas: u64,
+    /// Time from request arrival to the end of the response.
+    pub latency: Duration,
+    /// False when the stream stopped early: the client left or the upstream failed.
+    pub complete: bool,
+}
+
+/// Receives the final usage of each served request.
+///
+/// Insert one into a request's extensions before it reaches the router to meter that
+/// request. Each served request reports exactly once.
+#[derive(Clone)]
+pub struct UsageSink(Arc<dyn Fn(UsageReport) + Send + Sync>);
+
+impl UsageSink {
+    pub fn new(report: impl Fn(UsageReport) + Send + Sync + 'static) -> Self {
+        Self(Arc::new(report))
+    }
+}
+
+/// Tracks one stream for a [`UsageSink`] and reports on drop if the stream never finished.
+struct StreamMeter {
+    sink: Option<UsageSink>,
+    model: String,
+    started: Instant,
+    usage: Option<Usage>,
+    output_deltas: u64,
+}
+
+impl StreamMeter {
+    fn finish(&mut self, complete: bool) {
+        if let Some(sink) = self.sink.take() {
+            sink.0(UsageReport {
+                model: self.model.clone(),
+                usage: self.usage.clone(),
+                output_deltas: self.output_deltas,
+                latency: self.started.elapsed(),
+                complete,
+            });
+        }
+    }
+}
+
+impl Drop for StreamMeter {
+    // A dropped, unfinished stream means the client disconnected mid-response.
+    fn drop(&mut self) {
+        self.finish(false);
+    }
+}
+
 /// Observes a routed response without changing its aggregate or streaming contents.
 pub(crate) fn observe(
     response: Response,
@@ -21,6 +80,7 @@ pub(crate) fn observe(
     stats: StatsAccumulator,
     cache_eligible: f64,
     routing_log: Option<(SharedRoutingLog, RoutingLogContext)>,
+    sink: Option<UsageSink>,
 ) -> Response {
     let Response {
         llm_response,
@@ -35,9 +95,25 @@ pub(crate) fn observe(
             if let Some((log, context)) = routing_log {
                 log.append(context, &model, None, &agg.usage);
             }
+            if let Some(sink) = sink {
+                sink.0(UsageReport {
+                    model: model.clone(),
+                    usage: Some(agg.usage.clone()),
+                    output_deltas: 0,
+                    latency: started.elapsed(),
+                    complete: true,
+                });
+            }
             LlmResponse::Agg(agg)
         }
         LlmResponse::Stream(mut stream) => {
+            let mut meter = StreamMeter {
+                sink,
+                model: model.clone(),
+                started,
+                usage: None,
+                output_deltas: 0,
+            };
             let wrapped = async_stream::stream! {
                 let mut latest_usage = None;
                 let mut terminal_seen = false;
@@ -58,9 +134,15 @@ pub(crate) fn observe(
                             match chunk {
                                 LlmResponseChunk::Usage(usage) => {
                                     latest_usage = Some(usage.clone());
+                                    meter.usage = Some(usage.clone());
                                 }
                                 LlmResponseChunk::MessageStop { .. } => {
                                     terminal_seen = true;
+                                }
+                                LlmResponseChunk::TextDelta { .. }
+                                | LlmResponseChunk::ReasoningDelta { .. }
+                                | LlmResponseChunk::ToolCallDelta { .. } => {
+                                    meter.output_deltas += 1;
                                 }
                                 _ => {}
                             }
@@ -79,6 +161,7 @@ pub(crate) fn observe(
                             log.append(context.clone(), &model, None, usage);
                         }
                         recorded = true;
+                        meter.finish(true);
                     }
                     yield item;
                     if failed {
@@ -92,6 +175,7 @@ pub(crate) fn observe(
                         log.append(context, &model, None, &usage);
                     }
                 }
+                meter.finish(true);
             };
             LlmResponse::Stream(Box::pin(wrapped))
         }
@@ -221,6 +305,7 @@ mod tests {
             stats.clone(),
             0.0,
             Some((log.clone(), context)),
+            None,
         );
 
         let LlmResponse::Stream(mut observed) = observed.llm_response else {
@@ -241,5 +326,118 @@ mod tests {
         let process = stats.snapshot();
         assert_eq!(process.models["model/worker"].prompt_tokens, 10);
         assert_eq!(process.models["model/worker"].completion_tokens, 3);
+    }
+
+    fn collecting_sink() -> (UsageSink, Arc<parking_lot::Mutex<Vec<UsageReport>>>) {
+        let reports = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink_reports = Arc::clone(&reports);
+        let sink = UsageSink::new(move |report| sink_reports.lock().push(report));
+        (sink, reports)
+    }
+
+    fn text(text: &str) -> LlmResponseChunk {
+        LlmResponseChunk::TextDelta {
+            index: 0,
+            text: text.to_string(),
+        }
+    }
+
+    fn stream_response(events: Vec<Vec<LlmResponseChunk>>) -> Response {
+        let source = stream::iter(
+            events
+                .into_iter()
+                .map(|chunks| Ok(LlmResponseStreamEvent::new(chunks)))
+                .collect::<Vec<_>>(),
+        );
+        Response {
+            llm_response: LlmResponse::Stream(Box::pin(source)),
+            metadata: None,
+            upstream_headers: http::HeaderMap::new(),
+        }
+    }
+
+    fn observe_with(response: Response, sink: UsageSink) -> Response {
+        observe(
+            response,
+            "model/worker",
+            Instant::now(),
+            StatsAccumulator::default(),
+            0.0,
+            None,
+            Some(sink),
+        )
+    }
+
+    #[tokio::test]
+    async fn finished_stream_reports_usage_once() {
+        let (sink, reports) = collecting_sink();
+        let usage = Usage {
+            input_tokens: Some(10),
+            output_tokens: Some(2),
+            ..Usage::default()
+        };
+        let response = stream_response(vec![
+            vec![text("a")],
+            vec![text("b")],
+            vec![
+                LlmResponseChunk::Usage(usage.clone()),
+                LlmResponseChunk::MessageStop { reason: None },
+            ],
+        ]);
+        let LlmResponse::Stream(observed) = observe_with(response, sink).llm_response else {
+            panic!("expected stream");
+        };
+        observed.collect::<Vec<_>>().await;
+
+        let reports = reports.lock();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].complete);
+        assert_eq!(reports[0].usage, Some(usage));
+        assert_eq!(reports[0].output_deltas, 2);
+    }
+
+    /// Local servers send usage only at the end of a stream. A client that leaves
+    /// early must still be reported, with the deltas it already received.
+    #[tokio::test]
+    async fn dropped_stream_reports_partial_usage() {
+        let (sink, reports) = collecting_sink();
+        let response = stream_response(vec![vec![text("a")], vec![text("b")], vec![text("c")]]);
+        let LlmResponse::Stream(mut observed) = observe_with(response, sink).llm_response else {
+            panic!("expected stream");
+        };
+        observed.next().await;
+        observed.next().await;
+        assert!(reports.lock().is_empty());
+        drop(observed);
+
+        let reports = reports.lock();
+        assert_eq!(reports.len(), 1);
+        assert!(!reports[0].complete);
+        assert_eq!(reports[0].usage, None);
+        assert_eq!(reports[0].output_deltas, 2);
+    }
+
+    #[tokio::test]
+    async fn aggregate_response_reports_usage() {
+        let (sink, reports) = collecting_sink();
+        let usage = Usage {
+            input_tokens: Some(7),
+            output_tokens: Some(1),
+            ..Usage::default()
+        };
+        let response = Response {
+            llm_response: LlmResponse::Agg(switchyard_protocol::AggLlmResponse {
+                usage: usage.clone(),
+                ..Default::default()
+            }),
+            metadata: None,
+            upstream_headers: http::HeaderMap::new(),
+        };
+        observe_with(response, sink);
+
+        let reports = reports.lock();
+        assert_eq!(reports.len(), 1);
+        assert!(reports[0].complete);
+        assert_eq!(reports[0].usage, Some(usage));
     }
 }
