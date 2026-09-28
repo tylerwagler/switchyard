@@ -4,7 +4,7 @@
 //! [`TranslatingLlmClient`] — the crate's single public entry point: encode a neutral
 //! request, call the configured backend over HTTP, decode the neutral response.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::future::ready;
 use std::time::{Duration, SystemTime};
 
@@ -263,12 +263,13 @@ impl TranslatingLlmClient {
         if matches!(backend, Backend::OpenAiResponses(_)) {
             sanitize_openai_responses_provider_body(&mut body);
         }
-        // Strip before `merge_extra_body` so a target can reinstate either field
-        // deliberately via `extra_body`.
+        // Strip OpenAI-only fields before `merge_extra_body` so a target can
+        // reinstate `reasoning_effort` deliberately via `extra_body`.
         if matches!(backend, Backend::Anthropic(_)) {
             strip_anthropic_incompatible_fields(&mut body);
             strip_unsigned_thinking_blocks(&mut body);
         }
+        omit_configured_body_fields(&mut body, backend.omit_body_fields());
         merge_extra_body(&mut body, backend.extra_body());
         // After the merge on purpose: the effort override must win over both the caller's
         // value and any `reasoning` default a target set through `extra_body`.
@@ -1048,17 +1049,17 @@ fn ensure_responses_function_tool_description(object: &mut Map<String, Value>) {
     }
 }
 
-// Drops fields accepted by OpenAI-like APIs but rejected by Anthropic Messages.
+// Drops OpenAI-only fields that Anthropic Messages rejects.
 //
 // A router can serve earlier turns of a session from an OpenAI-format target and
-// later turns from an Anthropic one. Clients such as Claude Code send
-// `context_management` on every turn, so the Anthropic leg must strip it or the
-// upstream rejects the request (for example `clear_thinking_20251015` strategy
-// requires `thinking` to be enabled or adaptive).
+// later turns from an Anthropic one, so the caller keeps sending fields such as
+// `reasoning_effort` that only the OpenAI leg accepts.
+//
+// Anthropic's own beta fields are forwarded, including `context_management`. A
+// target whose upstream rejects one opts out with `omit_body_fields`.
 fn strip_anthropic_incompatible_fields(body: &mut Value) {
     if let Value::Object(object) = body {
         object.remove("reasoning_effort");
-        object.remove("context_management");
     }
 }
 
@@ -1158,6 +1159,15 @@ fn merge_extra_body(body: &mut Value, extra_body: &BTreeMap<String, Value>) {
     };
     for (key, value) in extra_body {
         object.entry(key.clone()).or_insert_with(|| value.clone());
+    }
+}
+
+fn omit_configured_body_fields(body: &mut Value, omit_body_fields: &BTreeSet<String>) {
+    let Value::Object(object) = body else {
+        return;
+    };
+    for key in omit_body_fields {
+        object.remove(key);
     }
 }
 
@@ -1310,6 +1320,7 @@ mod tests {
             forward_auth: false,
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
+            omit_body_fields: BTreeSet::new(),
             reasoning_effort: None,
             max_retries: 0,
             timeout: None,
@@ -1415,6 +1426,15 @@ mod tests {
     ) -> Vec<ModelConfig> {
         let mut backend = config(base_url);
         backend.extra_body = extra_body;
+        vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
+    }
+
+    fn chat_map_with_omit_body_fields(
+        base_url: &str,
+        omit_body_fields: BTreeSet<String>,
+    ) -> Vec<ModelConfig> {
+        let mut backend = config(base_url);
+        backend.omit_body_fields = omit_body_fields;
         vec![ModelConfig::new("gpt", Backend::OpenAiChat(backend), None)]
     }
 
@@ -2070,6 +2090,50 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn omit_body_fields_strips_a_field_extra_body_cannot_override()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(|request: &wiremock::Request| {
+                let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
+                body.get("max_tokens").is_none()
+            })
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&chat_map_with_omit_body_fields(
+            &format!("{}/v1", server.uri()),
+            BTreeSet::from(["max_tokens".to_string()]),
+        ))?;
+        let raw = json!({
+            "model": "client-facing",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 7
+        });
+
+        client
+            .call_rewrite_model_raw(
+                raw,
+                None,
+                Some(&ModelId::from("gpt")),
+                WireFormat::OpenAiChat,
+            )
+            .await?;
+        Ok(())
+    }
+
     // A weak OpenAI-format tier emits thinking blocks with no signature. Replaying
     // them to Anthropic is rejected (Bedrock reports it as a SigV4 mismatch), so
     // the Anthropic leg must drop them while keeping signed ones.
@@ -2146,7 +2210,7 @@ mod tests {
 
     // A router can serve earlier turns from an OpenAI target and later turns from
     // an Anthropic one, so the Anthropic leg must drop OpenAI-only fields the
-    // caller keeps sending or the upstream rejects the whole request.
+    // caller keeps sending. Anthropic's own beta fields travel through.
     #[tokio::test]
     async fn anthropic_requests_drop_openai_only_fields()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
@@ -2155,7 +2219,9 @@ mod tests {
             .and(path("/v1/messages"))
             .and(|request: &wiremock::Request| {
                 let body: Value = serde_json::from_slice(&request.body).unwrap_or(Value::Null);
-                body.get("context_management").is_none() && body.get("reasoning_effort").is_none()
+                body.get("reasoning_effort").is_none()
+                    && body.get("context_management")
+                        == Some(&json!({"edits": [{"type": "clear_thinking_20251015"}]}))
             })
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "id": "msg_1",
@@ -2188,6 +2254,68 @@ mod tests {
                 WireFormat::AnthropicMessages,
             )
             .await?;
+        Ok(())
+    }
+
+    // Feature betas describe the caller's request, not the credential, so an
+    // Anthropic target that authenticates with its own key still forwards them.
+    // Filtering to known values would strip a capability the upstream supports.
+    #[tokio::test]
+    async fn anthropic_requests_forward_caller_betas_with_an_own_key()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        const BETAS: &str = "context-management-2025-06-27,interleaved-thinking-2025-05-14";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&anthropic_map(&server.uri()))?;
+        let mut headers = http::HeaderMap::new();
+        headers.insert("anthropic-beta", http::HeaderValue::from_static(BETAS));
+        let raw = json!({
+            "model": "client-facing",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 7
+        });
+
+        client
+            .call_rewrite_model_raw(
+                raw,
+                Some(headers),
+                Some(&ModelId::from("claude")),
+                WireFormat::AnthropicMessages,
+            )
+            .await?;
+
+        let received = server
+            .received_requests()
+            .await
+            .ok_or("request recording should be enabled")?;
+        let received = received.first().ok_or("expected one upstream request")?;
+        assert_eq!(
+            received
+                .headers
+                .get("anthropic-beta")
+                .and_then(|value| value.to_str().ok()),
+            Some(BETAS)
+        );
+        assert_eq!(
+            received
+                .headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("secret")
+        );
         Ok(())
     }
 
@@ -2759,7 +2887,7 @@ mod tests {
                     .headers
                     .get("anthropic-beta")
                     .and_then(|value| value.to_str().ok())
-                    == Some("oauth-2025-04-20")
+                    == Some("oauth-2025-04-20,prompt-caching-2024-07-31")
                     && request.headers.get_all("anthropic-version").iter().count() == 1
                     && request
                         .headers

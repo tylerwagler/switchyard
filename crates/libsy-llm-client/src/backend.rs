@@ -4,7 +4,10 @@
 //! Per-provider backend configuration: wire format, upstream URL, and auth.
 
 use std::time::Duration;
-use std::{collections::BTreeMap, fmt};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fmt,
+};
 
 use reqwest::RequestBuilder;
 use reqwest::header::{HeaderName, HeaderValue};
@@ -59,6 +62,10 @@ pub struct HttpBackendConfig {
     pub extra_headers: BTreeMap<String, String>,
     /// Default top-level request fields, applied only when the request omits the key.
     pub extra_body: BTreeMap<String, Value>,
+    /// Top-level request fields dropped from the outbound body before `extra_body` is merged,
+    /// so a target can reinstate one deliberately. For providers that reject an otherwise
+    /// standard field (e.g. an internal API that 400s on `max_output_tokens`).
+    pub omit_body_fields: BTreeSet<String>,
     /// Reasoning effort forced on every request to this backend, replacing whatever the caller
     /// sent. Responses carries it as `reasoning.effort`, Chat Completions as `reasoning_effort`;
     /// Anthropic has no equivalent and rejects the setting at configuration time.
@@ -78,6 +85,7 @@ impl fmt::Debug for HttpBackendConfig {
             .field("forward_auth", &self.forward_auth)
             .field("extra_header_names", &self.extra_headers.keys())
             .field("extra_body_keys", &self.extra_body.keys())
+            .field("omit_body_fields", &self.omit_body_fields)
             .field("reasoning_effort", &self.reasoning_effort)
             .field("max_retries", &self.max_retries)
             .field("timeout", &self.timeout)
@@ -129,9 +137,8 @@ impl Backend {
             Backend::Anthropic(_) => {
                 name.eq_ignore_ascii_case("x-api-key")
                     || name.eq_ignore_ascii_case("anthropic-version")
-                    || (self.is_forwarding_auth()
-                        && (name.eq_ignore_ascii_case("authorization")
-                            || name.eq_ignore_ascii_case("anthropic-beta")))
+                    || name.eq_ignore_ascii_case("anthropic-beta")
+                    || (self.is_forwarding_auth() && name.eq_ignore_ascii_case("authorization"))
             }
         });
         if let Some(name) = invalid_name {
@@ -250,16 +257,28 @@ impl Backend {
         }
     }
 
-    /// Applies only the caller credential accepted by this provider.
+    /// Applies the caller's provider headers: Anthropic feature betas, plus the
+    /// accepted caller credential when this backend forwards auth.
     pub(crate) fn apply_forwarded_auth(
         &self,
         mut builder: RequestBuilder,
         metadata: Option<&Metadata>,
     ) -> RequestBuilder {
+        let headers = metadata.and_then(|metadata| metadata.http_headers.as_ref());
+        // Feature betas describe the caller's request, not the credential, so an
+        // Anthropic target receives them verbatim even when this backend
+        // authenticates with its own key. Filtering to known values would strip
+        // the capability a later client release introduces, and forwarding the
+        // body field without its beta header makes the upstream reject the request.
+        if matches!(self, Backend::Anthropic(_))
+            && let Some(value) = headers.and_then(|headers| headers.get("anthropic-beta"))
+        {
+            builder = builder.header("anthropic-beta", sensitive_header(value));
+        }
         if !self.is_forwarding_auth() {
             return builder;
         }
-        let Some(headers) = metadata.and_then(|metadata| metadata.http_headers.as_ref()) else {
+        let Some(headers) = headers else {
             return builder;
         };
         match self {
@@ -276,11 +295,6 @@ impl Backend {
                         builder = builder.header(name, sensitive_header(value));
                     }
                 }
-                if let Some(value) = headers.get("anthropic-beta")
-                    && let Some(value) = oauth_beta_header(value)
-                {
-                    builder = builder.header("anthropic-beta", value);
-                }
             }
         }
         builder
@@ -294,6 +308,11 @@ impl Backend {
     /// Default top-level fields to merge into outbound request bodies.
     pub fn extra_body(&self) -> &BTreeMap<String, Value> {
         &self.config().extra_body
+    }
+
+    /// Top-level fields dropped from outbound request bodies before `extra_body` is merged.
+    pub fn omit_body_fields(&self) -> &BTreeSet<String> {
+        &self.config().omit_body_fields
     }
 
     /// Reasoning effort forced on outbound requests, if the target configures one.
@@ -347,30 +366,11 @@ impl Backend {
     }
 }
 
-// Retains OAuth markers while keeping provider feature betas backend-owned.
+// Marks a value sensitive so logs and traces do not render it.
 fn sensitive_header(value: &HeaderValue) -> HeaderValue {
     let mut value = value.clone();
     value.set_sensitive(true);
     value
-}
-
-fn oauth_beta_header(value: &HeaderValue) -> Option<HeaderValue> {
-    let oauth_betas = value
-        .to_str()
-        .ok()?
-        .split(',')
-        .map(str::trim)
-        .filter(|beta| {
-            beta.get(..6)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("oauth-"))
-        });
-    let value = oauth_betas.collect::<Vec<_>>().join(",");
-    if value.is_empty() {
-        return None;
-    }
-    let mut value = HeaderValue::from_str(&value).ok()?;
-    value.set_sensitive(true);
-    Some(value)
 }
 
 // Accept either a root `/v1` URL or an already-specific OpenAI endpoint URL.
@@ -415,6 +415,7 @@ mod tests {
             forward_auth: false,
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
+            omit_body_fields: BTreeSet::new(),
             reasoning_effort: None,
             max_retries: 0,
             timeout: None,

@@ -33,6 +33,11 @@ use crate::util::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 
+// Fields the Anthropic encoder writes itself, so a re-encode must not also copy them out of the
+// caller's extensions. `switchyard_anthropic_request` is this crate's provenance marker, and
+// `parallel_tool_calls` becomes `tool_choice.disable_parallel_tool_use`.
+const ANTHROPIC_ENCODER_OWNED_FIELDS: &[&str] = &[ANTHROPIC_REQUEST_KEY, "parallel_tool_calls"];
+
 /// Format codec for Anthropic Messages payloads.
 pub struct AnthropicMessagesCodec;
 
@@ -209,7 +214,7 @@ impl FormatCodec for AnthropicMessagesCodec {
         if let Some(model) = &request.model {
             body.insert("model".to_string(), Value::String(model.clone()));
         }
-        let system_text = request
+        let system_parts = request
             .instructions
             .iter()
             .flat_map(|instruction| instruction.content.iter())
@@ -217,10 +222,26 @@ impl FormatCodec for AnthropicMessagesCodec {
                 ContentBlock::Text { text } | ContentBlock::Refusal { text } => Some(text.as_str()),
                 _ => None,
             })
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        if !system_text.is_empty() {
-            body.insert("system".to_string(), Value::String(system_text));
+            .collect::<Vec<_>>();
+        if is_anthropic_request(request) {
+            // Keep the caller's blocks separate. Anthropic removes its attribution block from
+            // the first system block only, so joining them would send that block to the model.
+            if !system_parts.is_empty() {
+                body.insert(
+                    "system".to_string(),
+                    Value::Array(
+                        system_parts
+                            .into_iter()
+                            .map(|text| json!({"type": "text", "text": text}))
+                            .collect(),
+                    ),
+                );
+            }
+        } else if !system_parts.is_empty() {
+            body.insert(
+                "system".to_string(),
+                Value::String(system_parts.join("\n\n")),
+            );
         }
 
         body.insert(
@@ -254,19 +275,11 @@ impl FormatCodec for AnthropicMessagesCodec {
             body.insert("tool_choice".to_string(), choice);
         }
         if is_anthropic_request(request) {
-            for field in [
-                "inference_geo",
-                "service_tier",
-                "stop_sequences",
-                "metadata",
-                "cache_control",
-                "container",
-                "speed",
-                "diagnostics",
-            ] {
-                if let Some(value) = request.extensions.fields.get(field) {
-                    body.insert(field.to_string(), value.clone());
+            for (field, value) in &request.extensions.fields {
+                if ANTHROPIC_ENCODER_OWNED_FIELDS.contains(&field.as_str()) {
+                    continue;
                 }
+                body.insert(field.clone(), value.clone());
             }
         }
         if let Some(stop_sequences) =

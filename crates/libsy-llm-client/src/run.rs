@@ -965,7 +965,7 @@ impl FromIterator<(ModelId, Arc<dyn RoutedLlmClient>)> for ClientRouter {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
 
     use super::*;
     use async_trait::async_trait;
@@ -1275,6 +1275,7 @@ mod tests {
                         forward_auth: false,
                         extra_headers: BTreeMap::new(),
                         extra_body: BTreeMap::from([("store".to_string(), json!(store))]),
+                        omit_body_fields: BTreeSet::new(),
                         reasoning_effort: None,
                         max_retries: 0,
                         timeout: None,
@@ -1420,6 +1421,7 @@ mod tests {
                     forward_auth: false,
                     extra_headers: BTreeMap::new(),
                     extra_body: BTreeMap::new(),
+                    omit_body_fields: BTreeSet::new(),
                     reasoning_effort: None,
                     max_retries: 0,
                     timeout: None,
@@ -2091,6 +2093,7 @@ mod tests {
                 forward_auth: false,
                 extra_headers: BTreeMap::new(),
                 extra_body: BTreeMap::new(),
+                omit_body_fields: BTreeSet::new(),
                 reasoning_effort: None,
                 max_retries: 2,
                 timeout: None,
@@ -2189,6 +2192,7 @@ mod tests {
                 forward_auth: false,
                 extra_headers: BTreeMap::new(),
                 extra_body: BTreeMap::new(),
+                omit_body_fields: BTreeSet::new(),
                 reasoning_effort: None,
                 max_retries: 0,
                 timeout: None,

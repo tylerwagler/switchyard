@@ -3,7 +3,7 @@
 
 //! Integration tests for the libsy Rust server.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::convert::Infallible;
 use std::error::Error;
 use std::io::Write;
@@ -449,7 +449,7 @@ async fn upstream_messages_requires_forwarded_oauth(
         && headers
             .get("anthropic-beta")
             .and_then(|value| value.to_str().ok())
-            == Some("oauth-2025-04-20")
+            == Some("oauth-2025-04-20,unsupported-beta")
         && headers
             .get("anthropic-version")
             .and_then(|value| value.to_str().ok())
@@ -749,6 +749,7 @@ fn random_state_with_retries(
         forward_auth: false,
         extra_headers: BTreeMap::new(),
         extra_body: BTreeMap::new(),
+        omit_body_fields: BTreeSet::new(),
         reasoning_effort: None,
         max_retries,
         timeout: None,

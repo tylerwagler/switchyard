@@ -537,7 +537,7 @@ fn anthropic_target_prompt_preserves_native_request_fields() -> TestResult {
         expected["system"]
             .as_array_mut()
             .ok_or("expected system blocks")?
-            .insert(0, json!({"type": "text", "text": "target prompt"}));
+            .insert(1, json!({"type": "text", "text": "target prompt"}));
 
         let mut request = engine
             .decode_request(WireFormat::AnthropicMessages, &body, &policy)?
@@ -4149,5 +4149,78 @@ fn responses_stored_tool_outputs_stay_tool_results() -> TestResult {
         )?
         .body;
     assert_eq!(output["input"], outputs);
+    Ok(())
+}
+
+// Anthropic's request schema is an open list. A re-encode must forward the fields the caller
+// sent, not a fixed set.
+#[test]
+fn anthropic_reencode_keeps_open_list_request_fields() -> TestResult {
+    let engine = TranslationEngine::default();
+    let policy = TranslationPolicy::default();
+    let body = json!({
+        "model": "route",
+        "max_tokens": 32,
+        "system": [{"type": "text", "text": "caller prompt"}],
+        "messages": [{"role": "user", "content": "hi"}],
+        "tool_choice": {"type": "auto", "disable_parallel_tool_use": true},
+        "safeguards": [{"type": "dangerous_tool_use", "classifier_context": {"v": 1}}],
+        "context_management": {"edits": [{"type": "clear_thinking_20251015"}]},
+        "thread": {"id": "thread_1"}
+    });
+    let mut request = engine
+        .decode_request(WireFormat::AnthropicMessages, &body, &policy)?
+        .request;
+    // A mutating processor clears exact replay, which is what forces a re-encode.
+    request.preservation.requests.clear();
+
+    let output = engine
+        .encode_request(WireFormat::AnthropicMessages, &request, &policy)?
+        .body;
+
+    assert_eq!(output["safeguards"], body["safeguards"]);
+    assert_eq!(output["context_management"], body["context_management"]);
+    assert_eq!(output["thread"], body["thread"]);
+    // Fields the encoder owns are translated, never copied out of the caller's extensions.
+    assert!(output.get("switchyard_anthropic_request").is_none());
+    assert!(output.get("parallel_tool_calls").is_none());
+    assert_eq!(
+        output["tool_choice"]["disable_parallel_tool_use"],
+        json!(true)
+    );
+    Ok(())
+}
+
+// Anthropic removes its attribution block from the first system block only, so a re-encode must
+// keep the caller's blocks separate and in order.
+#[test]
+fn anthropic_reencode_keeps_system_blocks_separate() -> TestResult {
+    let engine = TranslationEngine::default();
+    let policy = TranslationPolicy::default();
+    let body = json!({
+        "model": "route",
+        "max_tokens": 32,
+        "system": [
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=1"},
+            {"type": "text", "text": "caller prompt"}
+        ],
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let mut request = engine
+        .decode_request(WireFormat::AnthropicMessages, &body, &policy)?
+        .request;
+    request.preservation.requests.clear();
+
+    let output = engine
+        .encode_request(WireFormat::AnthropicMessages, &request, &policy)?
+        .body;
+
+    assert_eq!(
+        output["system"],
+        json!([
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=1"},
+            {"type": "text", "text": "caller prompt"}
+        ])
+    );
     Ok(())
 }

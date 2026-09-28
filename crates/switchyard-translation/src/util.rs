@@ -425,13 +425,18 @@ fn prepend_anthropic_system(body: &mut Map<String, Value>, prompt: &str) -> bool
         Some(Value::String(system)) => {
             system.insert_str(0, &format!("{prompt}\n\n"));
         }
-        Some(Value::Array(blocks)) => blocks.insert(
-            0,
-            json!({
-                "type": "text",
-                "text": prompt,
-            }),
-        ),
+        Some(Value::Array(blocks)) => {
+            // Keep the caller's first block first. Anthropic removes its attribution block from
+            // the first system block only, so inserting ahead of it defeats the strip.
+            let at = usize::from(!blocks.is_empty());
+            blocks.insert(
+                at,
+                json!({
+                    "type": "text",
+                    "text": prompt,
+                }),
+            );
+        }
         Some(_) => return false,
     }
     true
