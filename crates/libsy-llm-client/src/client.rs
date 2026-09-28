@@ -2255,6 +2255,68 @@ mod tests {
         Ok(())
     }
 
+    // Feature betas describe the caller's request, not the credential, so an
+    // Anthropic target that authenticates with its own key still forwards them.
+    // Filtering to known values would strip a capability the upstream supports.
+    #[tokio::test]
+    async fn anthropic_requests_forward_caller_betas_with_an_own_key()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        const BETAS: &str = "context-management-2025-06-27,interleaved-thinking-2025-05-14";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&anthropic_map(&server.uri()))?;
+        let mut headers = http::HeaderMap::new();
+        headers.insert("anthropic-beta", http::HeaderValue::from_static(BETAS));
+        let raw = json!({
+            "model": "client-facing",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 7
+        });
+
+        client
+            .call_rewrite_model_raw(
+                raw,
+                Some(headers),
+                Some(&ModelId::from("claude")),
+                WireFormat::AnthropicMessages,
+            )
+            .await?;
+
+        let received = server
+            .received_requests()
+            .await
+            .ok_or("request recording should be enabled")?;
+        let received = received.first().ok_or("expected one upstream request")?;
+        assert_eq!(
+            received
+                .headers
+                .get("anthropic-beta")
+                .and_then(|value| value.to_str().ok()),
+            Some(BETAS)
+        );
+        assert_eq!(
+            received
+                .headers
+                .get("x-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("secret")
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn streaming_openai_chat_aggregates()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
@@ -2823,7 +2885,7 @@ mod tests {
                     .headers
                     .get("anthropic-beta")
                     .and_then(|value| value.to_str().ok())
-                    == Some("oauth-2025-04-20")
+                    == Some("oauth-2025-04-20,prompt-caching-2024-07-31")
                     && request.headers.get_all("anthropic-version").iter().count() == 1
                     && request
                         .headers

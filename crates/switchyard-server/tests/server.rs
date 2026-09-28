@@ -449,7 +449,7 @@ async fn upstream_messages_requires_forwarded_oauth(
         && headers
             .get("anthropic-beta")
             .and_then(|value| value.to_str().ok())
-            == Some("oauth-2025-04-20")
+            == Some("oauth-2025-04-20,unsupported-beta")
         && headers
             .get("anthropic-version")
             .and_then(|value| value.to_str().ok())

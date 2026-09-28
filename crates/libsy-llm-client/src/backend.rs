@@ -137,9 +137,8 @@ impl Backend {
             Backend::Anthropic(_) => {
                 name.eq_ignore_ascii_case("x-api-key")
                     || name.eq_ignore_ascii_case("anthropic-version")
-                    || (self.is_forwarding_auth()
-                        && (name.eq_ignore_ascii_case("authorization")
-                            || name.eq_ignore_ascii_case("anthropic-beta")))
+                    || name.eq_ignore_ascii_case("anthropic-beta")
+                    || (self.is_forwarding_auth() && name.eq_ignore_ascii_case("authorization"))
             }
         });
         if let Some(name) = invalid_name {
@@ -258,16 +257,28 @@ impl Backend {
         }
     }
 
-    /// Applies only the caller credential accepted by this provider.
+    /// Applies the caller's provider headers: Anthropic feature betas, plus the
+    /// accepted caller credential when this backend forwards auth.
     pub(crate) fn apply_forwarded_auth(
         &self,
         mut builder: RequestBuilder,
         metadata: Option<&Metadata>,
     ) -> RequestBuilder {
+        let headers = metadata.and_then(|metadata| metadata.http_headers.as_ref());
+        // Feature betas describe the caller's request, not the credential, so an
+        // Anthropic target receives them verbatim even when this backend
+        // authenticates with its own key. Filtering to known values would strip
+        // the capability a later client release introduces, and forwarding the
+        // body field without its beta header makes the upstream reject the request.
+        if matches!(self, Backend::Anthropic(_))
+            && let Some(value) = headers.and_then(|headers| headers.get("anthropic-beta"))
+        {
+            builder = builder.header("anthropic-beta", sensitive_header(value));
+        }
         if !self.is_forwarding_auth() {
             return builder;
         }
-        let Some(headers) = metadata.and_then(|metadata| metadata.http_headers.as_ref()) else {
+        let Some(headers) = headers else {
             return builder;
         };
         match self {
@@ -283,11 +294,6 @@ impl Backend {
                     if let Some(value) = headers.get(name) {
                         builder = builder.header(name, sensitive_header(value));
                     }
-                }
-                if let Some(value) = headers.get("anthropic-beta")
-                    && let Some(value) = oauth_beta_header(value)
-                {
-                    builder = builder.header("anthropic-beta", value);
                 }
             }
         }
@@ -360,30 +366,11 @@ impl Backend {
     }
 }
 
-// Retains OAuth markers while keeping provider feature betas backend-owned.
+// Marks a value sensitive so logs and traces do not render it.
 fn sensitive_header(value: &HeaderValue) -> HeaderValue {
     let mut value = value.clone();
     value.set_sensitive(true);
     value
-}
-
-fn oauth_beta_header(value: &HeaderValue) -> Option<HeaderValue> {
-    let oauth_betas = value
-        .to_str()
-        .ok()?
-        .split(',')
-        .map(str::trim)
-        .filter(|beta| {
-            beta.get(..6)
-                .is_some_and(|prefix| prefix.eq_ignore_ascii_case("oauth-"))
-        });
-    let value = oauth_betas.collect::<Vec<_>>().join(",");
-    if value.is_empty() {
-        return None;
-    }
-    let mut value = HeaderValue::from_str(&value).ok()?;
-    value.set_sensitive(true);
-    Some(value)
 }
 
 // Accept either a root `/v1` URL or an already-specific OpenAI endpoint URL.
