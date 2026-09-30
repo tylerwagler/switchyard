@@ -3552,6 +3552,38 @@ target = "shared"
     Ok(())
 }
 
+#[tokio::test]
+async fn models_endpoint_default_model_is_the_default_route_not_the_first_id() -> TestResult {
+    const ROUTES: &str = r#"
+[llm_clients.primary]
+format = "openai_chat"
+base_url = "https://example.test/v1"
+
+[targets.shared]
+id = "upstream"
+llm_client = "primary"
+
+[routes.small]
+id = "alpha"
+type = "passthrough"
+target = "shared"
+
+[routes.main]
+id = "zulu"
+type = "passthrough"
+target = "shared"
+"#;
+    for (default_route, expected) in [("default_route = \"main\"\n", "zulu"), ("", "alpha")] {
+        let config = format!("schema_version = 1\n{default_route}{ROUTES}");
+        let app = build_switchyard_router(load_test_config(&config)?);
+        let body = send(&app, "GET", "/v1/models", None).await?.json()?;
+        assert_eq!(body["default_model"], json!(expected), "{default_route:?}");
+        assert_eq!(body["first_id"], json!("alpha"));
+        assert_eq!(body["model_pool"], json!(["alpha", "zulu"]));
+    }
+    Ok(())
+}
+
 // Build routes through the TOML loader to test disabled, enabled, and unset capabilities.
 fn capability_app(base_url: &str, format: &str) -> TestResult<Router> {
     Ok(build_switchyard_router(load_test_config(&format!(

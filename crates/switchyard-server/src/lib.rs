@@ -1583,6 +1583,7 @@ async fn models(
             .runner
             .models()
             .map(|model| (model.id.as_str(), model.capabilities)),
+        state.runner.default_route().map(|id| id.as_str()),
     );
     // Advertise non-chat backends too, so /v1/models is a truthful capability
     // listing (chat + embeddings + rerank + search).
@@ -1616,6 +1617,7 @@ async fn available_models(state: &ServerState) -> Value {
             .models()
             .filter(|model| model.base_urls.iter().any(|url| reachable.contains(url)))
             .map(|model| (model.id.as_str(), model.capabilities)),
+        state.runner.default_route().map(|id| id.as_str()),
     )
 }
 
@@ -1765,14 +1767,21 @@ async fn not_found() -> Response {
     )
 }
 
+// `default_model` is the configured default route when it is listed, so clients that
+// adopt it (Codex, gateway model discovery) start on the model unrouted ids resolve
+// to; without a listed default it falls back to the first id.
 fn model_list_payload<'a>(
     entries: impl IntoIterator<Item = (&'a str, ModelCapabilities)>,
+    default_route: Option<&str>,
 ) -> Value {
     let mut entries = entries.into_iter().collect::<Vec<_>>();
     entries.sort_unstable_by_key(|(model_id, _)| *model_id);
     let model_ids = entries.iter().map(|(model, _)| *model).collect::<Vec<_>>();
     let first_id = model_ids.first().copied();
     let last_id = model_ids.last().copied();
+    let default_model = default_route
+        .filter(|id| model_ids.contains(id))
+        .or(first_id);
     json!({
         "object": "list",
         "data": entries.iter().map(|(model, caps)| model_entry_json(model, *caps)).collect::<Vec<_>>(),
@@ -1781,7 +1790,7 @@ fn model_list_payload<'a>(
         "first_id": first_id,
         "last_id": last_id,
         "has_more": false,
-        "default_model": first_id,
+        "default_model": default_model,
         "model_pool": model_ids,
     })
 }
