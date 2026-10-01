@@ -27,7 +27,8 @@ use http::StatusCode;
 use parking_lot::Mutex;
 use serde_json::{Value, json};
 use switchyard_libsy::{
-    Algorithm, CallModel, LibsyError, OutcomeMetadata, Result, RoutingOutcome, RuntimeModels, drive,
+    Algorithm, Call, CallDecision, LibsyError, OutcomeMetadata, Result, RoutingOutcome,
+    RuntimeModels, drive,
 };
 use switchyard_protocol::{
     AggLlmResponse, LlmClientError, LlmResponse, LlmResponseChunk, LlmResponseStream, Message,
@@ -163,6 +164,14 @@ pub async fn decide(
     Ok(outcome)
 }
 
+async fn unsupported_decision(call: CallDecision) -> Result<()> {
+    let model = call.model.clone();
+    call.respond(Err(LibsyError::client_call(
+        model,
+        LlmClientError::General("decision calls are not supported by this client".to_string()),
+    )))
+}
+
 /// Emits completed routing calls after the outcome reveals whether one response became the answer.
 fn emit_routing_observations(
     observer: &Option<RunObserver>,
@@ -185,12 +194,17 @@ fn emit_routing_observations(
 
 /// Serve one offloaded call and fulfill its promise.
 ///
-/// A client failure stops the driver unless this call opts into algorithm-level recovery.
+/// LLM failures stop the run unless the call enables recovery. Unsupported decisions
+/// return an error to the algorithm.
 async fn serve(
     clients: ClientRouter,
-    call: CallModel,
+    call: Call,
     observations: Option<Arc<Mutex<Vec<LlmCallObservation>>>>,
 ) -> Result<()> {
+    let call = match call {
+        Call::Model(call) => *call,
+        Call::Decision(call) => return unsupported_decision(*call).await,
+    };
     let observe = |observation| {
         if let Some(observations) = &observations {
             observations.lock().push(observation);

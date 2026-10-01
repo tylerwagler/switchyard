@@ -444,7 +444,7 @@ mod tests {
     use super::*;
     use crate::algorithms::llm_class::{LlmClassifierConfig, LlmTaskClassifier};
     use crate::algorithms::util::DEFAULT_JUDGE_MAX_OUTPUT_TOKENS;
-    use crate::core::testing::{Serve, reply, test_drive_with_models};
+    use crate::core::testing::{Serve, reply, serve_decision, test_drive_with_models};
 
     /// A queue of replies, drained in order.
     struct Queue(Mutex<VecDeque<String>>);
@@ -624,6 +624,10 @@ mod tests {
             move |call| {
                 let serve = Arc::clone(&routing_serve);
                 async move {
+                    let call = match call {
+                        crate::Call::Model(call) => *call,
+                        crate::Call::Decision(call) => return serve_decision(*call).await,
+                    };
                     let target = call.models.first().cloned().ok_or(LibsyError::NoTargets)?;
                     let request = call.request.clone();
                     let response = serve
