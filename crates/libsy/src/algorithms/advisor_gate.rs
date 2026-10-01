@@ -529,7 +529,7 @@ impl AdvisorGate {
                 },
                 output: OutputParams {
                     max_output_tokens: Some(self.config.advisor_max_tokens),
-                    response_format: None,
+                    ..OutputParams::default()
                 },
                 ..LlmRequest::default()
             },
