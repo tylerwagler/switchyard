@@ -1412,6 +1412,12 @@ fn client_error(error: &LlmClientError) -> Response {
             "invalid_request_error",
             "context_length_exceeded",
         ),
+        LlmClientError::TemporarilyUnavailable => error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            error.to_string(),
+            "upstream_error",
+            "temporarily_unavailable",
+        ),
         LlmClientError::UpstreamHttp {
             status,
             body,
