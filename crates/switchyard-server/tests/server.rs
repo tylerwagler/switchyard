@@ -5112,7 +5112,7 @@ async fn advisor_route_redo_client_error_and_stats_projection() -> TestResult {
     assert!(feedback.starts_with("A senior reviewer examined your work"));
     assert!(feedback.ends_with("run the tests"));
 
-    // A failed HTTP advisor call stops the request before the algorithm can approve it.
+    // Fail-open returns the buffered executor turn when the HTTP advisor call fails.
     let response = send_with_headers(
         &app,
         "POST",
@@ -5121,8 +5121,8 @@ async fn advisor_route_redo_client_error_and_stats_projection() -> TestResult {
         &[("proxy_x_session_id", "fail-flow")],
     )
     .await?;
-    assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
-    assert_eq!(response.json()?["error"]["type"], "upstream_error");
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.json()?["choices"][0]["message"]["content"], "ok");
     assert_eq!(
         upstream.models().await,
         [
@@ -5135,8 +5135,8 @@ async fn advisor_route_redo_client_error_and_stats_projection() -> TestResult {
     );
 
     let stats = send(&app, "GET", "/v1/stats", None).await?.json()?;
-    // Only the successful redo request returns an executor answer.
-    assert_eq!(stats["models"]["model/executor"]["calls"], 1);
+    // Both requests return an executor answer.
+    assert_eq!(stats["models"]["model/executor"]["calls"], 2);
     assert_eq!(stats["classifier"]["total_errors"], 1);
     // Projection deltas for the metrics only this test emits.
     let redo = gate_count(&stats, &["reviews", "redo", "total"])
@@ -5163,10 +5163,9 @@ async fn advisor_route_redo_client_error_and_stats_projection() -> TestResult {
         gate_count(&stats, &["discarded", "tokens", "output"]),
         gate_count(&before, &["discarded", "tokens", "output"]) + 2
     );
-    // The host stops before the algorithm records a fail-open advisor decision.
     assert_eq!(
         gate_count(&stats, &["consult_failures", "upstream_5xx"]),
-        gate_count(&before, &["consult_failures", "upstream_5xx"])
+        gate_count(&before, &["consult_failures", "upstream_5xx"]) + 1
     );
 
     // Reset re-baselines the projection: the redo/discard counts this test
