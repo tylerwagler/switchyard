@@ -5,8 +5,9 @@
 
 use std::convert::Infallible;
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::response::sse::{Event, Sse};
+use axum::response::sse::{Event, KeepAlive, KeepAliveStream, Sse};
 use futures_util::Stream;
 use serde_json::{Value, json};
 use switchyard_runner::stream_error_summary;
@@ -18,8 +19,37 @@ use crate::redaction::Redactor;
 pub(crate) type SseFrameStream =
     std::pin::Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
 
-/// Converts translated JSON events into endpoint-specific SSE frames.
+/// How long a stream may stay silent before a keep-alive frame is sent.
+///
+/// Clients abort a stream that sends no bytes for a while; Claude Code waits five
+/// minutes. A long prefill can be silent that long, and a translated upstream's own
+/// keep-alives (pings or SSE comments) do not survive translation.
+const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Converts translated JSON events into endpoint-specific SSE frames, and sends a
+/// keep-alive frame whenever the stream is silent for [`KEEP_ALIVE_INTERVAL`].
 pub(crate) fn frame_stream(
+    stream: RawEventStream,
+    target_format: WireFormat,
+    redactor: Arc<Redactor>,
+) -> Sse<KeepAliveStream<SseFrameStream>> {
+    frame_events(stream, target_format, redactor)
+        .keep_alive(keep_alive(target_format, KEEP_ALIVE_INTERVAL))
+}
+
+/// The keep-alive frame for a format: the Anthropic `ping` event, which Anthropic
+/// clients skip, or an SSE comment, which OpenAI clients skip.
+fn keep_alive(target_format: WireFormat, interval: Duration) -> KeepAlive {
+    let keep_alive = KeepAlive::new().interval(interval);
+    if target_format == WireFormat::AnthropicMessages {
+        keep_alive.event(Event::default().event("ping").data(r#"{"type":"ping"}"#))
+    } else {
+        keep_alive
+    }
+}
+
+/// Converts translated JSON events into endpoint-specific SSE frames.
+fn frame_events(
     stream: RawEventStream,
     target_format: WireFormat,
     redactor: Arc<Redactor>,
@@ -140,6 +170,49 @@ mod tests {
     use super::*;
 
     type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
+
+    // Renders a stream that is silent before its one event, with a short keep-alive.
+    async fn silent_body(target_format: WireFormat, event: Value) -> TestResult<String> {
+        let stream: RawEventStream = Box::pin(stream::once(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            Ok(event)
+        }));
+        let response = frame_events(stream, target_format, Arc::new(Redactor::default()))
+            .keep_alive(keep_alive(target_format, Duration::from_millis(20)))
+            .into_response();
+        Ok(String::from_utf8(
+            to_bytes(response.into_body(), usize::MAX).await?.to_vec(),
+        )?)
+    }
+
+    // A silent Anthropic stream sends `ping` events, and the real event still follows.
+    #[tokio::test]
+    async fn silent_anthropic_stream_sends_pings() -> TestResult {
+        let body = silent_body(
+            WireFormat::AnthropicMessages,
+            json!({"type": "message_stop"}),
+        )
+        .await?;
+        assert!(
+            body.starts_with("event: ping\ndata: {\"type\":\"ping\"}\n\n"),
+            "{body}"
+        );
+        assert!(
+            body.trim_end()
+                .ends_with("event: message_stop\ndata: {\"type\":\"message_stop\"}"),
+            "{body}"
+        );
+        Ok(())
+    }
+
+    // A silent Chat stream sends SSE comments, which Chat clients skip.
+    #[tokio::test]
+    async fn silent_chat_stream_sends_comments() -> TestResult {
+        let body = silent_body(WireFormat::OpenAiChat, json!({"choices": []})).await?;
+        assert!(body.lines().any(|line| line.starts_with(':')), "{body}");
+        assert!(!body.contains("ping"), "{body}");
+        Ok(())
+    }
 
     // Renders a framed body for one Chat stream.
     async fn chat_body(items: Vec<Result<Value, LlmStreamError>>) -> TestResult<String> {
