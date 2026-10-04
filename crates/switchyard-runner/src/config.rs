@@ -403,6 +403,8 @@ struct RouteConfig {
     tool_calling: Option<bool>,
     reasoning: Option<bool>,
     vision: Option<bool>,
+    display_name: Option<String>,
+    description: Option<String>,
     algorithm: AlgorithmSpec,
 }
 
@@ -422,6 +424,8 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let tool_calling = take_optional(&mut table, "tool_calling")?;
         let reasoning = take_optional(&mut table, "reasoning")?;
         let vision = take_optional(&mut table, "vision")?;
+        let display_name = take_optional(&mut table, "display_name")?;
+        let description = take_optional(&mut table, "description")?;
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
             .map_err(serde::de::Error::custom)?;
         Ok(Self {
@@ -430,6 +434,8 @@ impl<'de> Deserialize<'de> for RouteConfig {
             tool_calling,
             reasoning,
             vision,
+            display_name,
+            description,
             algorithm,
         })
     }
@@ -593,7 +599,8 @@ impl DeploymentConfig {
                 responses_auxiliary_target,
                 decision_targets,
                 models,
-            );
+            )
+            .with_listing(config.display_name.clone(), config.description.clone());
             routes.push((config.id.clone(), route));
         }
         let web_search =

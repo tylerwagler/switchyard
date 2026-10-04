@@ -3966,6 +3966,56 @@ target = "shared"
     Ok(())
 }
 
+// Claude Code's `/model` picker shows `display_name` and `description`.
+#[tokio::test]
+async fn models_endpoint_lists_configured_display_name_and_description() -> TestResult {
+    const CONFIG: &str = r#"
+schema_version = 1
+
+[llm_clients.primary]
+format = "openai_chat"
+base_url = "https://example.test/v1"
+
+[targets.shared]
+id = "upstream/model"
+llm_client = "primary"
+
+[routes.named]
+id = "claude-elytron-flash"
+type = "passthrough"
+target = "shared"
+display_name = "Elytron Flash"
+description = "Main coding model"
+
+[routes.plain]
+id = "plain"
+type = "passthrough"
+target = "shared"
+"#;
+    let app = build_switchyard_router(load_test_config(CONFIG)?);
+    let body = send(&app, "GET", "/v1/models", None).await?.json()?;
+    let data = body["data"].as_array().cloned().unwrap_or_default();
+    let entry = |id: &str| {
+        data.iter()
+            .find(|entry| entry["id"] == id)
+            .cloned()
+            .unwrap_or_default()
+    };
+
+    assert_eq!(
+        entry("claude-elytron-flash")["display_name"],
+        json!("Elytron Flash")
+    );
+    assert_eq!(
+        entry("claude-elytron-flash")["description"],
+        json!("Main coding model")
+    );
+    // Unset: the name falls back to the id, and no description key is sent.
+    assert_eq!(entry("plain")["display_name"], json!("plain"));
+    assert!(entry("plain").get("description").is_none());
+    Ok(())
+}
+
 #[tokio::test]
 async fn models_endpoint_default_model_is_the_default_route_not_the_first_id() -> TestResult {
     const ROUTES: &str = r#"

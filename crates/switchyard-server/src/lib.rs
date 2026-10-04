@@ -45,8 +45,8 @@ use serde_json::{Value, json};
 use switchyard_llm_client::{AuxiliaryOperation, RunObservation, RunObserver};
 use switchyard_protocol::{LlmClientError, Metadata, ModelId, Request, Usage};
 use switchyard_runner::{
-    CallerAuthKind, DecisionTarget, EmbeddingsConfig, ModelCapabilities, RerankConfig,
-    ResolvedWebSearch, Route, RunOutput, Runner, RunnerError, SearchConfig,
+    CallerAuthKind, DecisionTarget, EmbeddingsConfig, ModelInfo, RerankConfig, ResolvedWebSearch,
+    Route, RunOutput, Runner, RunnerError, SearchConfig,
 };
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::task;
@@ -1618,10 +1618,7 @@ async fn models(
         return Json(available_models(&state).await);
     }
     let mut payload = model_list_payload(
-        state
-            .runner
-            .models()
-            .map(|model| (model.id.as_str(), model.capabilities)),
+        state.runner.models(),
         state.runner.default_route().map(|id| id.as_str()),
     );
     // Advertise non-chat backends too, so /v1/models is a truthful capability
@@ -1654,8 +1651,7 @@ async fn available_models(state: &ServerState) -> Value {
         state
             .runner
             .models()
-            .filter(|model| model.base_urls.iter().any(|url| reachable.contains(url)))
-            .map(|model| (model.id.as_str(), model.capabilities)),
+            .filter(|model| model.base_urls.iter().any(|url| reachable.contains(url))),
         state.runner.default_route().map(|id| id.as_str()),
     )
 }
@@ -1810,12 +1806,15 @@ async fn not_found() -> Response {
 // adopt it (Codex, gateway model discovery) start on the model unrouted ids resolve
 // to; without a listed default it falls back to the first id.
 fn model_list_payload<'a>(
-    entries: impl IntoIterator<Item = (&'a str, ModelCapabilities)>,
+    entries: impl IntoIterator<Item = ModelInfo<'a>>,
     default_route: Option<&str>,
 ) -> Value {
     let mut entries = entries.into_iter().collect::<Vec<_>>();
-    entries.sort_unstable_by_key(|(model_id, _)| *model_id);
-    let model_ids = entries.iter().map(|(model, _)| *model).collect::<Vec<_>>();
+    entries.sort_unstable_by_key(|model| model.id.as_str());
+    let model_ids = entries
+        .iter()
+        .map(|model| model.id.as_str())
+        .collect::<Vec<_>>();
     let first_id = model_ids.first().copied();
     let last_id = model_ids.last().copied();
     let default_model = default_route
@@ -1823,7 +1822,7 @@ fn model_list_payload<'a>(
         .or(first_id);
     json!({
         "object": "list",
-        "data": entries.iter().map(|(model, caps)| model_entry_json(model, *caps)).collect::<Vec<_>>(),
+        "data": entries.iter().map(model_entry_json).collect::<Vec<_>>(),
         // Codex requires this key; an empty list preserves its own catalog and instructions.
         "models": [],
         "first_id": first_id,
@@ -1834,14 +1833,16 @@ fn model_list_payload<'a>(
     })
 }
 
-fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
-    json!({
-        "id": model,
+// Claude Code's `/model` picker shows `display_name` and `description`.
+fn model_entry_json(model: &ModelInfo) -> Value {
+    let capabilities = model.capabilities;
+    let mut entry = json!({
+        "id": model.id.as_str(),
         "object": "model",
         "type": "model",
         "created": 0,
         "owned_by": "switchyard",
-        "display_name": model,
+        "display_name": model.display_name.unwrap_or(model.id.as_str()),
         // OpenAI-compatible clients read the context window from this field.
         "context_length": capabilities.context_window,
         "capabilities": {
@@ -1854,7 +1855,11 @@ fn model_entry_json(model: &str, capabilities: ModelCapabilities) -> Value {
                 "anthropic-messages",
             ],
         },
-    })
+    });
+    if let Some(description) = model.description {
+        entry["description"] = json!(description);
+    }
+    entry
 }
 
 fn startup_banner(options: &ServerRunOptions, state: &ServerState, color: bool) -> String {

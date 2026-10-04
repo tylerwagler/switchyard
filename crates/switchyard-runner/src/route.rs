@@ -118,6 +118,8 @@ pub struct Route {
     responses_auxiliary_target: Option<AuxiliaryTarget>,
     decision_targets: Vec<DecisionTarget>,
     models: Arc<RuntimeModels>,
+    display_name: Option<String>,
+    description: Option<String>,
 }
 
 /// The selected model and untouched response produced by a route execution.
@@ -148,7 +150,30 @@ impl Route {
             responses_auxiliary_target,
             decision_targets,
             models: Arc::new(models),
+            display_name: None,
+            description: None,
         }
+    }
+
+    /// Sets the name and description `GET /v1/models` shows for this route.
+    pub fn with_listing(
+        mut self,
+        display_name: Option<String>,
+        description: Option<String>,
+    ) -> Self {
+        self.display_name = display_name;
+        self.description = description;
+        self
+    }
+
+    /// The name `GET /v1/models` shows for this route, when configured.
+    pub fn display_name(&self) -> Option<&str> {
+        self.display_name.as_deref()
+    }
+
+    /// The description `GET /v1/models` shows for this route, when configured.
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
     }
 
     /// Returns the configured libsy algorithm name.

@@ -212,6 +212,8 @@ Every route takes the common keys below, plus the keys for its type.
 | `tool_calling` | No | unset | Tool-calling support advertised by `GET /v1/models`. When `false`, the server rejects tool definitions, tool controls, and tool history with HTTP 400 before dispatch. Unset values appear as `null`. Explicit `true` and unset values do not restrict requests. |
 | `reasoning` | No | unset | When `false`, the server rejects reasoning controls with HTTP 400 before dispatch. Explicit `true` and unset values do not restrict requests. The server does not include this declaration in `GET /v1/models`. |
 | `vision` | No | unset | Image-input support advertised in `GET /v1/models` under `data[].capabilities.vision`. When `false`, the server rejects images with HTTP 400 before dispatch, including images in tool results. Unset values appear as `null`. Explicit `true` and unset values do not restrict requests. Declare `true` only when every target the route can select accepts images. |
+| `display_name` | No | the `id` | Name `GET /v1/models` shows for this route as `data[].display_name`. Claude Code's `/model` picker shows it. |
+| `description` | No | unset | One-line description `GET /v1/models` shows as `data[].description`. Claude Code's `/model` picker shows it under the name. Unset values leave the key out. |
 
 ### `noop`
 

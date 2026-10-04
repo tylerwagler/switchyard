@@ -41,6 +41,10 @@ pub struct ModelInfo<'a> {
     pub id: &'a ModelId,
     pub algorithm: &'a str,
     pub capabilities: ModelCapabilities,
+    /// Configured display name; the listing falls back to the id.
+    pub display_name: Option<&'a str>,
+    /// Configured one-line description.
+    pub description: Option<&'a str>,
     /// Base URLs of the upstreams serving this route, deduplicated.
     pub base_urls: Vec<&'a str>,
 }
@@ -210,6 +214,8 @@ impl Runner {
             id,
             algorithm: route.algorithm_name(),
             capabilities: route.capabilities(),
+            display_name: route.display_name(),
+            description: route.description(),
             base_urls: {
                 let mut urls: Vec<&str> = route.base_urls().collect();
                 urls.sort_unstable();
