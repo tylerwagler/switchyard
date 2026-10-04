@@ -1091,6 +1091,7 @@ schema_version = 1
 format = "openai_chat"
 base_url = "{base_url}"
 max_retries = 0
+failure_cooldown_ms = 0
 [targets.main]
 id = "model/a"
 llm_client = "mock"
