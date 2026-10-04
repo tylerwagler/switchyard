@@ -34,6 +34,7 @@ use switchyard_runner::{ResolvedCache, ResolvedRerank, ResolvedWebSearch};
 use switchyard_translation::{LlmStreamError, RawEventStream, WireFormat};
 
 use crate::ServerState;
+use crate::safeguards::{Answer, add_to_message, add_to_stream};
 use crate::sse::frame_stream;
 
 const DEFAULT_MODEL: &str = "claude-fable-5-1";
@@ -661,10 +662,15 @@ fn record(outcome: &str, started: Instant) {
 
 /// Short-circuits dedicated web-search requests with a synthesized response.
 /// Everything else returns `None` and the normal routing path runs unchanged.
+///
+/// A Claude Code `safeguards` request is answered on the reply here too. It
+/// covers no tool uses, since every search block is a server tool. Without the
+/// answer, Claude Code drops the session to local classification.
 pub(crate) async fn maybe_short_circuit(
     state: &ServerState,
     wire_format: WireFormat,
     body: &Value,
+    safeguards: &mut Option<Answer>,
 ) -> Option<AxumResponse> {
     if wire_format != WireFormat::AnthropicMessages || !is_dedicated_web_search(body) {
         return None;
@@ -710,18 +716,27 @@ pub(crate) async fn maybe_short_circuit(
         }
     };
 
+    let answer = safeguards.take();
     let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
     if streaming {
+        let mut events = sse_from_content(&model, &content);
+        if let Some(answer) = answer {
+            events = add_to_stream(events, answer);
+        }
         Some(
             frame_stream(
-                sse_from_content(&model, &content),
+                events,
                 WireFormat::AnthropicMessages,
                 state.redactor.clone(),
             )
             .into_response(),
         )
     } else {
-        Some(Json(aggregate_from_content(&model, &content)).into_response())
+        let mut message = aggregate_from_content(&model, &content);
+        if let Some(answer) = answer {
+            add_to_message(&mut message, answer).await;
+        }
+        Some(Json(message).into_response())
     }
 }
 

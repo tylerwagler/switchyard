@@ -564,3 +564,46 @@ impl Drop for UpstreamApp {
         self.task.abort();
     }
 }
+
+// Claude Code asks for a safeguards answer on every main-model request. The
+// hosted search reply must carry it too, or the session drops to local
+// classification. Search blocks are server tools, so no tool use needs a verdict.
+#[tokio::test]
+async fn web_search_answers_safeguards() -> TestResult {
+    let stub = SearxngStub::start(sample_results(), 0).await?;
+    let upstream = UpstreamApp::start().await?;
+    let no_judge = deployment(&upstream.base_url, &stub.base_url, true);
+    // The judge route is never called: the reply has no tool uses to judge.
+    let judge = format!("{no_judge}\n[safeguards]\njudge_route = \"main\"\n");
+    let cases = [
+        (no_judge, json!({"type": "unsupported"})),
+        (judge, json!({"type": "available", "tool_uses": {}})),
+    ];
+    for (config, status) in cases {
+        let app = build_switchyard_router(ServerState::from_runner(Runner::from_toml(&config)?)?);
+        let expected = json!([{"type": "dangerous_tool_use", "status": status}]);
+        for stream in [false, true] {
+            let mut body = web_search_body();
+            body["stream"] = json!(stream);
+            body["safeguards"] = json!([{"type": "dangerous_tool_use",
+                "classifier_context": {"v": 1, "permission_mode": "auto"}}]);
+            let response = send(&app, "POST", "/v1/messages", Some(body)).await?;
+            assert_eq!(response.status, StatusCode::OK);
+            let text = String::from_utf8(response.bytes)?;
+            assert_eq!(text.matches("safeguard_results").count(), 1, "{text}");
+            let results = if stream {
+                text.lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                    .find(|event| event["type"] == "message_delta")
+                    .map(|event| event["delta"]["safeguard_results"].clone())
+                    .unwrap_or_default()
+            } else {
+                serde_json::from_str::<Value>(&text)?["safeguard_results"].clone()
+            };
+            assert_eq!(results, expected, "stream={stream}");
+            assert!(text.contains("server_tool_use"), "{text}");
+        }
+    }
+    Ok(())
+}

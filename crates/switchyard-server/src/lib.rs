@@ -1161,7 +1161,7 @@ async fn handle_llm_request(
     wire_format: WireFormat,
     routing_log_context: Option<routing_log::RoutingLogContext>,
 ) -> Response {
-    let (safeguards, classifier_tap) = if wire_format == WireFormat::AnthropicMessages {
+    let (mut safeguards, classifier_tap) = if wire_format == WireFormat::AnthropicMessages {
         let session_id = metadata.session_id.clone();
         (
             safeguards::take_request(&mut body)
@@ -1175,7 +1175,9 @@ async fn handle_llm_request(
     // Hosted web search: dedicated `web_search` requests are served here, before
     // routing or any model call (server-side search tools carry no input_schema,
     // which vLLM rejects with a 422). All other traffic continues as normal.
-    if let Some(response) = websearch::maybe_short_circuit(&state, wire_format, &body).await {
+    if let Some(response) =
+        websearch::maybe_short_circuit(&state, wire_format, &body, &mut safeguards).await
+    {
         return response;
     }
     let (route, request) = match resolve_route(&state, metadata, body, wire_format) {
