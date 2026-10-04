@@ -193,6 +193,10 @@ pub struct UsageEvent {
     /// Claude Code's request class (`main`, `subagent`, `workflow`, `compaction`,
     /// `auxiliary`), from `x-claude-code-request-class`.
     pub request_class: Option<String>,
+    /// Claude Code version, entrypoint and workload, from its attribution block.
+    pub client_version: Option<String>,
+    pub client_entrypoint: Option<String>,
+    pub client_workload: Option<String>,
 }
 
 impl UsageEvent {
@@ -234,6 +238,15 @@ impl UsageEvent {
         }
         if let Some(class) = &self.request_class {
             fields.push(("request_class", class.clone()));
+        }
+        for (name, value) in [
+            ("client_version", &self.client_version),
+            ("client_entrypoint", &self.client_entrypoint),
+            ("client_workload", &self.client_workload),
+        ] {
+            if let Some(value) = value {
+                fields.push((name, value.clone()));
+            }
         }
         fields
     }
@@ -278,6 +291,25 @@ mod tests {
                 .fields()
                 .contains(&("request_class", "auxiliary".to_string()))
         );
+    }
+
+    #[test]
+    fn client_fields_are_written_only_when_known() {
+        let names = |event: &UsageEvent| {
+            event
+                .fields()
+                .into_iter()
+                .map(|(name, _)| name)
+                .filter(|name| name.starts_with("client_"))
+                .collect::<Vec<_>>()
+        };
+        assert!(names(&UsageEvent::default()).is_empty());
+        let event = UsageEvent {
+            client_version: Some("2.1.289".to_string()),
+            client_entrypoint: Some("cli".to_string()),
+            ..UsageEvent::default()
+        };
+        assert_eq!(names(&event), ["client_version", "client_entrypoint"]);
     }
 
     #[test]

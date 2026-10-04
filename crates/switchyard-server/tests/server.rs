@@ -1036,6 +1036,85 @@ id = "{ROUTE_MODEL}"
     Ok(build_switchyard_router(state))
 }
 
+// Claude Code's attribution block is read for metering on every route, and
+// removed before forwarding only on a route that sets `strip_attribution`.
+#[tokio::test]
+async fn attribution_block_is_metered_and_stripped_per_route() -> TestResult {
+    const BLOCK: &str = "x-anthropic-billing-header: cc_version=2.1.289.f3a; cc_entrypoint=cli;";
+    let upstream = MockUpstream::start().await?;
+    let app = build_switchyard_router(load_test_config(&format!(
+        r#"
+schema_version = 1
+[llm_clients.mock]
+format = "openai_chat"
+base_url = "{base_url}"
+[targets.main]
+id = "model/a"
+llm_client = "mock"
+[routes.stripped]
+id = "stripped"
+type = "passthrough"
+target = "main"
+strip_attribution = true
+[routes.kept]
+id = "kept"
+type = "passthrough"
+target = "main"
+"#,
+        base_url = upstream.base_url,
+    ))?);
+    for (model, forwarded) in [("stripped", false), ("kept", true)] {
+        upstream.calls.lock().await.clear();
+        let reports = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = {
+            let reports = Arc::clone(&reports);
+            switchyard_server::UsageSink::new(move |report| {
+                if let Ok(mut reports) = reports.lock() {
+                    reports.push(report.client);
+                }
+            })
+        };
+        let body = json!({
+            "model": model, "max_tokens": 16,
+            "system": [
+                {"type": "text", "text": BLOCK},
+                {"type": "text", "text": "You are Claude Code."}
+            ],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let mut request = HttpRequest::builder()
+            .method("POST")
+            .uri("/v1/messages")
+            .header("content-type", "application/json")
+            .body(Body::from(serde_json::to_vec(&body)?))?;
+        request.extensions_mut().insert(sink);
+        let response = app.clone().oneshot(request).await?;
+        assert_eq!(response.status(), StatusCode::OK);
+        response.into_body().collect().await?;
+
+        let sent = upstream
+            .calls
+            .lock()
+            .await
+            .first()
+            .cloned()
+            .unwrap_or_default();
+        let sent = sent.to_string();
+        assert!(sent.contains("You are Claude Code."), "{model}: {sent}");
+        assert_eq!(
+            sent.contains("x-anthropic-billing-header"),
+            forwarded,
+            "{model}: {sent}"
+        );
+
+        let reports = reports.lock().map(|r| r.clone()).unwrap_or_default();
+        let client = reports.first().cloned().flatten().unwrap_or_default();
+        assert_eq!(client.version.as_deref(), Some("2.1.289"), "{model}");
+        assert_eq!(client.entrypoint.as_deref(), Some("cli"), "{model}");
+    }
+    Ok(())
+}
+
 #[tokio::test]
 async fn safeguards_are_answered_here_and_never_reach_the_backend() -> TestResult {
     let (upstream, app) = test_app(&[(ROUTE_MODEL, &["model/a"])]).await?;

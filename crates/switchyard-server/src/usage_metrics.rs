@@ -11,6 +11,7 @@ use opentelemetry::{KeyValue, global};
 use switchyard_protocol::{LlmResponse, LlmResponseChunk, Response, Usage};
 
 use crate::SharedRoutingLog;
+use crate::attribution::ClientAttribution;
 use crate::routing_log::RoutingLogContext;
 use crate::stats::{StatsAccumulator, TokenUsage};
 
@@ -27,6 +28,8 @@ pub struct UsageReport {
     pub latency: Duration,
     /// False when the stream stopped early: the client left or the upstream failed.
     pub complete: bool,
+    /// What Claude Code's attribution block said about the client, when it sent one.
+    pub client: Option<ClientAttribution>,
 }
 
 /// Receives the final usage of each served request.
@@ -39,6 +42,14 @@ pub struct UsageSink(Arc<dyn Fn(UsageReport) + Send + Sync>);
 impl UsageSink {
     pub fn new(report: impl Fn(UsageReport) + Send + Sync + 'static) -> Self {
         Self(Arc::new(report))
+    }
+
+    /// A sink that adds `client` to every report before passing it on.
+    pub(crate) fn with_client(self, client: ClientAttribution) -> Self {
+        Self::new(move |mut report| {
+            report.client = Some(client.clone());
+            self.0(report)
+        })
     }
 }
 
@@ -60,6 +71,7 @@ impl StreamMeter {
                 output_deltas: self.output_deltas,
                 latency: self.started.elapsed(),
                 complete,
+                client: None,
             });
         }
     }
@@ -102,6 +114,7 @@ pub(crate) fn observe(
                     output_deltas: 0,
                     latency: started.elapsed(),
                     complete: true,
+                    client: None,
                 });
             }
             LlmResponse::Agg(agg)

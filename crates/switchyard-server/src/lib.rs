@@ -3,6 +3,7 @@
 
 //! Rust HTTP server for libsy algorithms.
 
+mod attribution;
 mod auxiliary;
 mod capabilities;
 pub mod config;
@@ -57,6 +58,7 @@ use switchyard_translation::{WireFormat, decode_request, encode_aggregated_respo
 use crate::response::into_http_response;
 use crate::stats::{StatsAccumulator, StatsSnapshot, prefix_probe, tracking_enabled_from_env};
 
+pub use attribution::ClientAttribution;
 pub use observability::{flush_observability, initialize_observability};
 pub use usage_metrics::{UsageReport, UsageSink};
 
@@ -1155,12 +1157,27 @@ fn resolve_route(
 /// Resolves and executes an LLM request, attaching route identity when durable logging is enabled.
 async fn handle_llm_request(
     state: ServerState,
-    started: RequestStart,
+    mut started: RequestStart,
     metadata: Metadata,
     mut body: Value,
     wire_format: WireFormat,
     routing_log_context: Option<routing_log::RoutingLogContext>,
 ) -> Response {
+    // Claude Code's attribution block: metered first, then removed when the
+    // route forwards to backends that would only see it as prompt text.
+    if wire_format == WireFormat::AnthropicMessages {
+        if let Some(client) = attribution::read(&body) {
+            started.1 = started.1.map(|sink| sink.with_client(client));
+        }
+        let strips = body
+            .get("model")
+            .and_then(Value::as_str)
+            .and_then(|model| state.route_for_model(model))
+            .is_some_and(Route::strips_attribution);
+        if strips {
+            attribution::strip(&mut body);
+        }
+    }
     let (mut safeguards, classifier_tap) = if wire_format == WireFormat::AnthropicMessages {
         let session_id = metadata.session_id.clone();
         (

@@ -120,6 +120,7 @@ pub struct Route {
     models: Arc<RuntimeModels>,
     display_name: Option<String>,
     description: Option<String>,
+    strip_attribution: bool,
 }
 
 /// The selected model and untouched response produced by a route execution.
@@ -152,6 +153,7 @@ impl Route {
             models: Arc::new(models),
             display_name: None,
             description: None,
+            strip_attribution: false,
         }
     }
 
@@ -164,6 +166,17 @@ impl Route {
         self.display_name = display_name;
         self.description = description;
         self
+    }
+
+    /// Sets whether this route removes Claude Code's attribution block before forwarding.
+    pub fn with_attribution_strip(mut self, strip: bool) -> Self {
+        self.strip_attribution = strip;
+        self
+    }
+
+    /// Whether this route removes Claude Code's attribution block before forwarding.
+    pub fn strips_attribution(&self) -> bool {
+        self.strip_attribution
     }
 
     /// The name `GET /v1/models` shows for this route, when configured.

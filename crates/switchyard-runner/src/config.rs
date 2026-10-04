@@ -405,6 +405,7 @@ struct RouteConfig {
     vision: Option<bool>,
     display_name: Option<String>,
     description: Option<String>,
+    strip_attribution: bool,
     algorithm: AlgorithmSpec,
 }
 
@@ -426,6 +427,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let vision = take_optional(&mut table, "vision")?;
         let display_name = take_optional(&mut table, "display_name")?;
         let description = take_optional(&mut table, "description")?;
+        let strip_attribution = take_optional(&mut table, "strip_attribution")?.unwrap_or(false);
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
             .map_err(serde::de::Error::custom)?;
         Ok(Self {
@@ -436,6 +438,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             vision,
             display_name,
             description,
+            strip_attribution,
             algorithm,
         })
     }
@@ -600,7 +603,8 @@ impl DeploymentConfig {
                 decision_targets,
                 models,
             )
-            .with_listing(config.display_name.clone(), config.description.clone());
+            .with_listing(config.display_name.clone(), config.description.clone())
+            .with_attribution_strip(config.strip_attribution);
             routes.push((config.id.clone(), route));
         }
         let web_search =

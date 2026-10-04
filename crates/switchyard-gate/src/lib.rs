@@ -296,6 +296,7 @@ fn usage_event(
     body_bytes: u64,
 ) -> UsageEvent {
     let usage = report.usage.clone().unwrap_or_default();
+    let client = report.client.as_ref();
     let estimated =
         !report.complete && (usage.input_tokens.is_none() || usage.output_tokens.is_none());
     let input_tokens = usage.input_tokens.unwrap_or(if estimated {
@@ -327,6 +328,9 @@ fn usage_event(
         chat_id,
         // Set by the caller, which read the request headers.
         request_class: None,
+        client_version: client.and_then(|c| c.version.clone()),
+        client_entrypoint: client.and_then(|c| c.entrypoint.clone()),
+        client_workload: client.and_then(|c| c.workload.clone()),
     }
 }
 
@@ -400,6 +404,7 @@ mod tests {
             output_deltas,
             latency: Duration::from_millis(5),
             complete,
+            client: None,
         }
     }
 
@@ -515,6 +520,22 @@ mod tests {
         assert_eq!(class("main; drop"), None);
         assert_eq!(class(&"a".repeat(33)), None);
         assert_eq!(request_class(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn usage_event_carries_the_client_attribution() {
+        let mut with_client = report(true, None, 0);
+        with_client.client = Some(switchyard_server::ClientAttribution {
+            version: Some("2.1.289".to_string()),
+            entrypoint: Some("cli".to_string()),
+            workload: None,
+        });
+        let event = usage_event(&with_client, "u", None, "key", None, 0);
+        assert_eq!(event.client_version.as_deref(), Some("2.1.289"));
+        assert_eq!(event.client_entrypoint.as_deref(), Some("cli"));
+        assert_eq!(event.client_workload, None);
+        let plain = usage_event(&report(true, None, 0), "u", None, "key", None, 0);
+        assert_eq!(plain.client_version, None);
     }
 
     #[test]

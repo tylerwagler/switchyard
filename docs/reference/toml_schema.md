@@ -214,6 +214,7 @@ Every route takes the common keys below, plus the keys for its type.
 | `vision` | No | unset | Image-input support advertised in `GET /v1/models` under `data[].capabilities.vision`. When `false`, the server rejects images with HTTP 400 before dispatch, including images in tool results. Unset values appear as `null`. Explicit `true` and unset values do not restrict requests. Declare `true` only when every target the route can select accepts images. |
 | `display_name` | No | the `id` | Name `GET /v1/models` shows for this route as `data[].display_name`. Claude Code's `/model` picker shows it. |
 | `description` | No | unset | One-line description `GET /v1/models` shows as `data[].description`. Claude Code's `/model` picker shows it under the name. Unset values leave the key out. |
+| `strip_attribution` | No | `false` | Remove Claude Code's attribution block (`x-anthropic-billing-header: …`, the first `system` block of an Anthropic request) before forwarding. Set it on routes whose targets are not Anthropic's API: those see the block as prompt text, and its per-conversation fingerprint stops prompts from sharing a prefix. The server reads the block's `cc_version`, `cc_entrypoint` and `cc_workload` for usage reporting either way. |
 
 ### `noop`
 
