@@ -543,6 +543,41 @@ fn anthropic_reconstruction_rejects_fallbacks_with_credit_token() {
     ));
 }
 
+// A rebuilt Anthropic body keeps the caller's first system block first, as the
+// preserved body does: Anthropic strips its attribution block only from that position.
+#[test]
+fn anthropic_rebuild_puts_target_prompt_after_the_first_system_block() -> TestResult {
+    let engine = TranslationEngine::default();
+    let policy = normalized_policy();
+    let body = json!({
+        "model": "caller", "max_tokens": 64,
+        "system": [
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=test;"},
+            {"type": "text", "text": "caller prompt"}
+        ],
+        "messages": [{"role": "user", "content": "hi"}]
+    });
+    let mut request = engine
+        .decode_request(WireFormat::AnthropicMessages, &body, &policy)?
+        .request;
+    // Force the rebuild path, as a route that changes the request does.
+    request.preservation.requests.clear();
+    prepare_request_for_target(&mut request, &"target/model".into(), Some("target prompt"));
+    let output = engine
+        .encode_request(WireFormat::AnthropicMessages, &request, &policy)?
+        .body;
+
+    assert_eq!(
+        output["system"],
+        json!([
+            {"type": "text", "text": "x-anthropic-billing-header: cc_version=test;"},
+            {"type": "text", "text": "target prompt"},
+            {"type": "text", "text": "caller prompt"}
+        ])
+    );
+    Ok(())
+}
+
 #[test]
 fn anthropic_reconstruction_preserves_thinking() -> TestResult {
     let engine = TranslationEngine::default();

@@ -336,15 +336,24 @@ pub fn prepare_request_for_target(
     let target = target.to_string();
     request.model = Some(target.clone());
     if let Some(prompt) = prompt {
-        request.instructions.insert(
-            0,
-            InstructionBlock {
-                role: Role::System,
-                content: vec![ContentBlock::Text {
-                    text: prompt.to_string(),
-                }],
-            },
-        );
+        let text = ContentBlock::Text {
+            text: prompt.to_string(),
+        };
+        let anthropic = crate::codecs::common::is_anthropic_request(request);
+        match request.instructions.first_mut() {
+            // Keep the caller's first block first. Anthropic removes its attribution block from
+            // the first system block only, so inserting ahead of it defeats the strip.
+            Some(first) if anthropic && first.role == Role::System && !first.content.is_empty() => {
+                first.content.insert(1, text);
+            }
+            _ => request.instructions.insert(
+                0,
+                InstructionBlock {
+                    role: Role::System,
+                    content: vec![text],
+                },
+            ),
+        }
     }
     prepare_preserved_requests(&mut request.preservation, &target, prompt);
 }
