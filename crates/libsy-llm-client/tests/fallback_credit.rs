@@ -131,18 +131,20 @@ async fn fallback_credit_retry_child() -> TestResult {
         .mount(&server)
         .await;
 
-    let models = [
-        ("claude-fable-5", INITIAL_BETAS),
-        ("claude-opus-4-8", CREDIT_BETA),
-    ]
-    .map(|(model, beta)| {
+    // anthropic-beta comes from the caller; extra_headers cannot set it.
+    let betas = |value: &'static str| {
+        let mut headers = http::HeaderMap::new();
+        headers.insert("anthropic-beta", http::HeaderValue::from_static(value));
+        Some(headers)
+    };
+    let models = ["claude-fable-5", "claude-opus-4-8"].map(|model| {
         ModelConfig::new(
             model,
             Backend::Anthropic(HttpBackendConfig {
                 base_url: server.uri(),
                 api_key: None,
                 forward_auth: false,
-                extra_headers: BTreeMap::from([("anthropic-beta".to_string(), beta.to_string())]),
+                extra_headers: BTreeMap::new(),
                 extra_body: BTreeMap::new(),
                 omit_body_fields: BTreeSet::new(),
                 reasoning_effort: None,
@@ -157,7 +159,7 @@ async fn fallback_credit_retry_child() -> TestResult {
     let RawResponse::Buffered(refusal) = client
         .call_rewrite_model_raw(
             initial_body.clone(),
-            None,
+            betas(INITIAL_BETAS),
             None,
             WireFormat::AnthropicMessages,
         )
@@ -179,7 +181,12 @@ async fn fallback_credit_retry_child() -> TestResult {
     retry_body["model"] = json!("claude-opus-4-8");
     retry_body["fallback_credit_token"] = json!(token);
     let RawResponse::Buffered(answer) = client
-        .call_rewrite_model_raw(retry_body, None, None, WireFormat::AnthropicMessages)
+        .call_rewrite_model_raw(
+            retry_body,
+            betas(CREDIT_BETA),
+            None,
+            WireFormat::AnthropicMessages,
+        )
         .await?
     else {
         return Err("expected a buffered retry response".into());
