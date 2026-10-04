@@ -190,6 +190,9 @@ pub struct UsageEvent {
     pub complete: bool,
     pub estimated: bool,
     pub chat_id: Option<String>,
+    /// Claude Code's request class (`main`, `subagent`, `workflow`, `compaction`,
+    /// `auxiliary`), from `x-claude-code-request-class`.
+    pub request_class: Option<String>,
 }
 
 impl UsageEvent {
@@ -229,6 +232,9 @@ impl UsageEvent {
         if let Some(chat) = &self.chat_id {
             fields.push(("chat_id", chat.clone()));
         }
+        if let Some(class) = &self.request_class {
+            fields.push(("request_class", class.clone()));
+        }
         fields
     }
 }
@@ -258,6 +264,21 @@ mod tests {
 
     // 2026-09-25 23:59:30 UTC, a Friday.
     const FRI: u64 = 1_790_380_770;
+
+    #[test]
+    fn request_class_is_a_stream_field_only_when_known() {
+        let has = |event: &UsageEvent| event.fields().iter().any(|(k, _)| *k == "request_class");
+        assert!(!has(&UsageEvent::default()));
+        let event = UsageEvent {
+            request_class: Some("auxiliary".to_string()),
+            ..UsageEvent::default()
+        };
+        assert!(
+            event
+                .fields()
+                .contains(&("request_class", "auxiliary".to_string()))
+        );
+    }
 
     #[test]
     fn windows_use_utc_calendar_boundaries() {

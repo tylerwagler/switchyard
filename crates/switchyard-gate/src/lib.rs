@@ -30,6 +30,8 @@ use crate::quota::UsageEvent;
 
 const FORWARDED_EMAIL: &str = "x-openwebui-user-email";
 const FORWARDED_CHAT: &str = "x-openwebui-chat-id";
+/// Claude Code's routing hint, sent when `CLAUDE_CODE_GATEWAY_HINT_HEADERS=1`.
+const REQUEST_CLASS: &str = "x-claude-code-request-class";
 /// Rough bytes per token, used only to estimate the prompt of a stream that ended early.
 const BYTES_PER_TOKEN: u64 = 4;
 
@@ -242,6 +244,7 @@ fn usage_sink(
         .get(FORWARDED_CHAT)
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
+    let request_class = request_class(headers);
     let body_bytes = headers
         .get(header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
@@ -258,6 +261,7 @@ fn usage_sink(
             body_bytes,
         );
         event.billable_tokens = event.billable(&weights);
+        event.request_class = request_class.clone();
         let mut valkey = gate.valkey.clone();
         tokio::spawn(async move {
             if let Err(e) = quota::record(&mut valkey, &event).await {
@@ -266,6 +270,18 @@ fn usage_sink(
             }
         });
     })
+}
+
+/// The request class header, kept only when it is a short lowercase word. The client
+/// sets it, so anything else is dropped rather than written to the usage stream.
+fn request_class(headers: &HeaderMap) -> Option<String> {
+    let value = headers.get(REQUEST_CLASS)?.to_str().ok()?;
+    let word = !value.is_empty()
+        && value.len() <= 32
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b == b'_' || b == b'-');
+    word.then(|| value.to_string())
 }
 
 /// Turns a usage report into a billable event. A stream that stopped early usually has
@@ -309,6 +325,8 @@ fn usage_event(
         complete: report.complete,
         estimated,
         chat_id,
+        // Set by the caller, which read the request headers.
+        request_class: None,
     }
 }
 
@@ -486,6 +504,17 @@ mod tests {
             (event.input_tokens, event.output_tokens, event.estimated),
             (100, 20, false)
         );
+    }
+
+    #[test]
+    fn request_class_keeps_only_short_lowercase_words() {
+        let class = |value: &str| request_class(&headers(&[(REQUEST_CLASS, value)]));
+        assert_eq!(class("auxiliary").as_deref(), Some("auxiliary"));
+        assert_eq!(class("main").as_deref(), Some("main"));
+        assert_eq!(class("Main"), None);
+        assert_eq!(class("main; drop"), None);
+        assert_eq!(class(&"a".repeat(33)), None);
+        assert_eq!(request_class(&HeaderMap::new()), None);
     }
 
     #[test]
