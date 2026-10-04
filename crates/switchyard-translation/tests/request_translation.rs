@@ -510,7 +510,8 @@ fn anthropic_reconstruction_preserves_thinking() -> TestResult {
             .body;
 
         body["model"] = json!("target/model");
-        body["system"] = json!("target prompt");
+        // Re-encode keeps system prompts as blocks (see anthropic_reencode_keeps_system_blocks_separate).
+        body["system"] = json!([{"type": "text", "text": "target prompt"}]);
         assert_eq!(output, body);
     }
     Ok(())
