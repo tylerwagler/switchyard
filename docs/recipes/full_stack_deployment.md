@@ -44,8 +44,9 @@ cargo install --locked --path crates/switchyard-server
 cargo build --release -p switchyard-gate   # only if you want auth and quotas
 ```
 
-The root `Dockerfile` builds a `switchyard-server` image that listens on port
-`4000`. It does not include the gate.
+The root `Dockerfile` builds an image that listens on port `4000` and starts
+`switchyard-server`. The image also carries `switchyard-gate`; pass
+`--entrypoint switchyard-gate` to `docker run` to start the gate instead.
 
 ```bash
 docker build -t switchyard-server .
