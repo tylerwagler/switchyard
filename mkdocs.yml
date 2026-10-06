@@ -27,6 +27,7 @@ nav:
       - NeMo Relay: integrations/nemo_relay.md
       - pi: integrations/pi.md
       - Oh My Pi: integrations/oh_my_pi.md
+      - Claude Code: integrations/claude_code.md
   - Recipes:
       - Single-provider coding agents: recipes/single_provider_coding_agents.md
       - Full-stack deployment for coding agents: recipes/full_stack_deployment.md
