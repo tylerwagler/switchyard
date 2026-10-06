@@ -37,8 +37,6 @@ use crate::ServerState;
 use crate::safeguards::{Answer, add_to_message, add_to_stream};
 use crate::sse::frame_stream;
 
-const DEFAULT_MODEL: &str = "claude-fable-5-1";
-
 /// Search-instruction sentence shapes the client prepends to the query.
 const QUERY_PREFIXES: &[&str] = &[
     "perform a web search for the query:",
@@ -689,10 +687,13 @@ pub(crate) async fn maybe_short_circuit(
     // `state.web_search_config()` is only present when web search is resolved+enabled.
     let settings = state.web_search_config()?;
     let started = Instant::now();
+    // The response echoes the requested model. Anthropic Messages requires
+    // `model`, so a request without one is already malformed; an empty string
+    // is the honest echo and avoids inventing a model id.
     let model = body
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_MODEL)
+        .unwrap_or_default()
         .to_string();
     let query = extract_query(body);
     let content = match search(&query, settings, state.web_search_client()).await {
