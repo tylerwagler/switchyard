@@ -479,6 +479,18 @@ advisor's plan. See
 | `reviewer_system_prompt` | No | packaged prompt | Replaces the APPROVE/REDO reviewer prompt. |
 | `redo_feedback_prefix` | No | packaged prompt | Replaces the text put in front of a REDO plan fed back to the executor. |
 
+## `[safeguards]`
+
+Optional. Answers Claude Code's auto-mode safety check on the server. Without this
+section the server replies that it does not run the check, and Claude Code runs its own.
+With it, every tool use in a reply is judged by one short request through `judge_route`.
+
+| Key | Required | Default | Meaning |
+|---|:---:|---|---|
+| `judge_route` | Yes | — | Key under `[routes]` (not the route `id`) whose model judges each tool use. |
+| `timeout_ms` | No | `60000` | Time allowed for one verdict. A timeout or error reports the check as unavailable, never as allowed. |
+| `shadow_log` | No | unset | Path to a JSONL file. Turns on shadow mode: the server still answers that it does not run the check, runs the judge in the background, and appends its verdicts and Claude Code's own classifier exchanges to this file. |
+
 ## `[web_search]`
 
 Optional. Serves Claude Code's native server-side `web_search` tool requests
@@ -492,6 +504,7 @@ candidates is fetched and re-ranked before the top `max_results` are returned.
 | `enabled` | `false` | Set `true` to short-circuit dedicated web-search requests. |
 | `search` | — | Name of a `[search.<name>]` endpoint to query. |
 | `rerank` | — | Name of a `[rerank.<name>]` backend to re-rank candidates. |
+| `cache` | — | Name of a `[cache.<name>]` backend that stores raw search results. |
 | `max_results` | `6` | Results returned per query; range `1..=20`. |
 | `timeout_ms` | `15000` | Inline timeout; applies when not using a named `search`. |
 | `searxng_url` | `http://127.0.0.1:8080` | Compatibility alias for an inline SearXNG endpoint; mutually exclusive with `search`. |
@@ -505,7 +518,7 @@ Optional. A named search endpoint, typically a self-hosted SearXNG instance.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `base_url` | — | Base URL of the search endpoint (required). |
+| `base_url` | `http://127.0.0.1:8080` | Base URL of the search endpoint. |
 | `timeout_ms` | `15000` | Per-request timeout. |
 | `max_results` | `20` | Cap on raw candidates a consumer may request (feed for re-ranking). |
 

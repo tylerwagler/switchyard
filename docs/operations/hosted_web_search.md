@@ -26,7 +26,7 @@ base_url = "http://host:8002/v1"
 model = "qwen3-vl-rerank"
 
 [cache.valkey]                      # optional named cache backend
-url = "redis://valkey.defense.lan:6379"
+url = "redis://valkey:6379"
 ttl_s = 3600
 key_prefix = "switchyard:websearch"
 
