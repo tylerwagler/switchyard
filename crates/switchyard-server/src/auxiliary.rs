@@ -9,7 +9,7 @@
 //! shaped non-chat calls, not chat translation.
 
 use std::collections::BTreeMap;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::body::{Body, Bytes};
@@ -112,17 +112,18 @@ async fn relay_kind(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Response {
-    let (selected_name, base_url, api_key_env) = match kind {
+    let (selected_name, base_url, api_key_env, timeout) = match kind {
         "embeddings" => match pick(kind, state.embeddings(), name) {
             Ok((name, config)) => (
                 name,
                 config.base_url.as_str(),
                 config.api_key_env.as_deref(),
+                config.timeout(),
             ),
             Err((status, message)) => return json_error(status, message),
         },
         "rerank" => match pick(kind, state.rerank(), name) {
-            Ok((name, config)) => (name, config.base_url.as_str(), None),
+            Ok((name, config)) => (name, config.base_url.as_str(), None, config.timeout()),
             Err((status, message)) => return json_error(status, message),
         },
         _ => unreachable!("relay kind is fixed at the call site"),
@@ -134,6 +135,7 @@ async fn relay_kind(
         base_url,
         path,
         api_key_env,
+        timeout,
         headers,
         body,
     )
@@ -165,11 +167,12 @@ async fn relay_request(
     base_url: &str,
     path: &str,
     api_key_env: Option<&str>,
+    timeout: Duration,
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Option<String>, Bytes), String> {
     let url = format!("{}{}", base_url.trim_end_matches('/'), path);
-    let mut request = client.post(&url).body(body);
+    let mut request = client.post(&url).timeout(timeout).body(body);
     if let Some(content_type) = headers
         .get("content-type")
         .and_then(|value| value.to_str().ok())

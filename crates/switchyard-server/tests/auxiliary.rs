@@ -16,6 +16,7 @@ use axum::http::{Request as HttpRequest, StatusCode};
 use axum::routing::post;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
+use std::time::Duration;
 use switchyard_runner::Runner;
 use switchyard_server::{ServerState, build_switchyard_router};
 use tokio::net::TcpListener;
@@ -239,6 +240,54 @@ async fn rerank_default_relays_to_the_only_backend() -> TestResult {
     let result: Value = serde_json::from_slice(&response.bytes)?;
     assert_eq!(result["echo_id"], "r");
     assert_eq!(r.bodies().await, vec![body]);
+    Ok(())
+}
+
+/// A backend that never answers in time: the relay's `timeout_ms` must turn the
+/// wait into a 502 instead of hanging the caller.
+async fn slow_handler() -> (StatusCode, Json<Value>) {
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    (StatusCode::OK, Json(json!({})))
+}
+
+#[tokio::test]
+async fn relay_times_out_per_backend() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        let app = Router::new().route("/rerank", post(slow_handler));
+        let _ = axum::serve(listener, app).await;
+    });
+    let toml = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.upstream]
+format = "anthropic_messages"
+base_url = "https://upstream.test"
+
+[targets.main]
+id = "test/main"
+llm_client = "upstream"
+
+[routes.main]
+id = "test/main"
+type = "passthrough"
+target = "main"
+
+[rerank.slow]
+base_url = "http://{addr}"
+model = "slow"
+timeout_ms = 100
+"#
+    );
+    let app = build_switchyard_router(ServerState::from_runner(Runner::from_toml(&toml)?)?);
+
+    let started = std::time::Instant::now();
+    let response = send(&app, "POST", "/v1/rerank", Some(json!({ "query": "q" }))).await?;
+    task.abort();
+    assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+    assert!(started.elapsed() < Duration::from_secs(2));
     Ok(())
 }
 

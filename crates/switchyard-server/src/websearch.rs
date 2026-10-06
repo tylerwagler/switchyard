@@ -284,7 +284,7 @@ async fn rerank(
     let response = match client
         .post(format!("{}/rerank", rerank.base_url.trim_end_matches('/')))
         .json(&payload)
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(rerank.timeout)
         .send()
         .await
     {
