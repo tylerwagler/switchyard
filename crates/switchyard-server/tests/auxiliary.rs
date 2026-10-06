@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Integration coverage for the non-chat relay: `/v1/embeddings` + `/v1/rerank`
-//! proxy to configured backends (default/named), and `/v1/models` advertises the
+//! proxy to configured backends (the only one, or a named one), and `/v1/models` advertises the
 //! embed/rerank/search capabilities.
 
 use std::sync::Arc;
@@ -12,10 +12,11 @@ use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{Request as HttpRequest, StatusCode};
+use axum::http::{HeaderMap, Request as HttpRequest, StatusCode};
 use axum::routing::post;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
+use std::time::Duration;
 use switchyard_runner::Runner;
 use switchyard_server::{ServerState, build_switchyard_router};
 use tokio::net::TcpListener;
@@ -72,12 +73,16 @@ impl Drop for EchoStub {
 
 async fn echo_handler(
     State(state): State<EchoState>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     state.received.lock().unwrap().push(body.clone());
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok());
     (
         StatusCode::OK,
-        Json(json!({ "echo_id": state.id, "got": body })),
+        Json(json!({ "echo_id": state.id, "got": body, "authorization": authorization })),
     )
 }
 
@@ -158,7 +163,7 @@ async fn started(
 // --- tests -------------------------------------------------------------------
 
 #[tokio::test]
-async fn embeddings_default_relays_to_first_backend() -> TestResult {
+async fn embeddings_default_is_ambiguous_with_two_backends() -> TestResult {
     let a = EchoStub::start("a", "/embeddings").await?;
     let b = EchoStub::start("b", "/embeddings").await?;
     let r = EchoStub::start("r", "/rerank").await?;
@@ -166,11 +171,13 @@ async fn embeddings_default_relays_to_first_backend() -> TestResult {
     let app = started(&a, &b, &r, &s).await?;
 
     let body = json!({ "input": ["hello world"], "model": "m-a" });
-    let response = send(&app, "POST", "/v1/embeddings", Some(body.clone())).await?;
-    assert_eq!(response.status, StatusCode::OK);
+    let response = send(&app, "POST", "/v1/embeddings", Some(body)).await?;
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
     let result: Value = serde_json::from_slice(&response.bytes)?;
-    assert_eq!(result["echo_id"], "a");
-    assert_eq!(a.bodies().await, vec![body]);
+    let message = result["error"]["message"].as_str().unwrap();
+    assert!(message.contains("e_a"), "{message}");
+    assert!(message.contains("e_b"), "{message}");
+    assert!(a.bodies().await.is_empty());
     assert!(b.bodies().await.is_empty());
     Ok(())
 }
@@ -224,7 +231,7 @@ async fn embeddings_unknown_name_is_404() -> TestResult {
 }
 
 #[tokio::test]
-async fn rerank_default_relays_the_body() -> TestResult {
+async fn rerank_default_relays_to_the_only_backend() -> TestResult {
     let a = EchoStub::start("a", "/embeddings").await?;
     let b = EchoStub::start("b", "/embeddings").await?;
     let r = EchoStub::start("r", "/rerank").await?;
@@ -237,6 +244,95 @@ async fn rerank_default_relays_the_body() -> TestResult {
     let result: Value = serde_json::from_slice(&response.bytes)?;
     assert_eq!(result["echo_id"], "r");
     assert_eq!(r.bodies().await, vec![body]);
+    Ok(())
+}
+
+/// A backend that never answers in time: the relay's `timeout_ms` must turn the
+/// wait into a 502 instead of hanging the caller.
+async fn slow_handler() -> (StatusCode, Json<Value>) {
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    (StatusCode::OK, Json(json!({})))
+}
+
+#[tokio::test]
+async fn relay_times_out_per_backend() -> TestResult {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let task = tokio::spawn(async move {
+        let app = Router::new().route("/rerank", post(slow_handler));
+        let _ = axum::serve(listener, app).await;
+    });
+    let toml = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.upstream]
+format = "anthropic_messages"
+base_url = "https://upstream.test"
+
+[targets.main]
+id = "test/main"
+llm_client = "upstream"
+
+[routes.main]
+id = "test/main"
+type = "passthrough"
+target = "main"
+
+[rerank.slow]
+base_url = "http://{addr}"
+model = "slow"
+timeout_ms = 100
+"#
+    );
+    let app = build_switchyard_router(ServerState::from_runner(Runner::from_toml(&toml)?)?);
+
+    let started = std::time::Instant::now();
+    let response = send(&app, "POST", "/v1/rerank", Some(json!({ "query": "q" }))).await?;
+    task.abort();
+    assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+    assert!(started.elapsed() < Duration::from_secs(2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn rerank_relay_sends_the_configured_api_key() -> TestResult {
+    const KEY_ENV: &str = "SWITCHYARD_AUX_TEST_RERANK_KEY";
+    unsafe {
+        // "unsafe" is for concurrent reads and writes, very rare
+        std::env::set_var(KEY_ENV, "secret-token");
+    }
+    let r = EchoStub::start("r", "/rerank").await?;
+    let toml = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.upstream]
+format = "anthropic_messages"
+base_url = "https://upstream.test"
+
+[targets.main]
+id = "test/main"
+llm_client = "upstream"
+
+[routes.main]
+id = "test/main"
+type = "passthrough"
+target = "main"
+
+[rerank.secured]
+base_url = "{}"
+model = "r"
+api_key_env = "{KEY_ENV}"
+"#,
+        r.base_url
+    );
+    let app = build_switchyard_router(ServerState::from_runner(Runner::from_toml(&toml)?)?);
+
+    let response = send(&app, "POST", "/v1/rerank", Some(json!({ "query": "q" }))).await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let result: Value = serde_json::from_slice(&response.bytes)?;
+    assert_eq!(result["authorization"], "Bearer secret-token");
     Ok(())
 }
 
@@ -265,6 +361,19 @@ async fn models_lists_non_chat_capabilities() -> TestResult {
     assert!(kinds.contains(&("e_b".into(), "embeddings".into())));
     assert!(kinds.contains(&("r_a".into(), "rerank".into())));
     assert!(kinds.contains(&("s_a".into(), "search".into())));
+    // Embeddings and rerank entries name the model the backend serves.
+    let models: Vec<(String, String)> = payload["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| {
+            let id = entry["id"].as_str()?;
+            let model = entry["model"].as_str()?;
+            Some((id.to_string(), model.to_string()))
+        })
+        .collect();
+    assert!(models.contains(&("e_a".into(), "m-a".into())));
+    assert!(models.contains(&("r_a".into(), "r-a".into())));
     Ok(())
 }
 

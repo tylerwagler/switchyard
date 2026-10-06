@@ -502,7 +502,8 @@ Optional. Serves Claude Code's native server-side `web_search` tool requests
 from a named `[search.*]` endpoint (typically SearXNG) instead of passing them
 to a model backend (vLLM rejects the tool declaration with a 422). Off unless
 `enabled = true`. When `rerank` names a `[rerank.*]` backend, a surplus of raw
-candidates is fetched and re-ranked before the top `max_results` are returned.
+candidates (3x `max_results`, capped at the endpoint's `[search.*].max_results`)
+is fetched and re-ranked before the top `max_results` are returned.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -510,8 +511,8 @@ candidates is fetched and re-ranked before the top `max_results` are returned.
 | `search` | — | Name of a `[search.<name>]` endpoint to query. |
 | `rerank` | — | Name of a `[rerank.<name>]` backend to re-rank candidates. |
 | `cache` | — | Name of a `[cache.<name>]` backend that stores raw search results. |
-| `max_results` | `6` | Results returned per query; range `1..=20`. |
-| `timeout_ms` | `15000` | Inline timeout; applies when not using a named `search`. |
+| `max_results` | `6` | Results returned per query; range `1..=20`. Must not exceed the named endpoint's `[search.*].max_results`. |
+| `timeout_ms` | `15000` | Inline timeout. Only allowed without `search`; with a named `search`, set `[search.<name>].timeout_ms` instead. |
 | `searxng_url` | `http://127.0.0.1:8080` | Compatibility alias for an inline SearXNG endpoint; mutually exclusive with `search`. |
 
 When `search` is omitted, `searxng_url` (or the default) is used as an implicit
@@ -525,19 +526,21 @@ Optional. A named search endpoint, typically a self-hosted SearXNG instance.
 |---|---|---|
 | `base_url` | `http://127.0.0.1:8080` | Base URL of the search endpoint. |
 | `timeout_ms` | `15000` | Per-request timeout. |
-| `max_results` | `20` | Cap on raw candidates a consumer may request (feed for re-ranking). |
+| `max_results` | `20` | Most raw candidates web search requests from this endpoint per query. |
 
 ## `[rerank.<name>]`
 
 Optional. A named rerank backend exposing the Cohere-shaped `POST /v1/rerank`
-API (e.g. vLLM). Served by the gateway at `/v1/rerank` (default or `/{name}`)
-and usable from `web_search.rerank`.
+API (e.g. vLLM). Served by the gateway at `/v1/rerank` and usable from
+`web_search.rerank`.
 
 | Key | Default | Meaning |
 |---|---|---|
 | `base_url` | — | Backend base URL (required), e.g. `http://host:8002/v1`. |
 | `model` | — | Model id the backend serves (required). |
-| `default_top_n` | `6` | top-n applied when a consumer does not specify one. |
+| `default_top_n` | `6` | `top_n` that web search sends in its rerank request. Set it at or above `web_search.max_results`. The `/v1/rerank` relay passes bodies through unchanged and does not add it. |
+| `api_key_env` | — | Env var holding the API key, when the backend requires one. Sent as a bearer token by the relay and by web search. The variable must be set and non-empty at startup. |
+| `timeout_ms` | `30000` | Deadline for one request to the backend, from the relay or from web search. Must be at least `1`. |
 
 ## `[cache.<name>]`
 
@@ -557,16 +560,22 @@ the search it fronts.
 ## `[embeddings.<name>]`
 
 Optional. A named embeddings backend (`POST /v1/embeddings`, e.g. vLLM), served
-by the gateway at `/v1/embeddings` (default or `/{name}`).
+by the gateway at `/v1/embeddings`.
 
 | Key | Default | Meaning |
 |---|---|---|
 | `base_url` | — | Backend base URL (required), e.g. `http://host:8001/v1`. |
 | `model` | — | Model id the backend serves (required). |
-| `api_key_env` | — | Env var holding the API key, when the backend requires one. |
+| `api_key_env` | — | Env var holding the API key, when the backend requires one. Sent as a bearer token. The variable must be set and non-empty at startup. |
+| `timeout_ms` | `30000` | Deadline for one request to the backend. Must be at least `1`. |
 
-Serving: `GET /v1/models` advertises a truthful capability listing — chat
-routes plus `kind: embeddings` / `kind: rerank` / `kind: search` entries.
+Serving: `POST /v1/embeddings/{name}` and `POST /v1/rerank/{name}` pick a
+backend by name. Without the name the request goes to the only configured
+backend of that kind. When several are configured and no name is given, the
+gateway returns 400 and lists the names. `GET /v1/models` advertises a truthful
+capability listing — chat routes plus `kind: embeddings` / `kind: rerank` /
+`kind: search` entries. Embeddings and rerank entries carry the backend's
+`model`.
 
 See [Hosted Web Search](/operations/hosted_web_search/).
 

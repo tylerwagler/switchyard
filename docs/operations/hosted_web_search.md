@@ -48,9 +48,11 @@ exclusive with `search`).
 ## Re-ranking
 
 When `web_search.rerank` names a `[rerank.*]` backend, the bridge fetches a
-surplus of raw candidates (3× `max_results`) and re-ranks them against the query
-via the Cohere-shaped `POST /v1/rerank` endpoint (query vs `title\nsnippet`),
-returning the top `max_results` best-first. The re-ranker counters the noisy
+surplus of raw candidates (3× `max_results`, capped at the endpoint's
+`[search.*].max_results`) and re-ranks them against the query via the
+Cohere-shaped `POST /v1/rerank` endpoint (query vs `title\nsnippet`, with
+`top_n` set to the backend's `default_top_n`), returning the top `max_results`
+best-first. The re-ranker counters the noisy
 ordering scraped engines often produce. It is **fail-open**: if the rerank
 backend is unreachable or errors, results are returned in raw engine order and
 `switchyard.websearch_rerank_errors` increments — a reranker outage never fails
@@ -87,9 +89,11 @@ and synthesizes an Anthropic `message` response:
 - a short text block listing the cited results.
 
 Both aggregate and streaming (`SSE`) responses are supported. If the search
-fails or returns nothing, the bridge still returns a synthesized response with
-an empty result list and a notice — it never falls back to a model backend for
-a dedicated web-search request.
+returns nothing, the result list is empty and the text block says so. If the
+search fails, the `web_search_tool_result` block carries a
+`web_search_tool_result_error` with `error_code: "unavailable"`, and the text
+block names the error. Either way the bridge never falls back to a model
+backend for a dedicated web-search request.
 
 Synthetic searches are not model calls: they are excluded from `/v1/stats`
 per-model counters and surfaced instead as
@@ -106,8 +110,10 @@ localhost.
 ## Serving non-chat backends
 
 The named backends are also served by the gateway itself: `POST /v1/embeddings`
-and `POST /v1/rerank` (default = first configured backend, or a `/{name}` path
-segment) relay to the `[embeddings.*]` / `[rerank.*]` backends. `GET /v1/models`
+and `POST /v1/rerank` relay to the `[embeddings.*]` / `[rerank.*]` backends. A
+`/{name}` path segment picks a backend. Without it the request goes to the only
+configured backend of that kind. When several are configured and no name is
+given, the gateway returns 400 and lists the names. `GET /v1/models`
 advertises a truthful capability listing — chat routes plus `kind: embeddings` /
 `kind: rerank` / `kind: search` entries.
 

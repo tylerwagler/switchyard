@@ -37,8 +37,6 @@ use crate::ServerState;
 use crate::safeguards::{Answer, add_to_message, add_to_stream};
 use crate::sse::frame_stream;
 
-const DEFAULT_MODEL: &str = "claude-fable-5-1";
-
 /// Search-instruction sentence shapes the client prepends to the query.
 const QUERY_PREFIXES: &[&str] = &[
     "perform a web search for the query:",
@@ -171,15 +169,17 @@ async fn search(
     client: &reqwest::Client,
 ) -> Result<Vec<Value>, String> {
     // With a reranker, fetch a surplus of raw candidates and let it pick; without
-    // one, ask the engine for exactly what we return.
+    // one, ask the engine for exactly what we return. `[search.*].max_results`
+    // caps both.
     let requested = if settings.rerank.is_some() {
         settings
             .max_results
             .saturating_mul(CANDIDATES_PER_RESULT)
-            .clamp(1, 20)
+            .min(settings.max_candidates)
     } else {
-        settings.max_results.max(1)
-    };
+        settings.max_results
+    }
+    .max(1);
     if let Some(cache) = settings.cache.as_ref() {
         if let Some(hit) = cache_get(cache, query, requested).await {
             return Ok(hit);
@@ -273,14 +273,23 @@ async fn rerank(
         })
         .collect();
 
-    let payload = json!({ "model": rerank.model, "query": query, "documents": documents });
-    let response = match client
+    let payload = json!({
+        "model": rerank.model,
+        "query": query,
+        "documents": documents,
+        "top_n": rerank.top_n,
+    });
+    let mut request = client
         .post(format!("{}/rerank", rerank.base_url.trim_end_matches('/')))
         .json(&payload)
-        .timeout(std::time::Duration::from_secs(30))
-        .send()
-        .await
+        .timeout(rerank.timeout);
+    if let Some(key_env) = rerank.api_key_env.as_deref()
+        && let Ok(token) = std::env::var(key_env)
+        && !token.trim().is_empty()
     {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    let response = match request.send().await {
         Ok(response) => response,
         Err(error) => {
             record_rerank_error();
@@ -678,10 +687,13 @@ pub(crate) async fn maybe_short_circuit(
     // `state.web_search_config()` is only present when web search is resolved+enabled.
     let settings = state.web_search_config()?;
     let started = Instant::now();
+    // The response echoes the requested model. Anthropic Messages requires
+    // `model`, so a request without one is already malformed; an empty string
+    // is the honest echo and avoids inventing a model id.
     let model = body
         .get("model")
         .and_then(Value::as_str)
-        .unwrap_or(DEFAULT_MODEL)
+        .unwrap_or_default()
         .to_string();
     let query = extract_query(body);
     let content = match search(&query, settings, state.web_search_client()).await {

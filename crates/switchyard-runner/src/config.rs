@@ -185,7 +185,7 @@ pub struct SearchConfig {
     pub base_url: String,
     #[serde(default = "default_web_search_timeout_ms")]
     pub timeout_ms: u64,
-    /// Cap on raw candidates a consumer may request (feed for reranking).
+    /// Most raw candidates the web-search bridge requests per query.
     #[serde(default = "default_search_max_results")]
     pub max_results: usize,
 }
@@ -196,9 +196,16 @@ pub struct SearchConfig {
 pub struct RerankConfig {
     pub base_url: String,
     pub model: String,
-    /// Default top_n applied when a consumer does not specify one.
+    /// `top_n` the web-search bridge sends in its rerank request. The
+    /// `/v1/rerank` relay passes bodies through unchanged and does not add it.
     #[serde(default = "default_rerank_top_n")]
     pub default_top_n: usize,
+    /// Env var holding the API key, when the backend requires one.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Deadline for one request to this backend.
+    #[serde(default = "default_aux_timeout_ms")]
+    pub timeout_ms: u64,
 }
 
 /// A named embeddings backend (vLLM OpenAI-shaped `POST /v1/embeddings`).
@@ -210,6 +217,21 @@ pub struct EmbeddingsConfig {
     /// Env var holding the API key, when the backend requires one.
     #[serde(default)]
     pub api_key_env: Option<String>,
+    /// Deadline for one request to this backend.
+    #[serde(default = "default_aux_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl EmbeddingsConfig {
+    pub const fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.timeout_ms)
+    }
+}
+
+impl RerankConfig {
+    pub const fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.timeout_ms)
+    }
 }
 
 /// A named cache backend (Valkey or Redis, addressed as `redis://host:port[/db]`).
@@ -236,6 +258,8 @@ pub struct ResolvedWebSearch {
     pub timeout: std::time::Duration,
     /// Results returned to the client.
     pub max_results: usize,
+    /// Most raw candidates fetched from the search endpoint per query.
+    pub max_candidates: usize,
     pub rerank: Option<ResolvedRerank>,
     pub cache: Option<ResolvedCache>,
 }
@@ -253,6 +277,11 @@ pub struct ResolvedCache {
 pub struct ResolvedRerank {
     pub base_url: String,
     pub model: String,
+    /// `top_n` sent in the rerank request.
+    pub top_n: usize,
+    pub timeout: std::time::Duration,
+    /// Env var holding the API key, when the backend requires one.
+    pub api_key_env: Option<String>,
 }
 
 const fn default_cache_ttl_s() -> u64 {
@@ -287,6 +316,10 @@ const fn default_rerank_top_n() -> usize {
     6
 }
 
+const fn default_aux_timeout_ms() -> u64 {
+    30_000
+}
+
 /// Resolves `[web_search]` against the named `[search.*]` / `[rerank.*]` backends,
 /// validating cross-references and collapsing inline aliases into the effective
 /// settings the server surface consumes.
@@ -307,15 +340,21 @@ fn resolve_web_search(
             "web_search: set either `search` (named [search.*] endpoint) or `searxng_url` (inline), not both",
         ));
     }
-    let (search_url, timeout) = if let Some(name) = config.search() {
+    let (search_url, timeout, max_candidates) = if let Some(name) = config.search() {
         let entry = search.get(name).ok_or_else(|| {
             RunnerError::configuration(format!(
                 "web_search.search references unknown [search.{name}] endpoint"
             ))
         })?;
+        if config.timeout_ms().is_some() {
+            return Err(RunnerError::configuration(format!(
+                "web_search.timeout_ms is ignored when `search` is set; set [search.{name}].timeout_ms instead"
+            )));
+        }
         (
             entry.base_url.clone(),
             std::time::Duration::from_millis(entry.timeout_ms),
+            entry.max_results,
         )
     } else {
         let url = config
@@ -325,7 +364,11 @@ fn resolve_web_search(
         let ms = config
             .timeout_ms()
             .unwrap_or_else(default_web_search_timeout_ms);
-        (url, std::time::Duration::from_millis(ms))
+        (
+            url,
+            std::time::Duration::from_millis(ms),
+            default_search_max_results(),
+        )
     };
     reqwest::Url::parse(&search_url).map_err(|error| {
         RunnerError::configuration(format!("web_search endpoint is not a valid URL: {error}"))
@@ -336,6 +379,12 @@ fn resolve_web_search(
     if max_results == 0 || max_results > 20 {
         return Err(RunnerError::configuration(format!(
             "web_search.max_results must be between 1 and 20, got {max_results}"
+        )));
+    }
+    if max_results > max_candidates {
+        let name = config.search().unwrap_or_default();
+        return Err(RunnerError::configuration(format!(
+            "web_search.max_results ({max_results}) exceeds [search.{name}].max_results ({max_candidates})"
         )));
     }
     let resolved_rerank = config
@@ -349,6 +398,9 @@ fn resolve_web_search(
             Ok(ResolvedRerank {
                 base_url: entry.base_url.clone(),
                 model: entry.model.clone(),
+                top_n: entry.default_top_n,
+                timeout: entry.timeout(),
+                api_key_env: entry.api_key_env.clone(),
             })
         })
         .transpose()?;
@@ -380,13 +432,22 @@ fn resolve_web_search(
         search_url,
         timeout,
         max_results,
+        max_candidates,
         rerank: resolved_rerank,
         cache: resolved_cache,
     }))
 }
 
-/// Validates a named non-chat backend's reachable endpoint and model field.
-fn validate_aux_backend(kind: &str, name: &str, base_url: &str, model: &str) -> RunnerResult<()> {
+/// Validates a named non-chat backend's endpoint, model field, timeout, and
+/// API key variable. The key itself is read again per request.
+fn validate_aux_backend(
+    kind: &str,
+    name: &str,
+    base_url: &str,
+    model: &str,
+    timeout_ms: u64,
+    api_key_env: Option<&str>,
+) -> RunnerResult<()> {
     reqwest::Url::parse(base_url).map_err(|error| {
         RunnerError::configuration(format!(
             "[{kind}.{name}].base_url is not a valid URL: {error}"
@@ -396,6 +457,14 @@ fn validate_aux_backend(kind: &str, name: &str, base_url: &str, model: &str) -> 
         return Err(RunnerError::configuration(format!(
             "[{kind}.{name}].model must not be empty"
         )));
+    }
+    if timeout_ms == 0 {
+        return Err(RunnerError::configuration(format!(
+            "[{kind}.{name}].timeout_ms must be at least 1"
+        )));
+    }
+    if let Some(variable) = api_key_env {
+        read_api_key(&format!("[{kind}.{name}]"), variable)?;
     }
     Ok(())
 }
@@ -647,10 +716,24 @@ impl DeploymentConfig {
         let web_search =
             resolve_web_search(self.web_search, &self.search, &self.rerank, &self.cache)?;
         for (name, config) in &self.embeddings {
-            validate_aux_backend("embeddings", name, &config.base_url, &config.model)?;
+            validate_aux_backend(
+                "embeddings",
+                name,
+                &config.base_url,
+                &config.model,
+                config.timeout_ms,
+                config.api_key_env.as_deref(),
+            )?;
         }
         for (name, config) in &self.rerank {
-            validate_aux_backend("rerank", name, &config.base_url, &config.model)?;
+            validate_aux_backend(
+                "rerank",
+                name,
+                &config.base_url,
+                &config.model,
+                config.timeout_ms,
+                config.api_key_env.as_deref(),
+            )?;
         }
         for (name, config) in &self.search {
             reqwest::Url::parse(&config.base_url).map_err(|error| {
@@ -2709,18 +2792,86 @@ target = "t"
         let settings = runner.web_search().expect("web_search configured");
         assert_eq!(settings.search_url.as_str(), "http://search.lan:9999");
         assert_eq!(settings.timeout, std::time::Duration::from_millis(9000));
+        assert_eq!(settings.max_candidates, 30);
+    }
+
+    #[test]
+    fn web_search_rejects_inline_timeout_with_named_search() {
+        let toml = format!(
+            "{BASE}\n[search.main]\nbase_url = \"http://search.lan:9999\"\n\n[web_search]\nenabled = true\nsearch = \"main\"\ntimeout_ms = 2000\n"
+        );
+        let message = error_message(&toml);
+        assert!(message.contains("[search.main].timeout_ms"), "{message}");
+    }
+
+    #[test]
+    fn web_search_inline_endpoint_caps_candidates_at_twenty() {
+        let toml = format!("{BASE}\n[web_search]\nenabled = true\n");
+        let runner = runner_from_toml(&toml).expect("web_search parses");
+        assert_eq!(runner.web_search().expect("enabled").max_candidates, 20);
+    }
+
+    #[test]
+    fn web_search_rejects_max_results_above_the_search_cap() {
+        let toml = format!(
+            "{BASE}\n[search.main]\nbase_url = \"http://search.lan:9999\"\nmax_results = 4\n\n[web_search]\nenabled = true\nsearch = \"main\"\nmax_results = 5\n"
+        );
+        let message = error_message(&toml);
+        assert!(message.contains("[search.main].max_results"), "{message}");
     }
 
     #[test]
     fn web_search_resolves_named_rerank_backend() {
         let toml = format!(
-            "{BASE}\n[rerank.r]\nbase_url = \"http://rank.lan:8002/v1\"\nmodel = \"qwen3-vl-rerank\"\n\n[web_search]\nenabled = true\nrerank = \"r\"\n"
+            "{BASE}\n[rerank.r]\nbase_url = \"http://rank.lan:8002/v1\"\nmodel = \"qwen3-vl-rerank\"\ndefault_top_n = 4\n\n[web_search]\nenabled = true\nrerank = \"r\"\n"
         );
         let runner = runner_from_toml(&toml).expect("web_search with named rerank parses");
         let settings = runner.web_search().expect("web_search configured");
         let rerank = settings.rerank.as_ref().expect("rerank resolved");
         assert_eq!(rerank.base_url.as_str(), "http://rank.lan:8002/v1");
         assert_eq!(rerank.model.as_str(), "qwen3-vl-rerank");
+        assert_eq!(rerank.top_n, 4);
+        assert_eq!(rerank.timeout, std::time::Duration::from_millis(30_000));
+    }
+
+    #[test]
+    fn aux_api_key_env_must_be_set_at_load() {
+        let embeddings = format!(
+            "{BASE}\n[embeddings.e]\nbase_url = \"http://embed.lan:8001/v1\"\nmodel = \"m\"\napi_key_env = \"SWITCHYARD_AUX_TEST_KEY_NOT_SET\"\n"
+        );
+        let message = error_message(&embeddings);
+        assert!(message.contains("[embeddings.e]"), "{message}");
+        assert!(
+            message.contains("SWITCHYARD_AUX_TEST_KEY_NOT_SET"),
+            "{message}"
+        );
+
+        let rerank = format!(
+            "{BASE}\n[rerank.r]\nbase_url = \"http://rank.lan:8002/v1\"\nmodel = \"m\"\napi_key_env = \"SWITCHYARD_AUX_TEST_KEY_NOT_SET\"\n"
+        );
+        let message = error_message(&rerank);
+        assert!(message.contains("[rerank.r]"), "{message}");
+    }
+
+    #[test]
+    fn rerank_timeout_is_resolved_and_must_be_positive() {
+        let toml = format!(
+            "{BASE}\n[rerank.r]\nbase_url = \"http://rank.lan:8002/v1\"\nmodel = \"m\"\ntimeout_ms = 2500\n\n[web_search]\nenabled = true\nrerank = \"r\"\n"
+        );
+        let runner = runner_from_toml(&toml).expect("rerank timeout parses");
+        let rerank = runner
+            .web_search()
+            .expect("enabled")
+            .rerank
+            .as_ref()
+            .expect("rerank");
+        assert_eq!(rerank.timeout, std::time::Duration::from_millis(2500));
+
+        let zero = format!(
+            "{BASE}\n[embeddings.e]\nbase_url = \"http://embed.lan:8001/v1\"\nmodel = \"m\"\ntimeout_ms = 0\n"
+        );
+        let message = error_message(&zero);
+        assert!(message.contains("[embeddings.e].timeout_ms"), "{message}");
     }
 
     #[test]
@@ -2885,7 +3036,7 @@ model = "qwen3-vl-embed"
 [embeddings.e2]
 base_url = "http://embed2.lan:8001/v1"
 model = "qwen3-vl-embed-2"
-api_key_env = "EMBED_KEY"
+api_key_env = "SWITCHYARD_AUX_TEST_EMBED_KEY"
 
 [rerank.r1]
 base_url = "http://rerank.lan:8002/v1"
@@ -2895,15 +3046,27 @@ model = "qwen3-vl-rerank"
 base_url = "http://search.lan:8080"
 "#;
 
+    /// `api_key_env` is checked at load, so the fixture's variable must exist.
+    fn set_embed_key() {
+        unsafe {
+            // "unsafe" is for concurrent reads and writes, very rare
+            std::env::set_var("SWITCHYARD_AUX_TEST_EMBED_KEY", "embed-token");
+        }
+    }
+
     #[test]
     fn aux_backends_parse_and_are_exposed() {
+        set_embed_key();
         let runner = runner_from_toml(AUX).expect("aux config parses");
         let e1 = runner.embeddings().get("e1").expect("e1 configured");
         assert_eq!(e1.base_url.as_str(), "http://embed.lan:8001/v1");
         assert_eq!(e1.model.as_str(), "qwen3-vl-embed");
         assert!(e1.api_key_env.is_none());
         let e2 = runner.embeddings().get("e2").expect("e2 configured");
-        assert_eq!(e2.api_key_env.as_deref(), Some("EMBED_KEY"));
+        assert_eq!(
+            e2.api_key_env.as_deref(),
+            Some("SWITCHYARD_AUX_TEST_EMBED_KEY")
+        );
         let r1 = runner.rerank().get("r1").expect("r1 configured");
         assert_eq!(r1.model.as_str(), "qwen3-vl-rerank");
         let s1 = runner.search().get("s1").expect("s1 configured");
@@ -2931,6 +3094,7 @@ base_url = "http://search.lan:8080"
 
     #[test]
     fn rerank_reject_malformed_url() {
+        set_embed_key();
         let toml = AUX.replace("\"http://rerank.lan:8002/v1\"", "\"not a url\"");
         assert!(error_message(&toml).contains("[rerank.r1].base_url"));
     }

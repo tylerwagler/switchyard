@@ -2,12 +2,14 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Transparent relay for non-chat backends: `/v1/embeddings` and `/v1/rerank`
-//! proxy to the configured `[embeddings.*]` / `[rerank.*]` backends. The default
-//! route picks the first configured backend; an optional `/{name}` path segment
-//! selects a named one. Bodies pass through as-is — these are OpenAI/Cohere-
+//! proxy to the configured `[embeddings.*]` / `[rerank.*]` backends. An optional
+//! `/{name}` path segment selects a named backend. Without it the request goes
+//! to the only configured backend of that kind; with several configured the
+//! caller must name one. Bodies pass through as-is — these are OpenAI/Cohere-
 //! shaped non-chat calls, not chat translation.
 
-use std::time::Instant;
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
 
 use axum::Json;
 use axum::body::{Body, Bytes};
@@ -64,40 +66,41 @@ pub(crate) async fn rerank_named(
     relay_kind(&state, "rerank", RERANK_PATH, Some(&name), &headers, body).await
 }
 
-/// Picks a named backend, or the first configured when no name is given.
-fn pick_embeddings(
-    state: &ServerState,
+/// Picks the named backend, or the only one when no name is given. The error is
+/// the status and message for the caller.
+fn pick<'a, T>(
+    kind: &str,
+    backends: &'a BTreeMap<String, T>,
     name: Option<&str>,
-) -> Option<(String, String, Option<String>)> {
-    match name {
-        Some(name) => state.embeddings().get(name).map(|config| {
-            (
-                name.to_string(),
-                config.base_url.clone(),
-                config.api_key_env.clone(),
-            )
-        }),
-        None => state.embeddings().iter().next().map(|(name, config)| {
-            (
-                name.clone(),
-                config.base_url.clone(),
-                config.api_key_env.clone(),
-            )
-        }),
+) -> Result<(&'a str, &'a T), (StatusCode, String)> {
+    if let Some(name) = name {
+        return backends
+            .get_key_value(name)
+            .map(|(name, config)| (name.as_str(), config))
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    format!("no {kind} backend named {name} is configured"),
+                )
+            });
     }
-}
-
-fn pick_rerank(state: &ServerState, name: Option<&str>) -> Option<(String, String)> {
-    match name {
-        Some(name) => state
-            .rerank()
-            .get(name)
-            .map(|config| (name.to_string(), config.base_url.clone())),
-        None => state
-            .rerank()
-            .iter()
-            .next()
-            .map(|(name, config)| (name.clone(), config.base_url.clone())),
+    let mut iter = backends.iter();
+    match (iter.next(), iter.next()) {
+        (None, _) => Err((
+            StatusCode::NOT_FOUND,
+            format!("no {kind} backend is configured"),
+        )),
+        (Some((name, config)), None) => Ok((name.as_str(), config)),
+        (Some(_), Some(_)) => {
+            let names: Vec<&str> = backends.keys().map(String::as_str).collect();
+            Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "several {kind} backends are configured; choose one with POST /v1/{kind}/{{name}}: {}",
+                    names.join(", ")
+                ),
+            ))
+        }
     }
 }
 
@@ -109,14 +112,24 @@ async fn relay_kind(
     headers: &HeaderMap,
     body: Bytes,
 ) -> Response {
-    let (selected_name, base_url, api_key_env) = match kind {
-        "embeddings" => match pick_embeddings(state, name) {
-            Some(selected) => selected,
-            None => return missing_backend(kind, name),
+    let (selected_name, base_url, api_key_env, timeout) = match kind {
+        "embeddings" => match pick(kind, state.embeddings(), name) {
+            Ok((name, config)) => (
+                name,
+                config.base_url.as_str(),
+                config.api_key_env.as_deref(),
+                config.timeout(),
+            ),
+            Err((status, message)) => return json_error(status, message),
         },
-        "rerank" => match pick_rerank(state, name) {
-            Some((selected_name, base_url)) => (selected_name, base_url, None),
-            None => return missing_backend(kind, name),
+        "rerank" => match pick(kind, state.rerank(), name) {
+            Ok((name, config)) => (
+                name,
+                config.base_url.as_str(),
+                config.api_key_env.as_deref(),
+                config.timeout(),
+            ),
+            Err((status, message)) => return json_error(status, message),
         },
         _ => unreachable!("relay kind is fixed at the call site"),
     };
@@ -124,16 +137,17 @@ async fn relay_kind(
     let started = Instant::now();
     match relay_request(
         state.http_client(),
-        &base_url,
+        base_url,
         path,
-        api_key_env.as_deref(),
+        api_key_env,
+        timeout,
         headers,
         body,
     )
     .await
     {
         Ok((status, content_type, bytes)) => {
-            record(kind, &selected_name, "ok", started);
+            record(kind, selected_name, "ok", started);
             let mut builder = Response::builder().status(status);
             if let Some(content_type) = content_type {
                 builder = builder.header("content-type", content_type);
@@ -144,7 +158,7 @@ async fn relay_kind(
         }
         Err(error) => {
             tracing::warn!(kind, %error, "aux relay failed");
-            record(kind, &selected_name, "error", started);
+            record(kind, selected_name, "error", started);
             json_error(
                 StatusCode::BAD_GATEWAY,
                 format!("{kind} relay to {selected_name} failed: {error}"),
@@ -158,11 +172,12 @@ async fn relay_request(
     base_url: &str,
     path: &str,
     api_key_env: Option<&str>,
+    timeout: Duration,
     headers: &HeaderMap,
     body: Bytes,
 ) -> Result<(StatusCode, Option<String>, Bytes), String> {
     let url = format!("{}{}", base_url.trim_end_matches('/'), path);
-    let mut request = client.post(&url).body(body);
+    let mut request = client.post(&url).timeout(timeout).body(body);
     if let Some(content_type) = headers
         .get("content-type")
         .and_then(|value| value.to_str().ok())
@@ -197,6 +212,7 @@ pub(crate) fn capability_entries(state: &ServerState) -> Vec<Value> {
             "type": "model",
             "kind": "embeddings",
             "served_by": config.base_url,
+            "model": config.model,
             "created": 0,
             "owned_by": "switchyard",
             "display_name": name,
@@ -231,14 +247,6 @@ pub(crate) fn capability_entries(state: &ServerState) -> Vec<Value> {
         }));
     }
     entries
-}
-
-fn missing_backend(kind: &str, name: Option<&str>) -> Response {
-    let message = match name {
-        Some(name) => format!("no {kind} backend named {name} is configured"),
-        None => format!("no {kind} backend is configured"),
-    };
-    json_error(StatusCode::NOT_FOUND, message)
 }
 
 fn json_error(status: StatusCode, message: String) -> Response {

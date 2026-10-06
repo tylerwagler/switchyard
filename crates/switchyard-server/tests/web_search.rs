@@ -150,6 +150,7 @@ fn deployment_with_rerank(
     search: &str,
     rerank_url: &str,
     max_results: usize,
+    max_candidates: usize,
 ) -> String {
     format!(
         r#"
@@ -170,6 +171,7 @@ target = "main"
 
 [search.main]
 base_url = "{search}"
+max_results = {max_candidates}
 
 [rerank.r]
 base_url = "{rerank_url}"
@@ -425,11 +427,16 @@ async fn web_search_reranks_candidates_best_first() -> TestResult {
         &search.base_url,
         &rerank.base_url,
         3,
+        20,
     ))?)?;
     let app = build_switchyard_router(state);
 
     let response = send(&app, "POST", "/v1/messages", Some(web_search_body())).await?;
     assert_eq!(response.status, StatusCode::OK);
+    // The rerank request carries the backend's default_top_n (6 when unset).
+    let sent = rerank.bodies().await;
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["top_n"], 6);
     let body: Value = serde_json::from_slice(&response.bytes)?;
     let urls: Vec<&str> = body["content"][1]["content"]
         .as_array()
@@ -465,6 +472,7 @@ async fn web_search_falls_back_to_raw_order_when_reranker_down() -> TestResult {
         &search.base_url,
         &rerank.base_url,
         2,
+        20,
     ))?)?;
     let app = build_switchyard_router(state);
 
@@ -477,23 +485,57 @@ async fn web_search_falls_back_to_raw_order_when_reranker_down() -> TestResult {
     Ok(())
 }
 
+#[tokio::test]
+async fn web_search_caps_candidates_at_the_search_endpoint_limit() -> TestResult {
+    let search = SearxngStub::start(
+        vec![
+            json!({"url":"https://example.com/a","title":"A","content":"a"}),
+            json!({"url":"https://example.com/b","title":"B","content":"b"}),
+            json!({"url":"https://example.com/c","title":"C","content":"c"}),
+        ],
+        0,
+    )
+    .await?;
+    let rerank = RerankStub::start(vec![(0, 0.5), (1, 0.4)], false).await?;
+    let upstream = UpstreamApp::start().await?;
+    // max_results 2 would normally fetch 6 candidates; [search.main] caps it at 2.
+    let state = ServerState::from_runner(Runner::from_toml(&deployment_with_rerank(
+        &upstream.base_url,
+        &search.base_url,
+        &rerank.base_url,
+        2,
+        2,
+    ))?)?;
+    let app = build_switchyard_router(state);
+
+    let response = send(&app, "POST", "/v1/messages", Some(web_search_body())).await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let sent = rerank.bodies().await;
+    assert_eq!(sent[0]["documents"].as_array().unwrap().len(), 2);
+    Ok(())
+}
+
 // --- rerank stub -----------------------------------------------------------------
 
 struct RerankStub {
     base_url: String,
+    received: Arc<Mutex<Vec<Value>>>,
     task: tokio::task::JoinHandle<()>,
 }
 
 #[derive(Clone)]
 struct RerankState {
     scores: Arc<Mutex<Vec<(usize, f64)>>>,
+    received: Arc<Mutex<Vec<Value>>>,
     error: bool,
 }
 
 impl RerankStub {
     async fn start(scores: Vec<(usize, f64)>, error: bool) -> TestResult<Self> {
+        let received = Arc::new(Mutex::new(Vec::new()));
         let state = RerankState {
             scores: Arc::new(Mutex::new(scores)),
+            received: Arc::clone(&received),
             error,
         };
         let app = Router::new()
@@ -506,8 +548,13 @@ impl RerankStub {
         });
         Ok(Self {
             base_url: format!("http://{addr}"),
+            received,
             task,
         })
+    }
+
+    async fn bodies(&self) -> Vec<Value> {
+        self.received.lock().unwrap().clone()
     }
 }
 
@@ -519,8 +566,9 @@ impl Drop for RerankStub {
 
 async fn rerank_handler(
     State(state): State<RerankState>,
-    Json(_body): Json<Value>,
+    Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    state.received.lock().unwrap().push(body);
     if state.error {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
