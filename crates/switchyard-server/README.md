@@ -277,8 +277,8 @@ hand, then restart the server.
 | `POST` | `/v1/responses/input_tokens` | Token count from a route's OpenAI Responses target |
 | `POST` | `/v1/responses/compact` | Compaction through a route's OpenAI Responses target |
 | `ANY` | Any unmatched path | Raw forward through the optional `fallback_client` |
-| `POST` | `/v1/embeddings`, `/v1/embeddings/{name}` | Relay to the first configured or the named `[embeddings.*]` backend |
-| `POST` | `/v1/rerank`, `/v1/rerank/{name}` | Relay to the first configured or the named `[rerank.*]` backend |
+| `POST` | `/v1/embeddings`, `/v1/embeddings/{name}` | Relay to the named `[embeddings.*]` backend, or the only one when just one is configured |
+| `POST` | `/v1/rerank`, `/v1/rerank/{name}` | Relay to the named `[rerank.*]` backend, or the only one when just one is configured |
 | `GET` | `/v1/models` | Routes served by this deployment, plus embeddings, rerank, and search backends |
 | `GET` | `/v1/models?available=true` | Only the routes with at least one upstream accepting connections right now |
 | `GET` | `/v1/stats` | Per-model usage plus curated algorithm stats |
