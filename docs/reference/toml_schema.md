@@ -534,6 +534,7 @@ API (e.g. vLLM). Served by the gateway at `/v1/rerank` and usable from
 | `base_url` | — | Backend base URL (required), e.g. `http://host:8002/v1`. |
 | `model` | — | Model id the backend serves (required). |
 | `default_top_n` | `6` | `top_n` that web search sends in its rerank request. Set it at or above `web_search.max_results`. The `/v1/rerank` relay passes bodies through unchanged and does not add it. |
+| `api_key_env` | — | Env var holding the API key, when the backend requires one. Sent as a bearer token by the relay and by web search. The variable must be set and non-empty at startup. |
 | `timeout_ms` | `30000` | Deadline for one request to the backend, from the relay or from web search. Must be at least `1`. |
 
 ## `[cache.<name>]`
@@ -560,7 +561,7 @@ by the gateway at `/v1/embeddings`.
 |---|---|---|
 | `base_url` | — | Backend base URL (required), e.g. `http://host:8001/v1`. |
 | `model` | — | Model id the backend serves (required). |
-| `api_key_env` | — | Env var holding the API key, when the backend requires one. |
+| `api_key_env` | — | Env var holding the API key, when the backend requires one. Sent as a bearer token. The variable must be set and non-empty at startup. |
 | `timeout_ms` | `30000` | Deadline for one request to the backend. Must be at least `1`. |
 
 Serving: `POST /v1/embeddings/{name}` and `POST /v1/rerank/{name}` pick a

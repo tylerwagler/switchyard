@@ -123,7 +123,12 @@ async fn relay_kind(
             Err((status, message)) => return json_error(status, message),
         },
         "rerank" => match pick(kind, state.rerank(), name) {
-            Ok((name, config)) => (name, config.base_url.as_str(), None, config.timeout()),
+            Ok((name, config)) => (
+                name,
+                config.base_url.as_str(),
+                config.api_key_env.as_deref(),
+                config.timeout(),
+            ),
             Err((status, message)) => return json_error(status, message),
         },
         _ => unreachable!("relay kind is fixed at the call site"),

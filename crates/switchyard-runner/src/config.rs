@@ -200,6 +200,9 @@ pub struct RerankConfig {
     /// `/v1/rerank` relay passes bodies through unchanged and does not add it.
     #[serde(default = "default_rerank_top_n")]
     pub default_top_n: usize,
+    /// Env var holding the API key, when the backend requires one.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
     /// Deadline for one request to this backend.
     #[serde(default = "default_aux_timeout_ms")]
     pub timeout_ms: u64,
@@ -277,6 +280,8 @@ pub struct ResolvedRerank {
     /// `top_n` sent in the rerank request.
     pub top_n: usize,
     pub timeout: std::time::Duration,
+    /// Env var holding the API key, when the backend requires one.
+    pub api_key_env: Option<String>,
 }
 
 const fn default_cache_ttl_s() -> u64 {
@@ -390,6 +395,7 @@ fn resolve_web_search(
                 model: entry.model.clone(),
                 top_n: entry.default_top_n,
                 timeout: entry.timeout(),
+                api_key_env: entry.api_key_env.clone(),
             })
         })
         .transpose()?;
@@ -427,13 +433,15 @@ fn resolve_web_search(
     }))
 }
 
-/// Validates a named non-chat backend's endpoint, model field, and timeout.
+/// Validates a named non-chat backend's endpoint, model field, timeout, and
+/// API key variable. The key itself is read again per request.
 fn validate_aux_backend(
     kind: &str,
     name: &str,
     base_url: &str,
     model: &str,
     timeout_ms: u64,
+    api_key_env: Option<&str>,
 ) -> RunnerResult<()> {
     reqwest::Url::parse(base_url).map_err(|error| {
         RunnerError::configuration(format!(
@@ -449,6 +457,9 @@ fn validate_aux_backend(
         return Err(RunnerError::configuration(format!(
             "[{kind}.{name}].timeout_ms must be at least 1"
         )));
+    }
+    if let Some(variable) = api_key_env {
+        read_api_key(&format!("[{kind}.{name}]"), variable)?;
     }
     Ok(())
 }
@@ -706,6 +717,7 @@ impl DeploymentConfig {
                 &config.base_url,
                 &config.model,
                 config.timeout_ms,
+                config.api_key_env.as_deref(),
             )?;
         }
         for (name, config) in &self.rerank {
@@ -715,6 +727,7 @@ impl DeploymentConfig {
                 &config.base_url,
                 &config.model,
                 config.timeout_ms,
+                config.api_key_env.as_deref(),
             )?;
         }
         for (name, config) in &self.search {
@@ -2807,6 +2820,25 @@ target = "t"
     }
 
     #[test]
+    fn aux_api_key_env_must_be_set_at_load() {
+        let embeddings = format!(
+            "{BASE}\n[embeddings.e]\nbase_url = \"http://embed.lan:8001/v1\"\nmodel = \"m\"\napi_key_env = \"SWITCHYARD_AUX_TEST_KEY_NOT_SET\"\n"
+        );
+        let message = error_message(&embeddings);
+        assert!(message.contains("[embeddings.e]"), "{message}");
+        assert!(
+            message.contains("SWITCHYARD_AUX_TEST_KEY_NOT_SET"),
+            "{message}"
+        );
+
+        let rerank = format!(
+            "{BASE}\n[rerank.r]\nbase_url = \"http://rank.lan:8002/v1\"\nmodel = \"m\"\napi_key_env = \"SWITCHYARD_AUX_TEST_KEY_NOT_SET\"\n"
+        );
+        let message = error_message(&rerank);
+        assert!(message.contains("[rerank.r]"), "{message}");
+    }
+
+    #[test]
     fn rerank_timeout_is_resolved_and_must_be_positive() {
         let toml = format!(
             "{BASE}\n[rerank.r]\nbase_url = \"http://rank.lan:8002/v1\"\nmodel = \"m\"\ntimeout_ms = 2500\n\n[web_search]\nenabled = true\nrerank = \"r\"\n"
@@ -2989,7 +3021,7 @@ model = "qwen3-vl-embed"
 [embeddings.e2]
 base_url = "http://embed2.lan:8001/v1"
 model = "qwen3-vl-embed-2"
-api_key_env = "EMBED_KEY"
+api_key_env = "SWITCHYARD_AUX_TEST_EMBED_KEY"
 
 [rerank.r1]
 base_url = "http://rerank.lan:8002/v1"
@@ -2999,15 +3031,27 @@ model = "qwen3-vl-rerank"
 base_url = "http://search.lan:8080"
 "#;
 
+    /// `api_key_env` is checked at load, so the fixture's variable must exist.
+    fn set_embed_key() {
+        unsafe {
+            // "unsafe" is for concurrent reads and writes, very rare
+            std::env::set_var("SWITCHYARD_AUX_TEST_EMBED_KEY", "embed-token");
+        }
+    }
+
     #[test]
     fn aux_backends_parse_and_are_exposed() {
+        set_embed_key();
         let runner = runner_from_toml(AUX).expect("aux config parses");
         let e1 = runner.embeddings().get("e1").expect("e1 configured");
         assert_eq!(e1.base_url.as_str(), "http://embed.lan:8001/v1");
         assert_eq!(e1.model.as_str(), "qwen3-vl-embed");
         assert!(e1.api_key_env.is_none());
         let e2 = runner.embeddings().get("e2").expect("e2 configured");
-        assert_eq!(e2.api_key_env.as_deref(), Some("EMBED_KEY"));
+        assert_eq!(
+            e2.api_key_env.as_deref(),
+            Some("SWITCHYARD_AUX_TEST_EMBED_KEY")
+        );
         let r1 = runner.rerank().get("r1").expect("r1 configured");
         assert_eq!(r1.model.as_str(), "qwen3-vl-rerank");
         let s1 = runner.search().get("s1").expect("s1 configured");
@@ -3035,6 +3079,7 @@ base_url = "http://search.lan:8080"
 
     #[test]
     fn rerank_reject_malformed_url() {
+        set_embed_key();
         let toml = AUX.replace("\"http://rerank.lan:8002/v1\"", "\"not a url\"");
         assert!(error_message(&toml).contains("[rerank.r1].base_url"));
     }

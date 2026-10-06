@@ -281,13 +281,17 @@ async fn rerank(
         "documents": documents,
         "top_n": rerank.top_n,
     });
-    let response = match client
+    let mut request = client
         .post(format!("{}/rerank", rerank.base_url.trim_end_matches('/')))
         .json(&payload)
-        .timeout(rerank.timeout)
-        .send()
-        .await
+        .timeout(rerank.timeout);
+    if let Some(key_env) = rerank.api_key_env.as_deref()
+        && let Ok(token) = std::env::var(key_env)
+        && !token.trim().is_empty()
     {
+        request = request.header("authorization", format!("Bearer {token}"));
+    }
+    let response = match request.send().await {
         Ok(response) => response,
         Err(error) => {
             record_rerank_error();

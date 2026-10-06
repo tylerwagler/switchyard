@@ -12,7 +12,7 @@ use axum::Json;
 use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{Request as HttpRequest, StatusCode};
+use axum::http::{HeaderMap, Request as HttpRequest, StatusCode};
 use axum::routing::post;
 use http_body_util::BodyExt;
 use serde_json::{Value, json};
@@ -73,12 +73,16 @@ impl Drop for EchoStub {
 
 async fn echo_handler(
     State(state): State<EchoState>,
+    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
     state.received.lock().unwrap().push(body.clone());
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok());
     (
         StatusCode::OK,
-        Json(json!({ "echo_id": state.id, "got": body })),
+        Json(json!({ "echo_id": state.id, "got": body, "authorization": authorization })),
     )
 }
 
@@ -288,6 +292,47 @@ timeout_ms = 100
     task.abort();
     assert_eq!(response.status, StatusCode::BAD_GATEWAY);
     assert!(started.elapsed() < Duration::from_secs(2));
+    Ok(())
+}
+
+#[tokio::test]
+async fn rerank_relay_sends_the_configured_api_key() -> TestResult {
+    const KEY_ENV: &str = "SWITCHYARD_AUX_TEST_RERANK_KEY";
+    unsafe {
+        // "unsafe" is for concurrent reads and writes, very rare
+        std::env::set_var(KEY_ENV, "secret-token");
+    }
+    let r = EchoStub::start("r", "/rerank").await?;
+    let toml = format!(
+        r#"
+schema_version = 1
+
+[llm_clients.upstream]
+format = "anthropic_messages"
+base_url = "https://upstream.test"
+
+[targets.main]
+id = "test/main"
+llm_client = "upstream"
+
+[routes.main]
+id = "test/main"
+type = "passthrough"
+target = "main"
+
+[rerank.secured]
+base_url = "{}"
+model = "r"
+api_key_env = "{KEY_ENV}"
+"#,
+        r.base_url
+    );
+    let app = build_switchyard_router(ServerState::from_runner(Runner::from_toml(&toml)?)?);
+
+    let response = send(&app, "POST", "/v1/rerank", Some(json!({ "query": "q" }))).await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let result: Value = serde_json::from_slice(&response.bytes)?;
+    assert_eq!(result["authorization"], "Bearer secret-token");
     Ok(())
 }
 
