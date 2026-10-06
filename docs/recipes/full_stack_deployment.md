@@ -34,11 +34,11 @@ model inference itself.
 
 ## 1. Install
 
-Build from the fork's `dev` branch. The release on crates.io does not include
-the fork's features.
+Build from the fork's `main` branch, which holds its tested releases. The
+release on crates.io does not include the fork's features.
 
 ```bash
-git clone -b dev https://github.com/tylerwagler/switchyard.git
+git clone https://github.com/tylerwagler/switchyard.git
 cd switchyard
 cargo install --locked --path crates/switchyard-server
 cargo build --release -p switchyard-gate   # only if you want auth and quotas
