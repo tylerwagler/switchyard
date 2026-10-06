@@ -38,6 +38,11 @@ struct Args {
     #[arg(long, default_value_t = humantime::Duration::from(DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT))]
     shutdown_timeout: humantime::Duration,
 
+    /// Check the config and print the served models, then exit without connecting to
+    /// Postgres or Valkey.
+    #[arg(long)]
+    dry_run: bool,
+
     /// Portal Postgres URL for the `switchyard_gate` role.
     #[arg(long, env = "GATE_DATABASE_URL", hide_env_values = true)]
     database_url: String,
@@ -66,6 +71,18 @@ async fn main() -> ExitCode {
 
 async fn run(args: Args) -> Result<(), String> {
     let state = load_server_state(&args.config).map_err(|e| e.to_string())?;
+    let options = ServerRunOptions {
+        addr: SocketAddr::new(args.host, args.port),
+        backlog: DEFAULT_LISTEN_BACKLOG,
+        dry_run: args.dry_run,
+        shutdown_timeout: args.shutdown_timeout.into(),
+        tls: None,
+    };
+    if args.dry_run {
+        return run_server_with(state, options, |router| router)
+            .await
+            .map_err(|e| e.to_string());
+    }
     let client =
         redis::Client::open(args.valkey_url).map_err(|e| format!("invalid valkey url: {e}"))?;
     let valkey = redis::aio::ConnectionManager::new(client)
@@ -75,13 +92,6 @@ async fn run(args: Args) -> Result<(), String> {
         keys: KeyStore::new(args.database_url),
         valkey,
     });
-    let options = ServerRunOptions {
-        addr: SocketAddr::new(args.host, args.port),
-        backlog: DEFAULT_LISTEN_BACKLOG,
-        dry_run: false,
-        shutdown_timeout: args.shutdown_timeout.into(),
-        tls: None,
-    };
     run_server_with(state, options, |router| layer(router, gate))
         .await
         .map_err(|e| e.to_string())

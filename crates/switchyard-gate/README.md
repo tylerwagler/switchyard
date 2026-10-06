@@ -22,6 +22,7 @@ switchyard-gate --config switchyard.toml --port 4000
 | `--shutdown-timeout DUR` | | server default | How long active requests may finish after shutdown starts. |
 | `--database-url URL` | `GATE_DATABASE_URL` | required | Postgres URL for the `switchyard_gate` role. |
 | `--valkey-url URL` | `GATE_VALKEY_URL` | required | Valkey URL for counters and the usage stream. |
+| `--dry-run` | | off | Check the config, print the served models, and exit. Does not connect to Postgres or Valkey. |
 
 ## How a client authenticates
 
