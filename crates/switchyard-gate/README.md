@@ -135,4 +135,5 @@ bodies.
 - There are no TLS flags. Terminate TLS in front of the gate.
 - The Postgres connection uses `NoTls`. Keep the database on a private network.
 - Embeddings, rerank and web-search calls need a key but are not metered.
-- The root `Dockerfile` builds only `switchyard-server`. Build the gate from source.
+- The root `Dockerfile` image carries both binaries but starts `switchyard-server`. Pass
+  `--entrypoint switchyard-gate` to `docker run` to start the gate instead.

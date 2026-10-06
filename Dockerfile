@@ -11,7 +11,7 @@ COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
 COPY .cargo ./.cargo
 COPY crates ./crates
 
-RUN cargo build --locked --release -p switchyard-server
+RUN cargo build --locked --release -p switchyard-server -p switchyard-gate
 
 FROM debian:bookworm-slim
 
@@ -21,11 +21,13 @@ RUN apt-get update \
 
 COPY --from=builder \
     /opt/switchyard/target/release/switchyard-server \
-    /usr/local/bin/switchyard-server
+    /opt/switchyard/target/release/switchyard-gate \
+    /usr/local/bin/
 
 ENV HOME=/tmp
 
 USER 1000:1000
 EXPOSE 4000
 
+# To run the gate instead: docker run ... --entrypoint switchyard-gate IMAGE --config ...
 ENTRYPOINT ["switchyard-server"]
