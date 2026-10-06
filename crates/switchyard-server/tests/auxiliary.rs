@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 //! Integration coverage for the non-chat relay: `/v1/embeddings` + `/v1/rerank`
-//! proxy to configured backends (default/named), and `/v1/models` advertises the
+//! proxy to configured backends (the only one, or a named one), and `/v1/models` advertises the
 //! embed/rerank/search capabilities.
 
 use std::sync::Arc;
@@ -158,7 +158,7 @@ async fn started(
 // --- tests -------------------------------------------------------------------
 
 #[tokio::test]
-async fn embeddings_default_relays_to_first_backend() -> TestResult {
+async fn embeddings_default_is_ambiguous_with_two_backends() -> TestResult {
     let a = EchoStub::start("a", "/embeddings").await?;
     let b = EchoStub::start("b", "/embeddings").await?;
     let r = EchoStub::start("r", "/rerank").await?;
@@ -166,11 +166,13 @@ async fn embeddings_default_relays_to_first_backend() -> TestResult {
     let app = started(&a, &b, &r, &s).await?;
 
     let body = json!({ "input": ["hello world"], "model": "m-a" });
-    let response = send(&app, "POST", "/v1/embeddings", Some(body.clone())).await?;
-    assert_eq!(response.status, StatusCode::OK);
+    let response = send(&app, "POST", "/v1/embeddings", Some(body)).await?;
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
     let result: Value = serde_json::from_slice(&response.bytes)?;
-    assert_eq!(result["echo_id"], "a");
-    assert_eq!(a.bodies().await, vec![body]);
+    let message = result["error"]["message"].as_str().unwrap();
+    assert!(message.contains("e_a"), "{message}");
+    assert!(message.contains("e_b"), "{message}");
+    assert!(a.bodies().await.is_empty());
     assert!(b.bodies().await.is_empty());
     Ok(())
 }
@@ -224,7 +226,7 @@ async fn embeddings_unknown_name_is_404() -> TestResult {
 }
 
 #[tokio::test]
-async fn rerank_default_relays_the_body() -> TestResult {
+async fn rerank_default_relays_to_the_only_backend() -> TestResult {
     let a = EchoStub::start("a", "/embeddings").await?;
     let b = EchoStub::start("b", "/embeddings").await?;
     let r = EchoStub::start("r", "/rerank").await?;

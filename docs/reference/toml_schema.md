@@ -525,8 +525,8 @@ Optional. A named search endpoint, typically a self-hosted SearXNG instance.
 ## `[rerank.<name>]`
 
 Optional. A named rerank backend exposing the Cohere-shaped `POST /v1/rerank`
-API (e.g. vLLM). Served by the gateway at `/v1/rerank` (default or `/{name}`)
-and usable from `web_search.rerank`.
+API (e.g. vLLM). Served by the gateway at `/v1/rerank` and usable from
+`web_search.rerank`.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -552,7 +552,7 @@ the search it fronts.
 ## `[embeddings.<name>]`
 
 Optional. A named embeddings backend (`POST /v1/embeddings`, e.g. vLLM), served
-by the gateway at `/v1/embeddings` (default or `/{name}`).
+by the gateway at `/v1/embeddings`.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -560,8 +560,12 @@ by the gateway at `/v1/embeddings` (default or `/{name}`).
 | `model` | — | Model id the backend serves (required). |
 | `api_key_env` | — | Env var holding the API key, when the backend requires one. |
 
-Serving: `GET /v1/models` advertises a truthful capability listing — chat
-routes plus `kind: embeddings` / `kind: rerank` / `kind: search` entries.
+Serving: `POST /v1/embeddings/{name}` and `POST /v1/rerank/{name}` pick a
+backend by name. Without the name the request goes to the only configured
+backend of that kind. When several are configured and no name is given, the
+gateway returns 400 and lists the names. `GET /v1/models` advertises a truthful
+capability listing — chat routes plus `kind: embeddings` / `kind: rerank` /
+`kind: search` entries.
 
 See [Hosted Web Search](/operations/hosted_web_search/).
 

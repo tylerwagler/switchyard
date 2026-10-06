@@ -106,8 +106,10 @@ localhost.
 ## Serving non-chat backends
 
 The named backends are also served by the gateway itself: `POST /v1/embeddings`
-and `POST /v1/rerank` (default = first configured backend, or a `/{name}` path
-segment) relay to the `[embeddings.*]` / `[rerank.*]` backends. `GET /v1/models`
+and `POST /v1/rerank` relay to the `[embeddings.*]` / `[rerank.*]` backends. A
+`/{name}` path segment picks a backend. Without it the request goes to the only
+configured backend of that kind. When several are configured and no name is
+given, the gateway returns 400 and lists the names. `GET /v1/models`
 advertises a truthful capability listing — chat routes plus `kind: embeddings` /
 `kind: rerank` / `kind: search` entries.
 
