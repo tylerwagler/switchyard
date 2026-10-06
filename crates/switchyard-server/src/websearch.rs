@@ -171,15 +171,17 @@ async fn search(
     client: &reqwest::Client,
 ) -> Result<Vec<Value>, String> {
     // With a reranker, fetch a surplus of raw candidates and let it pick; without
-    // one, ask the engine for exactly what we return.
+    // one, ask the engine for exactly what we return. `[search.*].max_results`
+    // caps both.
     let requested = if settings.rerank.is_some() {
         settings
             .max_results
             .saturating_mul(CANDIDATES_PER_RESULT)
-            .clamp(1, 20)
+            .min(settings.max_candidates)
     } else {
-        settings.max_results.max(1)
-    };
+        settings.max_results
+    }
+    .max(1);
     if let Some(cache) = settings.cache.as_ref() {
         if let Some(hit) = cache_get(cache, query, requested).await {
             return Ok(hit);
@@ -273,7 +275,12 @@ async fn rerank(
         })
         .collect();
 
-    let payload = json!({ "model": rerank.model, "query": query, "documents": documents });
+    let payload = json!({
+        "model": rerank.model,
+        "query": query,
+        "documents": documents,
+        "top_n": rerank.top_n,
+    });
     let response = match client
         .post(format!("{}/rerank", rerank.base_url.trim_end_matches('/')))
         .json(&payload)

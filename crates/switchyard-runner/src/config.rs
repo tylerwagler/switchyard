@@ -185,7 +185,7 @@ pub struct SearchConfig {
     pub base_url: String,
     #[serde(default = "default_web_search_timeout_ms")]
     pub timeout_ms: u64,
-    /// Cap on raw candidates a consumer may request (feed for reranking).
+    /// Most raw candidates the web-search bridge requests per query.
     #[serde(default = "default_search_max_results")]
     pub max_results: usize,
 }
@@ -196,7 +196,8 @@ pub struct SearchConfig {
 pub struct RerankConfig {
     pub base_url: String,
     pub model: String,
-    /// Default top_n applied when a consumer does not specify one.
+    /// `top_n` the web-search bridge sends in its rerank request. The
+    /// `/v1/rerank` relay passes bodies through unchanged and does not add it.
     #[serde(default = "default_rerank_top_n")]
     pub default_top_n: usize,
 }
@@ -236,6 +237,8 @@ pub struct ResolvedWebSearch {
     pub timeout: std::time::Duration,
     /// Results returned to the client.
     pub max_results: usize,
+    /// Most raw candidates fetched from the search endpoint per query.
+    pub max_candidates: usize,
     pub rerank: Option<ResolvedRerank>,
     pub cache: Option<ResolvedCache>,
 }
@@ -253,6 +256,8 @@ pub struct ResolvedCache {
 pub struct ResolvedRerank {
     pub base_url: String,
     pub model: String,
+    /// `top_n` sent in the rerank request.
+    pub top_n: usize,
 }
 
 const fn default_cache_ttl_s() -> u64 {
@@ -307,7 +312,7 @@ fn resolve_web_search(
             "web_search: set either `search` (named [search.*] endpoint) or `searxng_url` (inline), not both",
         ));
     }
-    let (search_url, timeout) = if let Some(name) = config.search() {
+    let (search_url, timeout, max_candidates) = if let Some(name) = config.search() {
         let entry = search.get(name).ok_or_else(|| {
             RunnerError::configuration(format!(
                 "web_search.search references unknown [search.{name}] endpoint"
@@ -316,6 +321,7 @@ fn resolve_web_search(
         (
             entry.base_url.clone(),
             std::time::Duration::from_millis(entry.timeout_ms),
+            entry.max_results,
         )
     } else {
         let url = config
@@ -325,7 +331,11 @@ fn resolve_web_search(
         let ms = config
             .timeout_ms()
             .unwrap_or_else(default_web_search_timeout_ms);
-        (url, std::time::Duration::from_millis(ms))
+        (
+            url,
+            std::time::Duration::from_millis(ms),
+            default_search_max_results(),
+        )
     };
     reqwest::Url::parse(&search_url).map_err(|error| {
         RunnerError::configuration(format!("web_search endpoint is not a valid URL: {error}"))
@@ -336,6 +346,12 @@ fn resolve_web_search(
     if max_results == 0 || max_results > 20 {
         return Err(RunnerError::configuration(format!(
             "web_search.max_results must be between 1 and 20, got {max_results}"
+        )));
+    }
+    if max_results > max_candidates {
+        let name = config.search().unwrap_or_default();
+        return Err(RunnerError::configuration(format!(
+            "web_search.max_results ({max_results}) exceeds [search.{name}].max_results ({max_candidates})"
         )));
     }
     let resolved_rerank = config
@@ -349,6 +365,7 @@ fn resolve_web_search(
             Ok(ResolvedRerank {
                 base_url: entry.base_url.clone(),
                 model: entry.model.clone(),
+                top_n: entry.default_top_n,
             })
         })
         .transpose()?;
@@ -380,6 +397,7 @@ fn resolve_web_search(
         search_url,
         timeout,
         max_results,
+        max_candidates,
         rerank: resolved_rerank,
         cache: resolved_cache,
     }))
@@ -2708,18 +2726,36 @@ target = "t"
         let settings = runner.web_search().expect("web_search configured");
         assert_eq!(settings.search_url.as_str(), "http://search.lan:9999");
         assert_eq!(settings.timeout, std::time::Duration::from_millis(9000));
+        assert_eq!(settings.max_candidates, 30);
+    }
+
+    #[test]
+    fn web_search_inline_endpoint_caps_candidates_at_twenty() {
+        let toml = format!("{BASE}\n[web_search]\nenabled = true\n");
+        let runner = runner_from_toml(&toml).expect("web_search parses");
+        assert_eq!(runner.web_search().expect("enabled").max_candidates, 20);
+    }
+
+    #[test]
+    fn web_search_rejects_max_results_above_the_search_cap() {
+        let toml = format!(
+            "{BASE}\n[search.main]\nbase_url = \"http://search.lan:9999\"\nmax_results = 4\n\n[web_search]\nenabled = true\nsearch = \"main\"\nmax_results = 5\n"
+        );
+        let message = error_message(&toml);
+        assert!(message.contains("[search.main].max_results"), "{message}");
     }
 
     #[test]
     fn web_search_resolves_named_rerank_backend() {
         let toml = format!(
-            "{BASE}\n[rerank.r]\nbase_url = \"http://rank.lan:8002/v1\"\nmodel = \"qwen3-vl-rerank\"\n\n[web_search]\nenabled = true\nrerank = \"r\"\n"
+            "{BASE}\n[rerank.r]\nbase_url = \"http://rank.lan:8002/v1\"\nmodel = \"qwen3-vl-rerank\"\ndefault_top_n = 4\n\n[web_search]\nenabled = true\nrerank = \"r\"\n"
         );
         let runner = runner_from_toml(&toml).expect("web_search with named rerank parses");
         let settings = runner.web_search().expect("web_search configured");
         let rerank = settings.rerank.as_ref().expect("rerank resolved");
         assert_eq!(rerank.base_url.as_str(), "http://rank.lan:8002/v1");
         assert_eq!(rerank.model.as_str(), "qwen3-vl-rerank");
+        assert_eq!(rerank.top_n, 4);
     }
 
     #[test]

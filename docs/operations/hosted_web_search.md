@@ -48,9 +48,11 @@ exclusive with `search`).
 ## Re-ranking
 
 When `web_search.rerank` names a `[rerank.*]` backend, the bridge fetches a
-surplus of raw candidates (3× `max_results`) and re-ranks them against the query
-via the Cohere-shaped `POST /v1/rerank` endpoint (query vs `title\nsnippet`),
-returning the top `max_results` best-first. The re-ranker counters the noisy
+surplus of raw candidates (3× `max_results`, capped at the endpoint's
+`[search.*].max_results`) and re-ranks them against the query via the
+Cohere-shaped `POST /v1/rerank` endpoint (query vs `title\nsnippet`, with
+`top_n` set to the backend's `default_top_n`), returning the top `max_results`
+best-first. The re-ranker counters the noisy
 ordering scraped engines often produce. It is **fail-open**: if the rerank
 backend is unreachable or errors, results are returned in raw engine order and
 `switchyard.websearch_rerank_errors` increments — a reranker outage never fails

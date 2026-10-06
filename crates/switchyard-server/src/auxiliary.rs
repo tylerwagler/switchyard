@@ -204,6 +204,7 @@ pub(crate) fn capability_entries(state: &ServerState) -> Vec<Value> {
             "type": "model",
             "kind": "embeddings",
             "served_by": config.base_url,
+            "model": config.model,
             "created": 0,
             "owned_by": "switchyard",
             "display_name": name,

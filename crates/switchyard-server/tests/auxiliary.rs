@@ -267,6 +267,19 @@ async fn models_lists_non_chat_capabilities() -> TestResult {
     assert!(kinds.contains(&("e_b".into(), "embeddings".into())));
     assert!(kinds.contains(&("r_a".into(), "rerank".into())));
     assert!(kinds.contains(&("s_a".into(), "search".into())));
+    // Embeddings and rerank entries name the model the backend serves.
+    let models: Vec<(String, String)> = payload["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|entry| {
+            let id = entry["id"].as_str()?;
+            let model = entry["model"].as_str()?;
+            Some((id.to_string(), model.to_string()))
+        })
+        .collect();
+    assert!(models.contains(&("e_a".into(), "m-a".into())));
+    assert!(models.contains(&("r_a".into(), "r-a".into())));
     Ok(())
 }
 
