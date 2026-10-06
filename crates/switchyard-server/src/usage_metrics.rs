@@ -329,6 +329,7 @@ mod tests {
 
         let routing = log
             .snapshot_session("streaming-session")
+            .await
             .expect("read routing log")
             .expect("terminal event was recorded");
         let routing = serde_json::to_value(routing).expect("serialize routing stats");

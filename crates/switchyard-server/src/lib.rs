@@ -52,7 +52,6 @@ use switchyard_runner::{
     Route, RunOutput, Runner, RunnerError, SearchConfig,
 };
 use tokio::net::{TcpListener, TcpSocket};
-use tokio::task;
 use tracing::{Instrument, Level};
 
 use switchyard_translation::{WireFormat, decode_request, encode_aggregated_response};
@@ -233,11 +232,11 @@ impl SharedRoutingLog {
         }
     }
 
-    fn snapshot_session(
+    async fn snapshot_session(
         &self,
         session_id: &str,
     ) -> std::io::Result<Option<routing_log::SessionStatsSnapshot>> {
-        routing_log::snapshot(&self.path, session_id)
+        routing_log::snapshot(&self.path, session_id).await
     }
 }
 
@@ -1689,8 +1688,6 @@ struct SessionStatsQuery {
     session_id: String,
 }
 
-// TODO: This loads the entire file. It should stream the JSONL instead.
-// Huge files will crash the demo server.
 async fn get_session_stats(
     State(state): State<ServerState>,
     query: std::result::Result<Query<SessionStatsQuery>, QueryRejection>,
@@ -1710,17 +1707,7 @@ async fn get_session_stats(
         // Should be unreachable
         return not_found().await;
     };
-    let session_id = query.session_id.clone();
-    // Loading and de-serializing a large file is a time consuming blocking operation
-    let snapshot =
-        match task::spawn_blocking(move || routing_log.snapshot_session(&session_id)).await {
-            Ok(s) => s,
-            Err(err) => {
-                return server_error(format!("failed to snapshot: {err}"));
-            }
-        };
-
-    match snapshot {
+    match routing_log.snapshot_session(&query.session_id).await {
         Ok(Some(snapshot)) => (StatusCode::OK, Json(snapshot)).into_response(),
         Ok(None) => error_response(
             StatusCode::NOT_FOUND,
@@ -1982,6 +1969,7 @@ mod tests {
     use switchyard_llm_client::ModelCallObservation;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{Notify, oneshot};
+    use tokio::task;
 
     use super::*;
 
@@ -1989,8 +1977,8 @@ mod tests {
     /// model id with the classifier tier, while routed calls stay off the observer's
     /// log path — they are logged with terminal usage when the served response is
     /// observed, so an append here would double count them.
-    #[test]
-    fn stats_observer_logs_judge_calls_to_the_routing_log() {
+    #[tokio::test]
+    async fn stats_observer_logs_judge_calls_to_the_routing_log() {
         let dir = tempfile::tempdir().expect("temp dir");
         let log = SharedRoutingLog::new(dir.path().join("routing.jsonl")).expect("routing log");
         let mut headers = HeaderMap::new();
@@ -2023,6 +2011,7 @@ mod tests {
 
         let snapshot = log
             .snapshot_session("session-1")
+            .await
             .expect("read log")
             .expect("session recorded");
         let snapshot = serde_json::to_value(&snapshot).expect("serializable snapshot");

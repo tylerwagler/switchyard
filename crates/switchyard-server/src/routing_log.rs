@@ -6,13 +6,14 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use humantime::format_rfc3339_millis;
 use serde::{Deserialize, Serialize};
 use switchyard_protocol::{Metadata, ModelId, Usage};
+use tokio::io::{AsyncBufReadExt, BufReader};
 
 use crate::usage_metrics::token_usage;
 use crate::{ServerError, ServerResult};
@@ -74,23 +75,18 @@ impl RoutingLog {
     }
 }
 
-/// Reads complete records without synchronizing with the writer.
-pub(crate) fn snapshot(
+/// Streams the log one line at a time, keeping only the requested session's
+/// records, so the file never has to fit in memory. A partial trailing line
+/// still being written fails to parse and is skipped like any other bad line.
+pub(crate) async fn snapshot(
     path: &Path,
     session_id: &str,
 ) -> std::io::Result<Option<SessionStatsSnapshot>> {
-    let mut reader = BufReader::with_capacity(64 * 1024, fs::File::open(path)?);
-    let mut line = Vec::new();
+    let file = tokio::fs::File::open(path).await?;
+    let mut lines = BufReader::with_capacity(64 * 1024, file).lines();
     let mut snapshot = SessionStatsSnapshot::new(session_id);
-    loop {
-        line.clear();
-        if reader.read_until(b'\n', &mut line)? == 0 {
-            break;
-        }
-        if !line.ends_with(b"\n") {
-            break;
-        }
-        let Ok(record) = serde_json::from_slice::<RoutingRecord>(&line) else {
+    while let Some(line) = lines.next_line().await? {
+        let Ok(record) = serde_json::from_str::<RoutingRecord>(&line) else {
             continue;
         };
         snapshot.add_record(&record, session_id);
@@ -289,8 +285,8 @@ mod tests {
 
     /// Only the requested session is counted, absent fields fall back to zero
     /// and `unknown`, and an unparseable line does not abort the scan.
-    #[test]
-    fn snapshot_counts_only_the_requested_session() {
+    #[tokio::test]
+    async fn snapshot_counts_only_the_requested_session() {
         let dir = tempfile::tempdir().expect("temp dir");
         let path = dir.path().join("routing.jsonl");
         fs::write(
@@ -307,12 +303,20 @@ mod tests {
         )
         .expect("write log");
 
-        let stats = snapshot(&path, "a").expect("read log").expect("session a");
+        let stats = snapshot(&path, "a")
+            .await
+            .expect("read log")
+            .expect("session a");
         assert_eq!(stats.total_calls, 2);
         assert_eq!(stats.total_prompt_tokens, 15);
         assert_eq!(stats.total_completion_tokens, 2);
         assert_eq!(stats.models["m1"].calls, 1);
         assert_eq!(stats.models["unknown"].prompt_tokens, 5);
-        assert!(snapshot(&path, "missing").expect("read log").is_none());
+        assert!(
+            snapshot(&path, "missing")
+                .await
+                .expect("read log")
+                .is_none()
+        );
     }
 }
