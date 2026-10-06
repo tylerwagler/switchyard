@@ -702,6 +702,7 @@ impl DeploymentConfig {
             .with_embeddings(self.embeddings)
             .with_rerank(self.rerank)
             .with_search(self.search)
+            .with_cache(self.cache)
             .with_provider_api_keys(provider_api_keys);
         Ok(runner)
     }

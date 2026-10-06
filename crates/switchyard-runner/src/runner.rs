@@ -12,8 +12,8 @@ use switchyard_protocol::{ModelId, WireFormat};
 
 use crate::config;
 use crate::{
-    EmbeddingsConfig, ModelCapabilities, RerankConfig, ResolvedWebSearch, Route, RunnerError,
-    SafeguardsJudge, SearchConfig,
+    CacheConfig, EmbeddingsConfig, ModelCapabilities, RerankConfig, ResolvedWebSearch, Route,
+    RunnerError, SafeguardsJudge, SearchConfig,
 };
 
 /// Immutable named route table.
@@ -29,6 +29,7 @@ pub struct Runner {
     embeddings: BTreeMap<String, EmbeddingsConfig>,
     rerank: BTreeMap<String, RerankConfig>,
     search: BTreeMap<String, SearchConfig>,
+    cache: BTreeMap<String, CacheConfig>,
     /// Configured llm client name -> base URL, for liveness probing. Every
     /// other surface is retrospective: this is what answers "is that box
     /// reachable right now", which is the question an outage actually raises.
@@ -90,6 +91,7 @@ impl Runner {
             embeddings: BTreeMap::new(),
             rerank: BTreeMap::new(),
             search: BTreeMap::new(),
+            cache: BTreeMap::new(),
             upstreams: BTreeMap::new(),
             provider_api_keys: Vec::new(),
         }
@@ -145,6 +147,11 @@ impl Runner {
         self
     }
 
+    pub(crate) fn with_cache(mut self, cache: BTreeMap<String, CacheConfig>) -> Self {
+        self.cache = cache;
+        self
+    }
+
     pub(crate) fn with_upstreams(mut self, upstreams: BTreeMap<String, String>) -> Self {
         self.upstreams = upstreams;
         self
@@ -178,6 +185,11 @@ impl Runner {
     /// Named search endpoints (`[search.*]`).
     pub fn search(&self) -> &BTreeMap<String, SearchConfig> {
         &self.search
+    }
+
+    /// Named cache backends (`[cache.*]`).
+    pub fn cache(&self) -> &BTreeMap<String, CacheConfig> {
+        &self.cache
     }
 
     /// Returns the route registered for a model, falling back to the

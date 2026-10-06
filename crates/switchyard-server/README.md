@@ -282,6 +282,7 @@ hand, then restart the server.
 | `POST` | `/v1/stats/reset` | Clear accumulated stats |
 | `GET` | `/metrics` | Prometheus text, see [Metrics](#metrics) |
 | `GET` | `/health` | Liveness |
+| `GET` | `/v1/upstreams` | TCP reachability of every configured LLM client, embeddings, rerank, search, and cache backend |
 
 Requests name a route by its `id`, so `POST /v1/chat/completions` with `"model": "switchyard/general"`
 routes through the `[routes.general]` entry above. Any of the three request formats can address any

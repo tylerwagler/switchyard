@@ -167,12 +167,17 @@ for ones it failed. This is distinct from `models`, which reports what was
 *asked for* -- the two diverge on any fallback, where the box that served is not
 the box that was selected.
 
-`GET /v1/upstreams` probes every configured client's `base_url` for live TCP
-reachability, reporting `reachable`, `probe_ms`, and an `error` when it fails.
-Probes are connect-and-close (no model call, no credentials, no tokens) and run
-concurrently, so the endpoint costs one timeout at worst however many upstreams
-are down. A refused connect returns immediately; a black-holed host is reported
-as `no response within 1000ms`, so the two are distinguishable.
+`GET /v1/upstreams` probes every configured backend for live TCP reachability:
+each `[llm_clients.*]` `base_url`, plus the `[embeddings.*]`, `[rerank.*]`, and
+`[search.*]` `base_url`s and each `[cache.*]` `url`. Every entry carries its
+`kind` (`llm_client`, `embeddings`, `rerank`, `search`, or `cache`), its config
+name, the probed URL as `base_url`, `reachable`, `probe_ms`, and an `error` when
+it fails. A `redis://host:port[/db]` cache URL probes its host and port; the
+port defaults to `6379`. Probes are connect-and-close (no model call, no
+credentials, no tokens) and run concurrently, so the endpoint costs one timeout
+at worst however many upstreams are down. A refused connect returns
+immediately; a black-holed host is reported as `no response within 1000ms`, so
+the two are distinguishable.
 
 ## `[targets.<name>]`
 

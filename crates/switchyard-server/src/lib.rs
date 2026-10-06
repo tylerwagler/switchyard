@@ -1724,7 +1724,8 @@ async fn get_session_stats(
 /// TCP connect timeout.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
 
-/// Live TCP reachability for every configured upstream.
+/// Live TCP reachability for every configured backend: LLM clients plus the
+/// embeddings, rerank, search, and cache backends.
 ///
 /// Deliberately a connect-and-close, not a model call: it answers "is that box
 /// accepting connections right now" without spending tokens, needing
@@ -1732,17 +1733,29 @@ const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000
 /// and concurrently, so the endpoint costs one timeout at worst regardless of
 /// how many upstreams are down.
 async fn upstreams(State(state): State<ServerState>) -> Json<Value> {
-    let entries: Vec<(String, String)> = state
-        .runner
-        .upstreams()
-        .iter()
-        .map(|(name, url)| (name.clone(), url.clone()))
-        .collect();
-    let probes = entries.into_iter().map(|(name, url)| async move {
+    let runner = &state.runner;
+    let mut entries: Vec<(&str, &str, &str)> = Vec::new();
+    for (name, url) in runner.upstreams() {
+        entries.push(("llm_client", name, url));
+    }
+    for (name, config) in runner.embeddings() {
+        entries.push(("embeddings", name, &config.base_url));
+    }
+    for (name, config) in runner.rerank() {
+        entries.push(("rerank", name, &config.base_url));
+    }
+    for (name, config) in runner.search() {
+        entries.push(("search", name, &config.base_url));
+    }
+    for (name, config) in runner.cache() {
+        entries.push(("cache", name, &config.url));
+    }
+    let probes = entries.into_iter().map(|(kind, name, url)| async move {
         let started = std::time::Instant::now();
-        let outcome = probe_endpoint(&url).await;
+        let outcome = probe_endpoint(url).await;
         let elapsed = started.elapsed().as_secs_f64() * 1000.0;
         let mut entry = json!({
+            "kind": kind,
             "name": name,
             "base_url": url,
             "reachable": outcome.is_ok(),
@@ -1772,8 +1785,10 @@ async fn probe_endpoint(base_url: &str) -> std::result::Result<(), String> {
     let host = url
         .host_str()
         .ok_or_else(|| "url has no host".to_string())?;
+    // `redis://` is not a scheme the URL crate knows a default port for.
     let port = url
         .port_or_known_default()
+        .or_else(|| (url.scheme() == "redis").then_some(6379))
         .ok_or_else(|| "url has no port".to_string())?;
     let connect = tokio::net::TcpStream::connect((host, port));
     match tokio::time::timeout(PROBE_TIMEOUT, connect).await {
