@@ -36,4 +36,8 @@ switchyard-server --config routes.toml \
 ## Related Documentation
 
 - [Getting Started](getting_started.md): installation, configuration, and validation
-- [`switchyard-server`](../crates/switchyard-server/README.md): complete TOML schema, TLS, and metrics
+- [TOML schema](reference/toml_schema.md): complete configuration reference
+- [`switchyard-server`](../crates/switchyard-server/README.md): TLS and metrics
+
+The server's HTTP endpoints are listed in the
+[`switchyard-server` README](../crates/switchyard-server/README.md#endpoints).

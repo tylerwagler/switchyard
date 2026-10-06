@@ -164,8 +164,9 @@ A single TOML file can declare multiple routes. The table key, such as
 model on `GET /v1/models`.
 
 See [Routing Overview](routing_algorithms/overview.md) to compare strategies,
-and the [`switchyard-server` guide](../crates/switchyard-server/README.md) for
-the complete TOML schema, route options, TLS, and metrics.
+the [TOML schema](reference/toml_schema.md) for every key and route option, and
+the [`switchyard-server` guide](../crates/switchyard-server/README.md) for TLS
+and metrics.
 
 ### Troubleshooting
 

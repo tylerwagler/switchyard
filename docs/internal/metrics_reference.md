@@ -75,6 +75,21 @@ Each histogram emits `_bucket`, `_sum`, and `_count` series. Use
 `upstream_5xx`, `upstream_non_5xx`, `invalid_response`, `parse_error`, `client_error`, or
 `call_error`. The labels never include request or response text.
 
+## Auxiliary and web-search counters
+
+These cover the non-chat endpoints. The Prometheus exporter adds `_total` to
+every counter, so the OTel instrument `switchyard.aux_requests_total` appears
+as `switchyard_aux_requests_total_total`.
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `switchyard_aux_requests_total_total{kind,name,outcome}` | counter | Requests relayed by `/v1/embeddings` and `/v1/rerank`. `kind` is `embeddings` or `rerank`, `name` is the backend's config name, and `outcome` is `ok` or `error`. |
+| `switchyard_aux_duration_seconds{kind}` | histogram | Relay time per request, in seconds. |
+| `switchyard_websearch_queries_total{outcome}` | counter | Hosted web-search requests. `outcome` is `ok` or `error`. |
+| `switchyard_websearch_duration_seconds` | histogram | Time to answer one web-search request, in seconds. |
+| `switchyard_websearch_rerank_errors_total` | counter | Rerank calls that failed during a web search. The search still returns results in raw order. |
+| `switchyard_websearch_cache_total{outcome}` | counter | Cache lookups for raw search results. `outcome` is `hit` or `miss`. |
+
 ## Outcome counters for error-rate ratios
 
 For HTTP-derived responses and attempts, the `outcome` label takes three values:
@@ -154,12 +169,14 @@ into label space.
 | Label | Values | Where |
 |---|---|---|
 | `model` | One per configured endpoint, typically 2–6 per deployment. | All per-endpoint metrics. |
-| `outcome` | `ok`, `retryable_error`, `other_error`; plus `client_disconnected` on `switchyard_client_responses_total`. | Outcome counters |
+| `outcome` | `ok`, `retryable_error`, `other_error`; plus `client_disconnected` on `switchyard_client_responses_total`. `ok` or `error` on auxiliary and web-search counters; `hit` or `miss` on the cache counter. | Outcome counters |
 | `code` | Bounded: the known-code allowlist (`200`, `400`, `401`, `403`, `404`, `408`, `409`, `422`, `429`, `500`, `502`, `503`, `504`), plus `none` and the per-class buckets `1xx`/`2xx`/`3xx`/`4xx`/`5xx`/`other`. About 20 values max. | `switchyard_upstream_attempts_total` |
 | `le` | The configured histogram bucket boundaries. | Histogram buckets |
 | `algorithm` | One stable value per configured algorithm. | Routing-overhead histogram, in-flight gauge |
 | `tier` | Small enumerated set, optional. | Per-endpoint counters and histograms on algorithms that supply it |
 | `judge_model` | One per configured judge target. | Classifier fail-open counter |
+| `kind` | `embeddings` or `rerank`. | Auxiliary counters and histogram |
+| `name` | One per configured `[embeddings.*]` or `[rerank.*]` backend. | Auxiliary request counter |
 | `reason` | Exactly 8 fixed error categories. | Classifier fail-open counter |
 
 ## Triage cheatsheet

@@ -63,3 +63,8 @@ the client falls through from the algorithm's first choice.
 Once no untried target is left — including a single-target `passthrough` route,
 which has no alternative from the start — the request fails with HTTP 400 and an
 error `code` of `context_length_exceeded`.
+
+The error message starts with `capability_rejected: prompt_too_long:`, followed
+by the upstream's own text. Claude Code looks for `prompt_too_long` in the
+message, compacts the conversation, and retries. Without that token the client
+would show the error and stop.

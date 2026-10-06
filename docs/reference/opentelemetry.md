@@ -10,6 +10,22 @@ Libsy installs none of these and sends no telemetry itself. Environment variable
 alone do not enable collection. See [OTel Rust setup](https://opentelemetry.io/docs/languages/rust/)
 and [OTLP configuration](https://opentelemetry.io/docs/specs/otel/protocol/exporter/).
 
+## Server binary
+
+`switchyard-server` installs the subscriber and providers itself. Export turns
+on when `OTEL_EXPORTER_OTLP_ENDPOINT` is set, or the per-signal
+`OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT`.
+Traces and metrics are decided separately. The server speaks OTLP over HTTP
+only. `OTEL_SERVICE_NAME` sets the service name and defaults to
+`switchyard-server`. `OTEL_SDK_DISABLED=true` turns export off. So does an
+`OTEL_TRACES_EXPORTER` or `OTEL_METRICS_EXPORTER` value that does not include
+`otlp`. The Prometheus `GET /metrics` endpoint stays on either way.
+
+Logs go to stderr and follow `RUST_LOG`. The default filter is
+`info,opentelemetry=warn`. The request span honours an incoming W3C
+`traceparent` header (and `tracestate`), so the server's spans join the
+caller's trace. Pending spans and metrics are flushed at shutdown.
+
 ## Spans and attributes
 
 | Span | Emitted by | Meaning |

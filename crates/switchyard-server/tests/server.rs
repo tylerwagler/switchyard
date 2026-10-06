@@ -4050,14 +4050,28 @@ llm_client = "live"
 id = "m"
 type = "passthrough"
 target = "t"
+
+[embeddings.embed]
+base_url = "http://127.0.0.1:{dead_port}"
+model = "embed-model"
+
+[rerank.ranker]
+base_url = "{live}"
+model = "rerank-model"
+
+[search.web]
+base_url = "http://127.0.0.1:{dead_port}"
+
+[cache.valkey]
+url = "redis://127.0.0.1:{dead_port}/0"
 "#,
         live = upstream.base_url,
     ))?;
     let app = build_switchyard_router(state);
 
     let body = send(&app, "GET", "/v1/upstreams", None).await?.json()?;
-    assert_eq!(body["total"], 2);
-    assert_eq!(body["reachable"], 1);
+    assert_eq!(body["total"], 6);
+    assert_eq!(body["reachable"], 2);
     let by_name = |name: &str| {
         body["upstreams"]
             .as_array()
@@ -4067,6 +4081,7 @@ target = "t"
             .cloned()
             .expect("named upstream present")
     };
+    assert_eq!(by_name("live")["kind"], "llm_client");
     assert_eq!(by_name("live")["reachable"], true);
     assert!(by_name("live").get("error").is_none());
     // an unreachable upstream reports why, so refused and timed-out are
@@ -4076,6 +4091,21 @@ target = "t"
         by_name("dead")["error"]
             .as_str()
             .is_some_and(|e| !e.is_empty())
+    );
+    // every non-chat backend is probed under its config name and kind
+    assert_eq!(by_name("embed")["kind"], "embeddings");
+    assert_eq!(by_name("embed")["reachable"], false);
+    assert_eq!(by_name("ranker")["kind"], "rerank");
+    assert_eq!(by_name("ranker")["reachable"], true);
+    assert_eq!(by_name("web")["kind"], "search");
+    assert_eq!(by_name("web")["reachable"], false);
+    // a redis:// URL probes its host and port like any other
+    assert_eq!(by_name("valkey")["kind"], "cache");
+    assert_eq!(by_name("valkey")["reachable"], false);
+    assert!(
+        by_name("valkey")["error"]
+            .as_str()
+            .is_some_and(|e| !e.contains("no port"))
     );
     Ok(())
 }

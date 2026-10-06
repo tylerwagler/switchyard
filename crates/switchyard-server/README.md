@@ -277,11 +277,16 @@ hand, then restart the server.
 | `POST` | `/v1/responses/input_tokens` | Token count from a route's OpenAI Responses target |
 | `POST` | `/v1/responses/compact` | Compaction through a route's OpenAI Responses target |
 | `ANY` | Any unmatched path | Raw forward through the optional `fallback_client` |
-| `GET` | `/v1/models` | Routes served by this deployment |
+| `POST` | `/v1/embeddings`, `/v1/embeddings/{name}` | Relay to the first configured or the named `[embeddings.*]` backend |
+| `POST` | `/v1/rerank`, `/v1/rerank/{name}` | Relay to the first configured or the named `[rerank.*]` backend |
+| `GET` | `/v1/models` | Routes served by this deployment, plus embeddings, rerank, and search backends |
+| `GET` | `/v1/models?available=true` | Only the routes with at least one upstream accepting connections right now |
 | `GET` | `/v1/stats` | Per-model usage plus curated algorithm stats |
 | `POST` | `/v1/stats/reset` | Clear accumulated stats |
+| `GET` | `/v1/routing/session-stats?session_id=...` | Token totals for one session; only served with `--routing-log-file` |
 | `GET` | `/metrics` | Prometheus text, see [Metrics](#metrics) |
 | `GET` | `/health` | Liveness |
+| `GET` | `/v1/upstreams` | TCP reachability of every configured LLM client, embeddings, rerank, search, and cache backend |
 
 Requests name a route by its `id`, so `POST /v1/chat/completions` with `"model": "switchyard/general"`
 routes through the `[routes.general]` entry above. Any of the three request formats can address any
