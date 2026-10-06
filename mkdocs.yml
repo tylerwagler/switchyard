@@ -29,6 +29,7 @@ nav:
       - Oh My Pi: integrations/oh_my_pi.md
   - Recipes:
       - Single-provider coding agents: recipes/single_provider_coding_agents.md
+      - Full-stack deployment for coding agents: recipes/full_stack_deployment.md
   - Routing:
       - Overview: routing_algorithms/overview.md
       - Task (LLM Classifier): routing_algorithms/llm_classifier_routing.md
