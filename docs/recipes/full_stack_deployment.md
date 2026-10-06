@@ -362,7 +362,7 @@ The gate binary has no TLS flags. Terminate TLS in front of it.
 - **Prometheus** scrapes `GET /metrics`. `examples/prometheus/` has a scrape
   config and alert rules. Useful series: `switchyard.routing_fallbacks`,
   `switchyard.ttfb_ms`, `switchyard.classifier_fail_open`,
-  `switchyard.websearch_queries`, `switchyard.aux_requests_total`.
+  `switchyard.websearch_queries`, `switchyard.aux_requests`.
 - **OpenTelemetry** export turns on when `OTEL_EXPORTER_OTLP_ENDPOINT` is set.
   The protocol is OTLP over HTTP. `OTEL_SERVICE_NAME` defaults to
   `switchyard-server`. Set `OTEL_SDK_DISABLED=true` to turn it off. Span and

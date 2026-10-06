@@ -78,12 +78,11 @@ Each histogram emits `_bucket`, `_sum`, and `_count` series. Use
 ## Auxiliary and web-search counters
 
 These cover the non-chat endpoints. The Prometheus exporter adds `_total` to
-every counter, so the OTel instrument `switchyard.aux_requests_total` appears
-as `switchyard_aux_requests_total_total`.
+every counter, so instrument names carry no suffix of their own.
 
 | Metric | Type | Meaning |
 |---|---|---|
-| `switchyard_aux_requests_total_total{kind,name,outcome}` | counter | Requests relayed by `/v1/embeddings` and `/v1/rerank`. `kind` is `embeddings` or `rerank`, `name` is the backend's config name, and `outcome` is `ok` or `error`. |
+| `switchyard_aux_requests_total{kind,name,outcome}` | counter | Requests relayed by `/v1/embeddings` and `/v1/rerank`. `kind` is `embeddings` or `rerank`, `name` is the backend's config name, and `outcome` is `ok` or `error`. |
 | `switchyard_aux_duration_seconds{kind}` | histogram | Relay time per request, in seconds. |
 | `switchyard_websearch_queries_total{outcome}` | counter | Hosted web-search requests. `outcome` is `ok` or `error`. |
 | `switchyard_websearch_duration_seconds` | histogram | Time to answer one web-search request, in seconds. |

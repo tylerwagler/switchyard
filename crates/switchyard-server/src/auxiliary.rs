@@ -266,17 +266,14 @@ fn internal_error() -> Response {
 
 fn record(kind: &str, name: &str, outcome: &str, started: Instant) {
     let meter = global::meter("switchyard");
-    meter
-        .u64_counter("switchyard.aux_requests_total")
-        .build()
-        .add(
-            1,
-            &[
-                KeyValue::new("kind", kind.to_string()),
-                KeyValue::new("name", name.to_string()),
-                KeyValue::new("outcome", outcome.to_string()),
-            ],
-        );
+    meter.u64_counter("switchyard.aux_requests").build().add(
+        1,
+        &[
+            KeyValue::new("kind", kind.to_string()),
+            KeyValue::new("name", name.to_string()),
+            KeyValue::new("outcome", outcome.to_string()),
+        ],
+    );
     meter
         .f64_histogram("switchyard.aux_duration_seconds")
         .build()
