@@ -346,6 +346,11 @@ fn resolve_web_search(
                 "web_search.search references unknown [search.{name}] endpoint"
             ))
         })?;
+        if config.timeout_ms().is_some() {
+            return Err(RunnerError::configuration(format!(
+                "web_search.timeout_ms is ignored when `search` is set; set [search.{name}].timeout_ms instead"
+            )));
+        }
         (
             entry.base_url.clone(),
             std::time::Duration::from_millis(entry.timeout_ms),
@@ -2787,6 +2792,15 @@ target = "t"
         assert_eq!(settings.search_url.as_str(), "http://search.lan:9999");
         assert_eq!(settings.timeout, std::time::Duration::from_millis(9000));
         assert_eq!(settings.max_candidates, 30);
+    }
+
+    #[test]
+    fn web_search_rejects_inline_timeout_with_named_search() {
+        let toml = format!(
+            "{BASE}\n[search.main]\nbase_url = \"http://search.lan:9999\"\n\n[web_search]\nenabled = true\nsearch = \"main\"\ntimeout_ms = 2000\n"
+        );
+        let message = error_message(&toml);
+        assert!(message.contains("[search.main].timeout_ms"), "{message}");
     }
 
     #[test]

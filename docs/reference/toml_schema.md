@@ -507,7 +507,7 @@ is fetched and re-ranked before the top `max_results` are returned.
 | `rerank` | — | Name of a `[rerank.<name>]` backend to re-rank candidates. |
 | `cache` | — | Name of a `[cache.<name>]` backend that stores raw search results. |
 | `max_results` | `6` | Results returned per query; range `1..=20`. Must not exceed the named endpoint's `[search.*].max_results`. |
-| `timeout_ms` | `15000` | Inline timeout; applies when not using a named `search`. |
+| `timeout_ms` | `15000` | Inline timeout. Only allowed without `search`; with a named `search`, set `[search.<name>].timeout_ms` instead. |
 | `searxng_url` | `http://127.0.0.1:8080` | Compatibility alias for an inline SearXNG endpoint; mutually exclusive with `search`. |
 
 When `search` is omitted, `searxng_url` (or the default) is used as an implicit
