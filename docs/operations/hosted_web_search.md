@@ -89,9 +89,11 @@ and synthesizes an Anthropic `message` response:
 - a short text block listing the cited results.
 
 Both aggregate and streaming (`SSE`) responses are supported. If the search
-fails or returns nothing, the bridge still returns a synthesized response with
-an empty result list and a notice — it never falls back to a model backend for
-a dedicated web-search request.
+returns nothing, the result list is empty and the text block says so. If the
+search fails, the `web_search_tool_result` block carries a
+`web_search_tool_result_error` with `error_code: "unavailable"`, and the text
+block names the error. Either way the bridge never falls back to a model
+backend for a dedicated web-search request.
 
 Synthetic searches are not model calls: they are excluded from `/v1/stats`
 per-model counters and surfaced instead as
