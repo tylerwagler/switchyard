@@ -19,9 +19,12 @@
 //! Configuration lives in the deployment's `[web_search]` section (see
 //! `switchyard_runner::WebSearchConfig`); the bridge is off until enabled.
 
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use axum::Json;
+use axum::extract::{Query, State};
+use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response as AxumResponse};
 use opentelemetry::{KeyValue, global};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -667,6 +670,99 @@ fn record(outcome: &str, started: Instant) {
         .record(started.elapsed().as_secs_f64(), &[]);
 }
 
+// --- the pipeline ------------------------------------------------------------
+
+/// The hosted search pipeline end to end: cached SearXNG candidates, re-ranked
+/// by the configured backend when there is one (falling back to raw engine
+/// order on any rerank failure -- fail-open), cut to `max_results`.  Both the
+/// Anthropic bridge and the SearXNG-shaped endpoint serve exactly this list.
+async fn ranked_results(
+    query: &str,
+    settings: &ResolvedWebSearch,
+    client: &reqwest::Client,
+) -> Result<Vec<Value>, String> {
+    let candidates = search(query, settings, client).await?;
+    let ranked = match settings.rerank.as_ref() {
+        Some(backend) => match rerank(query, &candidates, backend, client).await {
+            Some(ranked) => ranked,
+            None => candidates,
+        },
+        None => candidates,
+    };
+    Ok(ranked.into_iter().take(settings.max_results).collect())
+}
+
+// --- the SearXNG-shaped endpoint ---------------------------------------------
+
+/// `GET /search?q=<query>&format=json`: the hosted search pipeline behind a
+/// SearXNG-compatible response, so a client that already speaks SearXNG (Open
+/// WebUI's `searxng` engine, for one) can point at the gateway instead of the
+/// engine and get the same re-ranked, cached results the Anthropic bridge
+/// serves.  Only the JSON format is served; `score` descends in rank order so
+/// a client that sorts by score keeps the ranking.  503 when `[web_search]`
+/// is not enabled, 400 without a query, 502 when the search itself fails.
+pub(crate) async fn searxng_compat(
+    State(state): State<ServerState>,
+    Query(params): Query<HashMap<String, String>>,
+) -> AxumResponse {
+    let Some(settings) = state.web_search_config() else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({ "error": "hosted web search is not enabled on this gateway" })),
+        )
+            .into_response();
+    };
+    if let Some(format) = params.get("format")
+        && format != "json"
+    {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "only format=json is served" })),
+        )
+            .into_response();
+    }
+    let query = params.get("q").map(|q| q.trim()).unwrap_or_default();
+    if query.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "missing query parameter q" })),
+        )
+            .into_response();
+    }
+    let started = Instant::now();
+    match ranked_results(query, settings, state.web_search_client()).await {
+        Ok(ranked) => {
+            record("compat_ok", started);
+            let count = ranked.len();
+            let results = ranked
+                .iter()
+                .enumerate()
+                .map(|(rank, result)| {
+                    json!({
+                        "url": result["url"],
+                        "title": result["title"],
+                        "content": result["content"],
+                        "engine": "switchyard",
+                        "category": "general",
+                        "score": (count - rank) as f64,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Json(json!({
+                "query": query,
+                "number_of_results": count,
+                "results": results,
+            }))
+            .into_response()
+        }
+        Err(error) => {
+            tracing::warn!(%error, "web search endpoint failed");
+            record("compat_error", started);
+            (StatusCode::BAD_GATEWAY, Json(json!({ "error": error }))).into_response()
+        }
+    }
+}
+
 // --- entry point -------------------------------------------------------------
 
 /// Short-circuits dedicated web-search requests with a synthesized response.
@@ -696,28 +792,8 @@ pub(crate) async fn maybe_short_circuit(
         .unwrap_or_default()
         .to_string();
     let query = extract_query(body);
-    let content = match search(&query, settings, state.web_search_client()).await {
-        Ok(candidates) => {
-            // Re-rank the surplus of raw candidates when a backend is configured,
-            // falling back to raw engine order on any rerank failure (fail-open).
-            let ranked = match settings.rerank.as_ref() {
-                Some(backend) => {
-                    match rerank(&query, &candidates, backend, state.web_search_client()).await {
-                        Some(ranked) => ranked
-                            .into_iter()
-                            .take(settings.max_results)
-                            .collect::<Vec<_>>(),
-                        None => candidates
-                            .into_iter()
-                            .take(settings.max_results)
-                            .collect::<Vec<_>>(),
-                    }
-                }
-                None => candidates
-                    .into_iter()
-                    .take(settings.max_results)
-                    .collect::<Vec<_>>(),
-            };
+    let content = match ranked_results(&query, settings, state.web_search_client()).await {
+        Ok(ranked) => {
             record("ok", started);
             build_blocks(&query, &ranked).0
         }

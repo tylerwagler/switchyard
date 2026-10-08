@@ -4,6 +4,15 @@ All notable changes to Switchyard are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **SearXNG-shaped search endpoint** -- `GET /search?q=<query>&format=json`
+  serves the hosted web search pipeline (cached SearXNG candidates, re-ranked,
+  cut to `max_results`) in SearXNG's own JSON shape, so SearXNG-capable clients
+  such as Open WebUI can point at the gateway instead of the engine.
+
 ## [0.3.0]
 
 Switchyard 0.3.0 builds on the native server and Rust library introduced in

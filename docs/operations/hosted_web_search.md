@@ -117,6 +117,20 @@ given, the gateway returns 400 and lists the names. `GET /v1/models`
 advertises a truthful capability listing — chat routes plus `kind: embeddings` /
 `kind: rerank` / `kind: search` entries.
 
+## The SearXNG-shaped endpoint
+
+The same pipeline is served to clients that already speak SearXNG:
+`GET /search?q=<query>&format=json` returns the re-ranked, cached results in
+SearXNG's JSON shape (`query`, `number_of_results`, `results[]` with `url`,
+`title`, `content`, `engine`, `category` and a `score` that descends in rank
+order). Point a SearXNG-capable client at the gateway instead of the engine --
+Open WebUI's `searxng` web-search engine, for instance, with the query URL
+`https://<gateway>/search?q=<query>` -- and it gets what the Anthropic bridge
+gets: the `[web_search]` section's `max_results`, the reranker, the cache. Only
+`format=json` is served (400 otherwise); 503 while `[web_search]` is not
+enabled; 502 when the search itself fails, never an empty list. Queries count
+under `switchyard.websearch_queries` with outcome `compat_ok` / `compat_error`.
+
 ## Relationship to MCP search
 
 Server-side web search is a *client-side* feature of Claude Code: the tool is
