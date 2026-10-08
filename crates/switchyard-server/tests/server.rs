@@ -1298,6 +1298,7 @@ async fn safeguards_shadow_mode_logs_both_verdicts_and_answers_unsupported() -> 
     let upstream = MockUpstream::start().await?;
     let temp_dir = tempfile::tempdir()?;
     let log_path = temp_dir.path().join("shadow/safeguards.jsonl");
+    let verdict_path = temp_dir.path().join("verdicts.jsonl");
     let app = build_switchyard_router(load_test_config(&format!(
         r#"
 schema_version = 1
@@ -1322,9 +1323,11 @@ target = "judge"
 [safeguards]
 judge_route = "judge"
 shadow_log = "{log_path}"
+verdict_log = "{verdict_path}"
 "#,
         base_url = upstream.base_url,
         log_path = log_path.display(),
+        verdict_path = verdict_path.display(),
     ))?);
     let session = [("x-claude-code-session-id", "shadow-session")];
     for stream in [false, true] {
@@ -1406,6 +1409,190 @@ shadow_log = "{log_path}"
             .iter()
             .all(|r| !r.to_string().contains("mcp-tool-call") || r["kind"] == "judge")
     );
+    // The client got no verdicts, so the verdict log was never opened.
+    assert!(!verdict_path.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn safeguards_verdict_log_records_each_returned_verdict() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let temp_dir = tempfile::tempdir()?;
+    let log_path = temp_dir.path().join("verdicts/safeguards.jsonl");
+    let app = build_switchyard_router(load_test_config(&format!(
+        r#"
+schema_version = 1
+[llm_clients.mock]
+format = "openai_chat"
+base_url = "{base_url}"
+max_retries = 0
+failure_cooldown_ms = 0
+[targets.main]
+id = "model/a"
+llm_client = "mock"
+[targets.judge]
+id = "model/judge"
+llm_client = "mock"
+[routes.main]
+id = "{ROUTE_MODEL}"
+type = "passthrough"
+target = "main"
+[routes.judge]
+id = "switchyard/safeguards-judge"
+type = "passthrough"
+target = "judge"
+[safeguards]
+judge_route = "judge"
+verdict_log = "{log_path}"
+"#,
+        base_url = upstream.base_url,
+        log_path = log_path.display(),
+    ))?);
+    // (tool, outcome, reason, explanation, judge answer)
+    let cases = [
+        (
+            "search",
+            "not_flagged",
+            None,
+            None,
+            Some("<block>no</block>"),
+        ),
+        (
+            "rm_everything",
+            "flagged",
+            None,
+            Some("[Test Rule] deletes everything"),
+            Some("<block>yes</block><reason>[Test Rule] deletes everything</reason>"),
+        ),
+        ("judge_down", "unavailable", Some("error"), None, None),
+        (
+            "judge_garbage",
+            "unavailable",
+            Some("error"),
+            None,
+            Some("looks fine"),
+        ),
+    ];
+    let mut expected = Vec::new();
+    for stream in [false, true] {
+        for (index, (tool, ..)) in cases.iter().enumerate() {
+            let request_id = format!("req-{stream}-{index}");
+            let body = json!({
+                "model": ROUTE_MODEL,
+                "max_tokens": 16,
+                "stream": stream,
+                "tools": [{"name": tool, "input_schema": {"type": "object"}}],
+                "messages": [{"role": "user", "content": "mcp-tool-call"}],
+                "safeguards": [{"type": "dangerous_tool_use",
+                    "classifier_context": {"v": 1, "permission_mode": "auto"}}]
+            });
+            let headers = [
+                ("x-claude-code-session-id", "verdict-session"),
+                ("x-client-request-id", request_id.as_str()),
+            ];
+            let response =
+                send_with_headers(&app, "POST", "/v1/messages", Some(body), &headers).await?;
+            assert_eq!(response.status, StatusCode::OK, "{tool}");
+            let id = if stream {
+                response
+                    .text()?
+                    .lines()
+                    .filter_map(|line| line.strip_prefix("data: "))
+                    .filter_map(|data| serde_json::from_str::<Value>(data).ok())
+                    .find_map(|event| event["content_block"]["id"].as_str().map(String::from))
+            } else {
+                response.json()?["content"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .find_map(|block| block["id"].as_str().map(String::from))
+            }
+            .ok_or("missing tool_use")?;
+            expected.push((request_id, id, index));
+        }
+        // A reply without tool uses is not recorded; a failed reply is
+        // recorded as unanswered.
+        for (prompt, request_id) in [
+            ("visible request", format!("plain-{stream}")),
+            ("fail", format!("fail-{stream}")),
+        ] {
+            let body = json!({
+                "model": ROUTE_MODEL,
+                "max_tokens": 16,
+                "stream": stream,
+                "messages": [{"role": "user", "content": prompt}],
+                "safeguards": [{"type": "dangerous_tool_use",
+                    "classifier_context": {"v": 1, "permission_mode": "auto"}}]
+            });
+            let headers = [("x-client-request-id", request_id.as_str())];
+            send_with_headers(&app, "POST", "/v1/messages", Some(body), &headers).await?;
+        }
+    }
+
+    // A writer thread appends the records; wait for all of them.
+    let want = expected.len() * 2 + 2;
+    let mut records: Vec<Value> = Vec::new();
+    for _ in 0..100 {
+        records = std::fs::read_to_string(&log_path)
+            .unwrap_or_default()
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        if records.len() >= want {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(records.len(), want, "{records:#?}");
+    for (request_id, id, index) in &expected {
+        let (tool, outcome, reason, explanation, answer) = cases[*index];
+        let of_request: Vec<_> = records
+            .iter()
+            .filter(|r| r["request_id"] == request_id.as_str())
+            .collect();
+        let verdicts: Vec<_> = of_request
+            .iter()
+            .filter(|r| r["kind"] == "verdict")
+            .collect();
+        assert_eq!(verdicts.len(), 1, "{request_id}: {records:#?}");
+        let verdict = verdicts[0];
+        assert_eq!(verdict["session_id"], "verdict-session");
+        assert_eq!(verdict["route"], ROUTE_MODEL);
+        assert_eq!(verdict["judge_route"], "switchyard/safeguards-judge");
+        assert_eq!(verdict["tool_use_id"], id.as_str());
+        assert_eq!(verdict["name"], tool);
+        assert_eq!(verdict["input"], json!({"q": "rust"}));
+        assert_eq!(verdict["outcome"], outcome, "{request_id}");
+        assert_eq!(verdict["reason"], json!(reason), "{request_id}");
+        assert_eq!(verdict["explanation"], json!(explanation), "{request_id}");
+        assert_eq!(verdict["judge_answer"], json!(answer), "{request_id}");
+        assert_eq!(verdict["error"].is_string(), outcome == "unavailable");
+        assert!(verdict["latency_ms"].is_u64());
+        assert!(verdict["ts"].is_string());
+        // No conversation text is kept.
+        assert!(!verdict.to_string().contains("mcp-tool-call"));
+        let responses: Vec<_> = of_request
+            .iter()
+            .filter(|r| r["kind"] == "response")
+            .collect();
+        assert_eq!(responses.len(), 1, "{request_id}: {records:#?}");
+        assert_eq!(responses[0]["status"], "available");
+        assert_eq!(responses[0]["tool_uses"], 1);
+    }
+    for stream in [false, true] {
+        let failed: Vec<_> = records
+            .iter()
+            .filter(|r| r["request_id"] == format!("fail-{stream}"))
+            .collect();
+        assert_eq!(failed.len(), 1, "{records:#?}");
+        assert_eq!(failed[0]["kind"], "response");
+        assert_eq!(failed[0]["status"], "unanswered");
+        assert!(
+            records
+                .iter()
+                .all(|r| r["request_id"] != format!("plain-{stream}"))
+        );
+    }
     Ok(())
 }
 
