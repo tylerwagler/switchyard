@@ -204,6 +204,7 @@ pub struct ServerState {
     rerank: BTreeMap<String, RerankConfig>,
     search: BTreeMap<String, SearchConfig>,
     safeguards_shadow: Option<Arc<safeguards::ShadowLog>>,
+    safeguards_verdicts: Option<Arc<safeguards::VerdictLog>>,
 }
 
 #[derive(Clone)]
@@ -271,6 +272,29 @@ impl ServerState {
                 },
             )?)),
         };
+        // Shadow mode returns no verdicts, so the verdict log stays closed.
+        let safeguards_verdicts = match runner.safeguards() {
+            Some(judge) if judge.shadow_log.is_none() => judge.verdict_log.as_ref(),
+            Some(judge) => {
+                if let Some(path) = &judge.verdict_log {
+                    tracing::warn!(path = %path.display(),
+                        "safeguards verdict_log records nothing in shadow mode");
+                }
+                None
+            }
+            None => None,
+        }
+        .map(|path| {
+            safeguards::VerdictLog::open(path)
+                .map(Arc::new)
+                .map_err(|error| {
+                    ServerError::new(format!(
+                        "cannot open safeguards verdict log {}: {error}",
+                        path.display()
+                    ))
+                })
+        })
+        .transpose()?;
         Ok(Self {
             redactor: Arc::new(redactor),
             runner: Arc::new(runner),
@@ -284,6 +308,7 @@ impl ServerState {
             rerank,
             search,
             safeguards_shadow,
+            safeguards_verdicts,
         })
     }
 
@@ -1183,8 +1208,15 @@ async fn handle_llm_request(
     let (mut safeguards, classifier_tap) = if wire_format == WireFormat::AnthropicMessages {
         let session_id = metadata.session_id.clone();
         (
-            safeguards::take_request(&mut body)
-                .map(|context| safeguards::answer(&state, context, &body, session_id.clone())),
+            safeguards::take_request(&mut body).map(|context| {
+                safeguards::answer(
+                    &state,
+                    context,
+                    &body,
+                    session_id.clone(),
+                    metadata.correlation_id.clone(),
+                )
+            }),
             safeguards::client_classifier_tap(&state, &body, session_id),
         )
     } else {
