@@ -630,7 +630,8 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
         .route("/v1/embeddings", post(auxiliary::embeddings_default))
         .route("/v1/embeddings/{name}", post(auxiliary::embeddings_named))
         .route("/v1/rerank", post(auxiliary::rerank_default))
-        .route("/v1/rerank/{name}", post(auxiliary::rerank_named));
+        .route("/v1/rerank/{name}", post(auxiliary::rerank_named))
+        .route("/search", get(websearch::searxng_compat));
     if state.routing_log.is_some() {
         router = router.route("/v1/routing/session-stats", get(get_session_stats));
     }

@@ -655,3 +655,63 @@ async fn web_search_answers_safeguards() -> TestResult {
     }
     Ok(())
 }
+
+// --- the SearXNG-shaped endpoint ---------------------------------------------
+
+#[tokio::test]
+async fn search_endpoint_serves_searxng_shaped_results() -> TestResult {
+    let stub = SearxngStub::start(sample_results(), 0).await?;
+    let upstream = UpstreamApp::start().await?;
+    let app = started_router(&stub.base_url, &upstream.base_url, true).await?;
+
+    let response = send(
+        &app,
+        "GET",
+        "/search?q=hello%20world&format=json&pageno=1",
+        None,
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let body: Value = serde_json::from_slice(&response.bytes)?;
+    assert_eq!(body["query"], "hello world");
+    let results = body["results"].as_array().expect("results array");
+    assert_eq!(
+        results.len(),
+        body["number_of_results"].as_u64().unwrap() as usize
+    );
+    assert_eq!(results[0]["url"], "https://example.com/a");
+    assert!(results[0]["title"].is_string() && results[0]["content"].is_string());
+    // score descends in rank order, so a client sorting by score keeps the ranking
+    assert!(results[0]["score"].as_f64() > results[1]["score"].as_f64());
+    // the query reached SearXNG exactly once, as typed
+    assert_eq!(stub.recorded_queries().await, vec!["hello world"]);
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_endpoint_refuses_without_query_or_when_disabled() -> TestResult {
+    let stub = SearxngStub::start(sample_results(), 0).await?;
+    let upstream = UpstreamApp::start().await?;
+    let app = started_router(&stub.base_url, &upstream.base_url, true).await?;
+    let response = send(&app, "GET", "/search?format=json", None).await?;
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+    let response = send(&app, "GET", "/search?q=x&format=html", None).await?;
+    assert_eq!(response.status, StatusCode::BAD_REQUEST);
+
+    let off = started_router(&stub.base_url, &upstream.base_url, false).await?;
+    let response = send(&off, "GET", "/search?q=hello&format=json", None).await?;
+    assert_eq!(response.status, StatusCode::SERVICE_UNAVAILABLE);
+    assert!(stub.recorded_queries().await.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_endpoint_reports_an_outage() -> TestResult {
+    // more failures than the bridge retries: the endpoint must say so, not return []
+    let stub = SearxngStub::start(sample_results(), 10).await?;
+    let upstream = UpstreamApp::start().await?;
+    let app = started_router(&stub.base_url, &upstream.base_url, true).await?;
+    let response = send(&app, "GET", "/search?q=hello&format=json", None).await?;
+    assert_eq!(response.status, StatusCode::BAD_GATEWAY);
+    Ok(())
+}
