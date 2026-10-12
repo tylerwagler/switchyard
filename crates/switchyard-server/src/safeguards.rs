@@ -17,12 +17,16 @@
 //! In shadow mode the answer stays `unsupported`. The judge still runs, in the
 //! background, and its verdicts are logged next to Claude Code's own
 //! classifier exchanges, so a judge can be graded before it decides anything.
+//!
+//! Outside shadow mode, an optional verdict log records each verdict the
+//! server returns, with the tool use it decided, so a judge's decisions on real
+//! traffic can be graded and its denials looked into.
 
 use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::StreamExt;
 use futures_util::future::{BoxFuture, join_all};
@@ -61,25 +65,88 @@ pub(crate) struct ShadowLog(parking_lot::Mutex<std::fs::File>);
 
 impl ShadowLog {
     pub(crate) fn open(path: &Path) -> std::io::Result<Self> {
-        if let Some(parent) = path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
-        Ok(Self(parking_lot::Mutex::new(file)))
+        Ok(Self(parking_lot::Mutex::new(open_append(path)?)))
     }
 
     fn append(&self, mut record: Value) {
-        record["ts"] =
-            Value::String(humantime::format_rfc3339_millis(SystemTime::now()).to_string());
+        stamp(&mut record);
         let line = format!("{record}\n");
         if let Err(error) = self.0.lock().write_all(line.as_bytes()) {
             tracing::warn!(%error, "safeguards shadow log append failed");
+        }
+    }
+}
+
+/// Append-only JSONL file of the verdicts the server returns. A writer thread
+/// appends the records, so the disk never delays a reply. A write error is
+/// logged once, until a write succeeds again.
+pub(crate) struct VerdictLog(std::sync::mpsc::Sender<Value>);
+
+impl VerdictLog {
+    pub(crate) fn open(path: &Path) -> std::io::Result<Self> {
+        let mut file = open_append(path)?;
+        let (sender, records) = std::sync::mpsc::channel::<Value>();
+        let path = path.to_path_buf();
+        std::thread::Builder::new()
+            .name("safeguards-verdict-log".to_string())
+            .spawn(move || {
+                let mut failing = false;
+                for record in records {
+                    match file.write_all(format!("{record}\n").as_bytes()) {
+                        Ok(()) => failing = false,
+                        Err(error) if !failing => {
+                            failing = true;
+                            tracing::warn!(path = %path.display(), %error,
+                                "safeguards verdict log append failed");
+                        }
+                        Err(_) => {}
+                    }
+                }
+            })?;
+        Ok(Self(sender))
+    }
+
+    fn append(&self, mut record: Value) {
+        stamp(&mut record);
+        // The writer thread lives as long as the sender.
+        let _ = self.0.send(record);
+    }
+}
+
+fn open_append(path: &Path) -> std::io::Result<std::fs::File> {
+    if let Some(parent) = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
+fn stamp(record: &mut Value) {
+    record["ts"] = Value::String(humantime::format_rfc3339_millis(SystemTime::now()).to_string());
+}
+
+/// Records a reply whose verdicts were never returned: the answer was dropped
+/// before it ran (an upstream error, or a stream that ended without its
+/// `message_delta`) or while the judge was still deciding (the client left).
+struct Unanswered(Option<(Arc<VerdictLog>, Value)>);
+
+impl Unanswered {
+    fn disarm(mut self) -> Option<(Arc<VerdictLog>, Value)> {
+        self.0.take()
+    }
+}
+
+impl Drop for Unanswered {
+    fn drop(&mut self) {
+        if let Some((log, mut record)) = self.0.take() {
+            record["kind"] = json!("response");
+            record["status"] = json!("unanswered");
+            log.append(record);
         }
     }
 }
@@ -110,6 +177,7 @@ pub(crate) fn answer(
     context: Value,
     body: &Value,
     session_id: Option<String>,
+    request_id: Option<String>,
 ) -> Answer {
     let Some(judge) = state.runner.safeguards() else {
         return Box::new(|_| Box::pin(async { unsupported() }));
@@ -121,17 +189,74 @@ pub(crate) fn answer(
         context,
         transcript: render_transcript(body),
     };
-    let Some(log) = state.safeguards_shadow.clone() else {
+    if let Some(log) = state.safeguards_shadow.clone() {
+        return Box::new(move |tool_uses| {
+            Box::pin(async move {
+                if !tool_uses.is_empty() {
+                    tokio::spawn(shadow_judge(judge, tool_uses, session_id, log));
+                }
+                unsupported()
+            })
+        });
+    }
+    let Some(log) = state.safeguards_verdicts.clone() else {
         return Box::new(move |tool_uses| Box::pin(async move { judge.results(tool_uses).await }));
     };
+    let base = json!({
+        "session_id": session_id,
+        "request_id": request_id,
+        "route": body["model"],
+        "judge_route": judge.model.as_str(),
+    });
+    let unanswered = Unanswered(Some((log, base)));
     Box::new(move |tool_uses| {
         Box::pin(async move {
-            if !tool_uses.is_empty() {
-                tokio::spawn(shadow_judge(judge, tool_uses, session_id, log));
+            let started = Instant::now();
+            let decisions = judge.decide(&tool_uses).await;
+            let latency_ms = started.elapsed().as_millis() as u64;
+            let results = available(
+                tool_uses
+                    .iter()
+                    .zip(&decisions)
+                    .map(|(tool, decision)| (tool.id.clone(), decision.verdict.clone()))
+                    .collect(),
+            );
+            if let Some((log, base)) = unanswered.disarm()
+                && !tool_uses.is_empty()
+            {
+                record_verdicts(&log, &base, &tool_uses, &decisions);
+                let mut record = base;
+                record["kind"] = json!("response");
+                record["status"] = results[0]["status"]["type"].clone();
+                record["tool_uses"] = json!(tool_uses.len());
+                record["latency_ms"] = json!(latency_ms);
+                log.append(record);
             }
-            unsupported()
+            results
         })
     })
+}
+
+fn record_verdicts(log: &VerdictLog, base: &Value, tool_uses: &[ToolUse], decisions: &[Decision]) {
+    for (tool, decision) in tool_uses.iter().zip(decisions) {
+        let verdict = &decision.verdict;
+        let mut record = base.clone();
+        record["kind"] = json!("verdict");
+        record["tool_use_id"] = json!(tool.id);
+        record["name"] = json!(tool.name);
+        record["input"] = tool.input.clone();
+        record["outcome"] = if verdict["type"] == "unavailable" {
+            json!("unavailable")
+        } else {
+            verdict["outcome"].clone()
+        };
+        record["reason"] = verdict.get("reason").cloned().unwrap_or(Value::Null);
+        record["explanation"] = verdict.get("explanation").cloned().unwrap_or(Value::Null);
+        record["latency_ms"] = json!(decision.latency.as_millis() as u64);
+        record["judge_answer"] = json!(decision.answer);
+        record["error"] = json!(decision.error);
+        log.append(record);
+    }
 }
 
 async fn shadow_judge(
@@ -325,6 +450,16 @@ fn hold_for_answer(events: RawEventStream, answer: Answer, ping_every: Duration)
     })
 }
 
+/// One verdict, with what the verdict log keeps about how it was reached.
+struct Decision {
+    verdict: Value,
+    latency: Duration,
+    /// The judge's answer text, when it gave one.
+    answer: Option<String>,
+    /// Why there is no verdict, when there is none.
+    error: Option<String>,
+}
+
 struct Judge {
     state: ServerState,
     model: ModelId,
@@ -335,32 +470,48 @@ struct Judge {
 
 impl Judge {
     async fn results(&self, tool_uses: Vec<ToolUse>) -> Value {
-        let verdicts = join_all(tool_uses.iter().map(|tool| self.verdict(&tool_uses, tool))).await;
+        let decisions = self.decide(&tool_uses).await;
         available(
             tool_uses
                 .iter()
                 .map(|tool| tool.id.clone())
-                .zip(verdicts)
+                .zip(decisions.into_iter().map(|decision| decision.verdict))
                 .collect(),
         )
     }
 
-    async fn verdict(&self, all: &[ToolUse], tool: &ToolUse) -> Value {
-        let text = match tokio::time::timeout(self.timeout, self.ask(all, tool)).await {
+    async fn decide(&self, tool_uses: &[ToolUse]) -> Vec<Decision> {
+        join_all(tool_uses.iter().map(|tool| self.verdict(tool_uses, tool))).await
+    }
+
+    async fn verdict(&self, all: &[ToolUse], tool: &ToolUse) -> Decision {
+        let started = Instant::now();
+        let reply = tokio::time::timeout(self.timeout, self.ask(all, tool)).await;
+        let latency = started.elapsed();
+        let (verdict, answer, error) = match reply {
             Err(_) => {
                 tracing::warn!(tool = %tool.name, "safeguards judge timed out");
-                return unavailable("timeout");
+                (unavailable("timeout"), None, Some("timeout".to_string()))
             }
             Ok(Err(error)) => {
                 tracing::warn!(tool = %tool.name, %error, "safeguards judge failed");
-                return unavailable("error");
+                (unavailable("error"), None, Some(error))
             }
-            Ok(Ok(text)) => text,
+            Ok(Ok(text)) => match parse_verdict(&text) {
+                Some(verdict) => (verdict, Some(text), None),
+                None => {
+                    tracing::warn!(tool = %tool.name, "safeguards judge answer had no verdict");
+                    let error = "the answer had no verdict".to_string();
+                    (unavailable("error"), Some(text), Some(error))
+                }
+            },
         };
-        parse_verdict(&text).unwrap_or_else(|| {
-            tracing::warn!(tool = %tool.name, "safeguards judge answer had no verdict");
-            unavailable("error")
-        })
+        Decision {
+            verdict,
+            latency,
+            answer,
+            error,
+        }
     }
 
     async fn ask(&self, all: &[ToolUse], tool: &ToolUse) -> Result<String, String> {

@@ -496,6 +496,25 @@ With it, every tool use in a reply is judged by one short request through `judge
 | `judge_route` | Yes | — | Key under `[routes]` (not the route `id`) whose model judges each tool use. |
 | `timeout_ms` | No | `60000` | Time allowed for one verdict. A timeout or error reports the check as unavailable, never as allowed. |
 | `shadow_log` | No | unset | Path to a JSONL file. Turns on shadow mode: the server still answers that it does not run the check, runs the judge in the background, and appends its verdicts and Claude Code's own classifier exchanges to this file. |
+| `verdict_log` | No | unset | Path to a JSONL file. Records each verdict the server returns. It records nothing in shadow mode, because there the server returns no verdicts. The file holds tool names and inputs, never the conversation. |
+
+The verdict log is written by a background thread, so a slow or failing disk never
+delays or fails a reply. A write error is logged once until a write succeeds again.
+Each line is one JSON object. All lines carry `ts`, `kind`, `session_id` (from
+`x-claude-code-session-id`), `request_id` (the first of `x-switchyard-request-id`,
+`x-request-id` and `x-client-request-id`), `route` (the requested model) and `judge_route` (the judge's
+route id).
+
+- `kind: "verdict"`: one per judged tool use. It adds `tool_use_id`, `name`, `input`,
+  `outcome` (`flagged`, `not_flagged` or `unavailable`), `reason` (for `unavailable`:
+  `timeout` or `error`), `explanation` (for `flagged`), `latency_ms`, `judge_answer`
+  (the judge's raw text, or null when it gave none) and `error` (why there is no
+  verdict, or null).
+- `kind: "response"`: one per reply. `status` is the returned status (`available`),
+  with `tool_uses` (the count) and `latency_ms` (all verdicts). A reply without tool
+  uses is not recorded. `status: "unanswered"` means the client received no verdicts:
+  the upstream request failed, the stream ended early, or the client left while the
+  judge was deciding.
 
 ## `[web_search]`
 

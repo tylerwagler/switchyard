@@ -174,7 +174,9 @@ Notes on the choices:
   [`[llm_clients.<name>]`](../reference/toml_schema.md#llm_clientsname).
 - **`[safeguards]`** sends one short judge request per tool use through the
   named route. Add `shadow_log = "/var/lib/switchyard/safeguards.jsonl"` to
-  log the judge's verdicts without acting on them.
+  log the judge's verdicts without acting on them. Once the judge decides, add
+  `verdict_log = "/var/lib/switchyard/verdicts.jsonl"` to keep a record of each
+  verdict the server returns.
 - The judge and the efficient tier share a model id, so they must share an
   `llm_client` and the same `extra_body`. To give the judge its own settings,
   such as thinking turned off, serve the model under a second name (vLLM's

@@ -90,6 +90,10 @@ pub(crate) struct DeploymentConfig {
 /// anything: Switchyard still answers that it does not run the check, runs the
 /// judge in the background, and appends its verdicts and Claude Code's own
 /// classifier exchanges to this JSONL file.
+///
+/// `verdict_log` records every verdict the server returns, one JSONL record per
+/// judged tool use. It records nothing in shadow mode, where the server returns
+/// no verdicts.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SafeguardsConfig {
@@ -98,6 +102,8 @@ struct SafeguardsConfig {
     timeout_ms: Option<u64>,
     #[serde(default)]
     shadow_log: Option<std::path::PathBuf>,
+    #[serde(default)]
+    verdict_log: Option<std::path::PathBuf>,
 }
 
 /// The judge for Claude Code's server-side auto mode check.
@@ -109,6 +115,8 @@ pub struct SafeguardsJudge {
     pub timeout: std::time::Duration,
     /// Shadow mode's JSONL file. When set, the judge's verdicts are only logged.
     pub shadow_log: Option<std::path::PathBuf>,
+    /// JSONL file for the verdicts the server returns. Unused in shadow mode.
+    pub verdict_log: Option<std::path::PathBuf>,
 }
 
 /// Opt-in hosted web search: serves Claude Code's server-side `web_search` tool
@@ -768,6 +776,7 @@ impl DeploymentConfig {
                         config.timeout_ms.unwrap_or(DEFAULT_SAFEGUARDS_TIMEOUT_MS),
                     ),
                     shadow_log: config.shadow_log,
+                    verdict_log: config.verdict_log,
                 })
             }
         };
@@ -2950,6 +2959,7 @@ target = "t"
         assert!(runner.exact_route(judge.model.as_str()).is_some());
         assert_eq!(judge.timeout, std::time::Duration::from_millis(5000));
         assert!(judge.shadow_log.is_none());
+        assert!(judge.verdict_log.is_none());
         let toml = format!("{BASE}\n[safeguards]\njudge_route = \"r\"\nshadow_log = \"s.jsonl\"\n");
         let runner = runner_from_toml(&toml).expect("shadow safeguards resolves");
         let judge = runner.safeguards().expect("safeguards configured");
@@ -2957,6 +2967,17 @@ target = "t"
             judge.shadow_log.as_deref(),
             Some(std::path::Path::new("s.jsonl"))
         );
+        let toml =
+            format!("{BASE}\n[safeguards]\njudge_route = \"r\"\nverdict_log = \"v.jsonl\"\n");
+        let runner = runner_from_toml(&toml).expect("verdict log resolves");
+        let judge = runner.safeguards().expect("safeguards configured");
+        assert!(judge.shadow_log.is_none());
+        assert_eq!(
+            judge.verdict_log.as_deref(),
+            Some(std::path::Path::new("v.jsonl"))
+        );
+        let toml = format!("{BASE}\n[safeguards]\njudge_route = \"r\"\nverdict_logs = \"v\"\n");
+        assert!(error_message(&toml).contains("verdict_logs"));
     }
 
     #[test]
