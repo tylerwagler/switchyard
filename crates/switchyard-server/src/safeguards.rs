@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::StreamExt;
-use futures_util::future::{BoxFuture, join_all};
+use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
 use switchyard_protocol::{Metadata, ModelId};
 use switchyard_translation::{RawEventStream, WireFormat, encode_aggregated_response};
@@ -43,8 +43,15 @@ const PING_EVERY: Duration = Duration::from_secs(10);
 /// The judge sees the start of the conversation (the task) and its recent part.
 const TRANSCRIPT_HEAD_CHARS: usize = 6_000;
 const TRANSCRIPT_TAIL_CHARS: usize = 54_000;
+/// A long conversation loses its middle in steps of this many characters, so
+/// the cut stays put while the conversation grows by up to one step, and
+/// consecutive judge requests of a session share their prompt prefix: the judge
+/// server reuses its cached prefill instead of reading the transcript again.
+const TRANSCRIPT_CUT_STEP_CHARS: usize = 16_000;
 const REASON_MAX_CHARS: usize = 300;
-const JUDGE_MAX_TOKENS: u64 = 256;
+/// The verdict tag comes first and the reason is one short sentence; the
+/// longest answer in the 2026-10-12 replays of this prompt was 45 tokens.
+const JUDGE_MAX_TOKENS: u64 = 96;
 
 /// One tool use in a reply.
 #[derive(Debug, Clone, PartialEq)]
@@ -447,6 +454,11 @@ fn hold_for_answer(events: RawEventStream, answer: Answer, ping_every: Duration)
             }
             yield Ok(event);
         }
+        if answer.is_some() {
+            // The verdict log records this reply as unanswered; this tells it
+            // apart from a client that left mid-stream.
+            tracing::warn!("safeguards: the stream ended without its message_delta, so no verdict was sent");
+        }
     })
 }
 
@@ -480,8 +492,16 @@ impl Judge {
         )
     }
 
+    /// Decides the tool uses one after another. Their requests share the
+    /// prompt up to the transcript's end, and the judge server reuses a cached
+    /// prefill only for a request that follows the one that made it: in
+    /// parallel, each would read the whole transcript again on its own slot.
     async fn decide(&self, tool_uses: &[ToolUse]) -> Vec<Decision> {
-        join_all(tool_uses.iter().map(|tool| self.verdict(tool_uses, tool))).await
+        let mut decisions = Vec::with_capacity(tool_uses.len());
+        for tool in tool_uses {
+            decisions.push(self.verdict(tool_uses, tool).await);
+        }
+        decisions
     }
 
     async fn verdict(&self, all: &[ToolUse], tool: &ToolUse) -> Decision {
@@ -579,13 +599,37 @@ fn render_transcript(body: &Value) -> String {
             _ => {}
         }
     }
+    shorten_transcript(out)
+}
+
+/// Keeps the first `TRANSCRIPT_HEAD_CHARS` and at most `TRANSCRIPT_TAIL_CHARS`
+/// of the rest. The removed middle grows in whole `TRANSCRIPT_CUT_STEP_CHARS`
+/// steps and ends at a line break, so the kept text only changes at its end
+/// until the conversation outgrows the next step.
+fn shorten_transcript(out: String) -> String {
     let chars = out.chars().count();
-    if chars <= TRANSCRIPT_HEAD_CHARS + TRANSCRIPT_TAIL_CHARS {
+    let Some(overflow) = chars.checked_sub(TRANSCRIPT_HEAD_CHARS + TRANSCRIPT_TAIL_CHARS) else {
+        return out;
+    };
+    if overflow == 0 {
         return out;
     }
-    let head: String = out.chars().take(TRANSCRIPT_HEAD_CHARS).collect();
-    let tail: String = out.chars().skip(chars - TRANSCRIPT_TAIL_CHARS).collect();
-    format!("{head}\n[... earlier conversation removed ...]\n{tail}")
+    let removed = overflow.div_ceil(TRANSCRIPT_CUT_STEP_CHARS) * TRANSCRIPT_CUT_STEP_CHARS;
+    let byte_at = |char_index: usize| {
+        out.char_indices()
+            .nth(char_index)
+            .map_or(out.len(), |(byte, _)| byte)
+    };
+    let head_end = byte_at(TRANSCRIPT_HEAD_CHARS);
+    let cut = byte_at(TRANSCRIPT_HEAD_CHARS + removed);
+    let tail_start = out[cut..]
+        .find('\n')
+        .map_or(cut, |line_end| cut + line_end + 1);
+    format!(
+        "{}\n[... earlier conversation removed ...]\n{}",
+        &out[..head_end],
+        &out[tail_start..]
+    )
 }
 
 /// Renders one judge request. `<action>` holds only the tool use under review.
@@ -844,6 +888,44 @@ mod tests {
             // The shared parts come first, so the judge's prompt cache serves every sibling.
             assert!(rendered.starts_with("<environment>\n{}\n</environment>\n<transcript>\n"));
         }
+    }
+
+    #[test]
+    fn a_growing_transcript_keeps_its_prefix_between_cut_steps() {
+        let removed = "\n[... earlier conversation removed ...]\n";
+        let mut messages =
+            vec![json!({"role": "user", "content": format!("TASK {}", "t".repeat(7_000))})];
+        let mut previous: Option<String> = None;
+        let (mut kept_prefix, mut moved) = (0, 0);
+        for turn in 0..400 {
+            messages.push(
+                json!({"role": "assistant", "content": format!("turn {turn} {}", "x".repeat(500))}),
+            );
+            let transcript = render_transcript(&json!({"messages": messages}));
+            let budget = TRANSCRIPT_HEAD_CHARS + removed.len() + TRANSCRIPT_TAIL_CHARS;
+            assert!(transcript.chars().count() <= budget, "turn {turn}");
+            assert!(transcript.starts_with("user: TASK"));
+            assert!(transcript.ends_with(&format!("turn {turn} {}\n", "x".repeat(500))));
+            if let Some((_, tail)) = transcript.split_once(removed) {
+                // The kept tail starts at a message line and holds at least
+                // all but one step of the tail budget.
+                assert!(tail.starts_with("assistant: turn "), "turn {turn}");
+                assert!(
+                    tail.chars().count() > TRANSCRIPT_TAIL_CHARS - TRANSCRIPT_CUT_STEP_CHARS - 600
+                );
+            }
+            if let Some(previous) = previous.replace(transcript.clone()) {
+                if transcript.starts_with(previous.as_str()) {
+                    kept_prefix += 1;
+                } else {
+                    moved += 1;
+                }
+            }
+        }
+        // 400 turns of ~515 chars outgrow the budget by ~150k chars: about ten
+        // cut steps, and every other turn only appends.
+        assert!(moved <= 12, "the cut moved on {moved} turns");
+        assert!(kept_prefix >= 385, "{kept_prefix}");
     }
 
     #[test]
