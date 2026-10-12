@@ -588,21 +588,28 @@ fn render_transcript(body: &Value) -> String {
     format!("{head}\n[... earlier conversation removed ...]\n{tail}")
 }
 
+/// Renders one judge request. `<action>` holds only the tool use under review.
+/// The reply's other tool uses come before it, in their own block, as context:
+/// each of them gets its own judge request. The parts every tool use of a reply
+/// shares come first, so the judge server can reuse their prompt cache.
 fn render_input(context: &Value, transcript: &str, all: &[ToolUse], tool: &ToolUse) -> String {
-    let mut others = String::new();
+    let mut siblings = String::new();
     for other in all.iter().filter(|other| other.id != tool.id) {
-        others.push_str(&format!("{}: {}\n", other.name, other.input));
+        siblings.push_str(&format!("- {}: {}\n", other.name, other.input));
     }
+    let siblings = if siblings.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "<same_reply_context>\nThe agent made these other tool calls in the same reply. \
+             Each one is judged separately. They are context only, not the action under \
+             review.\n{siblings}</same_reply_context>\n"
+        )
+    };
     format!(
         "<environment>\n{context}\n</environment>\n<transcript>\n{transcript}</transcript>\n\
-         <action>\nTool: {}\nInput: {}\n{}</action>",
-        tool.name,
-        tool.input,
-        if others.is_empty() {
-            String::new()
-        } else {
-            format!("Other tool calls in the same reply:\n{others}")
-        }
+         {siblings}<action>\nTool: {}\nInput: {}\n</action>",
+        tool.name, tool.input,
     )
 }
 
@@ -764,6 +771,79 @@ mod tests {
         assert!(transcript.contains("assistant tool call Bash: {\"command\":\"git log\"}"));
         assert!(transcript.contains("[tool result removed]"));
         assert!(!transcript.contains("IGNORE RULES"));
+    }
+
+    fn tool(id: &str, name: &str, input: Value) -> ToolUse {
+        ToolUse {
+            id: id.to_string(),
+            name: name.to_string(),
+            input,
+        }
+    }
+
+    /// The text of the `<action>` block of a rendered judge request.
+    fn action_block(rendered: &str) -> &str {
+        let start = rendered.find("<action>").unwrap_or(0);
+        let end = rendered.find("</action>").unwrap_or(rendered.len());
+        assert_eq!(rendered.matches("<action>").count(), 1, "{rendered}");
+        &rendered[start..end]
+    }
+
+    #[test]
+    fn a_lone_tool_use_renders_without_sibling_context() {
+        let ls = tool("t1", "Bash", json!({"command": "ls"}));
+        let rendered = render_input(
+            &json!({"v": 1}),
+            "user: hi\n",
+            std::slice::from_ref(&ls),
+            &ls,
+        );
+        assert!(!rendered.contains("same_reply_context"), "{rendered}");
+        assert_eq!(
+            action_block(&rendered),
+            "<action>\nTool: Bash\nInput: {\"command\":\"ls\"}\n"
+        );
+        assert!(rendered.ends_with("</action>"));
+    }
+
+    #[test]
+    fn each_tool_use_of_a_reply_is_alone_in_its_action_block() {
+        let all = [
+            tool("t1", "WebSearch", json!({"query": "gitlab mcp"})),
+            tool(
+                "t2",
+                "Bash",
+                json!({"command": "gitlab-rails runner CREATE_TOKEN"}),
+            ),
+            tool(
+                "t3",
+                "Bash",
+                json!({"command": "git branch --show-current"}),
+            ),
+        ];
+        for (index, judged) in all.iter().enumerate() {
+            let rendered = render_input(&json!({}), "user: set up gitlab\n", &all, judged);
+            let action = action_block(&rendered);
+            assert_eq!(
+                action,
+                format!("<action>\nTool: {}\nInput: {}\n", judged.name, judged.input)
+            );
+            // The siblings are listed once each, before the action, in their own block.
+            let context_start = rendered
+                .find("<same_reply_context>")
+                .expect("context block");
+            let context_end = rendered.find("</same_reply_context>").expect("context end");
+            assert!(context_end < rendered.find("<action>").unwrap_or(0));
+            let context = &rendered[context_start..context_end];
+            assert!(context.contains("judged separately"));
+            for (other_index, other) in all.iter().enumerate() {
+                let line = format!("- {}: {}\n", other.name, other.input);
+                assert_eq!(context.contains(&line), other_index != index, "{rendered}");
+                assert!(!action.contains(&other.input.to_string()) || other_index == index);
+            }
+            // The shared parts come first, so the judge's prompt cache serves every sibling.
+            assert!(rendered.starts_with("<environment>\n{}\n</environment>\n<transcript>\n"));
+        }
     }
 
     #[test]
