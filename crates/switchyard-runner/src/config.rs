@@ -582,6 +582,8 @@ struct RouteConfig {
     display_name: Option<String>,
     description: Option<String>,
     strip_attribution: bool,
+    /// Whether `GET /v1/models` lists this route. Defaults to true.
+    listed: Option<bool>,
     algorithm: AlgorithmSpec,
 }
 
@@ -604,6 +606,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let display_name = take_optional(&mut table, "display_name")?;
         let description = take_optional(&mut table, "description")?;
         let strip_attribution = take_optional(&mut table, "strip_attribution")?.unwrap_or(false);
+        let listed = take_optional(&mut table, "listed")?;
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
             .map_err(serde::de::Error::custom)?;
         Ok(Self {
@@ -615,6 +618,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             display_name,
             description,
             strip_attribution,
+            listed,
             algorithm,
         })
     }
@@ -885,7 +889,8 @@ impl DeploymentConfig {
                 models,
             )
             .with_listing(config.display_name.clone(), config.description.clone())
-            .with_attribution_strip(config.strip_attribution);
+            .with_attribution_strip(config.strip_attribution)
+            .with_listed(config.listed.unwrap_or(true));
             routes.push((config.id.clone(), route));
         }
         let web_search =

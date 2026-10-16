@@ -1680,7 +1680,7 @@ async fn models(
         return Json(available_models(&state).await);
     }
     let mut payload = model_list_payload(
-        state.runner.models(),
+        state.runner.models().filter(|model| model.listed),
         state.runner.default_route().map(|id| id.as_str()),
     );
     // Advertise non-chat backends too, so /v1/models is a truthful capability
@@ -1697,6 +1697,7 @@ async fn available_models(state: &ServerState) -> Value {
     let mut urls: Vec<&str> = state
         .runner
         .models()
+        .filter(|model| model.listed)
         .flat_map(|model| model.base_urls)
         .collect();
     urls.sort_unstable();
@@ -1713,6 +1714,7 @@ async fn available_models(state: &ServerState) -> Value {
         state
             .runner
             .models()
+            .filter(|model| model.listed)
             .filter(|model| model.base_urls.iter().any(|url| reachable.contains(url))),
         state.runner.default_route().map(|id| id.as_str()),
     )

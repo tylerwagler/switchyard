@@ -46,6 +46,8 @@ pub struct ModelInfo<'a> {
     pub display_name: Option<&'a str>,
     /// Configured one-line description.
     pub description: Option<&'a str>,
+    /// Whether `/v1/models` lists this route.
+    pub listed: bool,
     /// Base URLs of the upstreams serving this route, deduplicated.
     pub base_urls: Vec<&'a str>,
 }
@@ -250,6 +252,7 @@ impl Runner {
             capabilities: route.capabilities(),
             display_name: route.display_name(),
             description: route.description(),
+            listed: route.listed(),
             base_urls: {
                 let mut urls: Vec<&str> = route.base_urls().collect();
                 urls.sort_unstable();

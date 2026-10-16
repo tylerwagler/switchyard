@@ -8,6 +8,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Unlisted routes** -- a route with `listed = false` still serves callers that
+  name its id but stays out of `GET /v1/models`, for routes that exist for the
+  gateway itself, such as a safeguards judge route.
+
 - **Target model detection** -- a target with `detect_model = true` reports the
   model its backend serves at startup (`GET /v1/models`, then `GET /health`)
   instead of the `id` configured beside it, so a backend model swap does not

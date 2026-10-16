@@ -121,6 +121,7 @@ pub struct Route {
     display_name: Option<String>,
     description: Option<String>,
     strip_attribution: bool,
+    listed: bool,
 }
 
 /// The selected model and untouched response produced by a route execution.
@@ -154,6 +155,7 @@ impl Route {
             display_name: None,
             description: None,
             strip_attribution: false,
+            listed: true,
         }
     }
 
@@ -166,6 +168,20 @@ impl Route {
         self.display_name = display_name;
         self.description = description;
         self
+    }
+
+    /// Sets whether `GET /v1/models` lists this route.
+    ///
+    /// An unlisted route still serves callers that name its id; it exists for the
+    /// gateway itself, like a safeguards judge route.
+    pub fn with_listed(mut self, listed: bool) -> Self {
+        self.listed = listed;
+        self
+    }
+
+    /// Whether `GET /v1/models` lists this route.
+    pub fn listed(&self) -> bool {
+        self.listed
     }
 
     /// Sets whether this route removes Claude Code's attribution block before forwarding.

@@ -4632,6 +4632,45 @@ target = "shared"
     Ok(())
 }
 
+// A route that exists for the gateway itself (a safeguards judge, say) stays out
+// of model discovery while it still serves callers that name its id.
+#[tokio::test]
+async fn unlisted_routes_stay_out_of_model_discovery() -> TestResult {
+    let app = build_switchyard_router(load_test_config(
+        r#"
+schema_version = 1
+
+[llm_clients.primary]
+format = "openai_chat"
+base_url = "https://example.test/v1"
+
+[targets.shared]
+id = "upstream"
+llm_client = "primary"
+
+[routes.visible]
+id = "visible"
+type = "passthrough"
+target = "shared"
+
+[routes.hidden]
+id = "hidden"
+type = "passthrough"
+target = "shared"
+listed = false
+"#,
+    )?);
+    let body = send(&app, "GET", "/v1/models", None).await?.json()?;
+    let entries = body["data"].as_array().cloned().unwrap_or_default();
+    let listed: Vec<&str> = entries
+        .iter()
+        .filter_map(|entry| entry["id"].as_str())
+        .collect();
+    assert!(listed.contains(&"visible"), "{listed:?}");
+    assert!(!listed.contains(&"hidden"), "{listed:?}");
+    Ok(())
+}
+
 #[tokio::test]
 async fn models_endpoint_default_model_is_the_default_route_not_the_first_id() -> TestResult {
     const ROUTES: &str = r#"
