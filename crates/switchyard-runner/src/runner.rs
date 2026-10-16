@@ -72,11 +72,24 @@ impl Runner {
         config::load_runner(path)
     }
 
+    /// Loads a version-1 deployment TOML file, discovering the served model id
+    /// for each `detect_model` target before building the routes.
+    ///
+    /// A target whose backend cannot be reached keeps its configured id.
+    pub async fn load_detected(path: impl AsRef<Path>) -> Result<Self, RunnerError> {
+        config::load_runner_detected(path).await
+    }
+
     /// Loads and validates a version-1 deployment TOML document.
     ///
     /// Use [`Self::load`] when the deployment is stored in a file.
     pub fn from_toml(source: &str) -> Result<Self, RunnerError> {
         config::runner_from_toml(source)
+    }
+
+    /// The TOML-document counterpart of [`Self::load_detected`].
+    pub async fn from_toml_detected(source: &str) -> Result<Self, RunnerError> {
+        config::runner_from_toml_detected(source).await
     }
 
     /// Loads routes whose only completion-side effect is model selection.
@@ -281,5 +294,70 @@ impl Runner {
             selected: resolve(model_ids.next()?)?,
             fallbacks: model_ids.map(resolve).collect::<Option<Vec<_>>>()?,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DEPLOYMENT: &str = r#"
+schema_version = 1
+
+[llm_clients.mock]
+format = "openai_chat"
+base_url = "http://127.0.0.1:9/v1"
+
+[targets.first]
+id = "model/stale"
+llm_client = "mock"
+detect_model = true
+
+[routes.pick]
+id = "switchyard/pick"
+type = "passthrough"
+target = "first"
+"#;
+
+    /// A detected model replaces the configured id; without one the configured id
+    /// stays, so an unreachable backend at startup is not a configuration error.
+    #[test]
+    fn detected_models_replace_the_configured_target_id() {
+        let detected = config::runner_from_toml_with_models(
+            DEPLOYMENT,
+            &BTreeMap::from([("first".to_string(), ModelId::from("model/detected"))]),
+        )
+        .expect("detected deployment");
+        let route = detected.route("switchyard/pick").expect("route");
+        assert!(
+            route
+                .decision_target(&ModelId::from("model/detected"))
+                .is_some()
+        );
+        assert!(
+            route
+                .decision_target(&ModelId::from("model/stale"))
+                .is_none()
+        );
+
+        let undetected = config::runner_from_toml_with_models(DEPLOYMENT, &BTreeMap::new())
+            .expect("undetected deployment");
+        let route = undetected.route("switchyard/pick").expect("route");
+        assert!(
+            route
+                .decision_target(&ModelId::from("model/stale"))
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn detected_models_for_unknown_targets_are_rejected() {
+        let error = config::runner_from_toml_with_models(
+            DEPLOYMENT,
+            &BTreeMap::from([("missing".to_string(), ModelId::from("model/detected"))]),
+        )
+        .err()
+        .expect("unknown target was accepted");
+        assert!(error.to_string().contains("unknown target"), "{error}");
     }
 }

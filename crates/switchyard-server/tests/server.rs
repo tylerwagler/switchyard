@@ -25,7 +25,7 @@ use switchyard_llm_client::{
 use switchyard_protocol::RoutedLlmClient;
 use switchyard_protocol::{Category, ModelId, WireFormat};
 use switchyard_runner::{DecisionTarget, ModelCapabilities, Route, Runner, RuntimeModels};
-use switchyard_server::config::load_server_state;
+use switchyard_server::config::{load_server_state, load_server_state_detected};
 use switchyard_server::{
     DEFAULT_MAX_REQUEST_BODY_BYTES, ServerState, build_llm_router, build_switchyard_router,
 };
@@ -51,6 +51,7 @@ impl MockUpstream {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let app = Router::new()
             .route("/props", get(upstream_props))
+            .route("/v1/models", get(upstream_models))
             .route("/v1/chat/completions", post(upstream_chat))
             .route("/buffered/responses", post(upstream_buffered_responses))
             .route(
@@ -122,6 +123,15 @@ fn has_system_prompt(call: &Value, expected: &str) -> bool {
 async fn upstream_props(State(calls): State<Arc<Mutex<Vec<Value>>>>) -> Json<Value> {
     calls.lock().await.push(json!({"path": "/props"}));
     Json(json!({"default_generation_settings": {"n_ctx": 98_304}}))
+}
+
+/// Names the model this upstream serves, for `detect_model` startup discovery.
+async fn upstream_models() -> HttpResponse {
+    Json(json!({
+        "object": "list",
+        "data": [{"id": "model/detected", "object": "model"}]
+    }))
+    .into_response()
 }
 
 async fn upstream_chat(
@@ -2173,6 +2183,17 @@ fn load_test_config(toml: &str) -> TestResult<ServerState> {
     config.write_all(toml.as_bytes())?;
     config.flush()?;
     Ok(load_server_state(config.path())?)
+}
+
+/// Resolves `detect_model` targets against their backends before loading.
+async fn load_test_config_detected(toml: &str) -> TestResult<ServerState> {
+    let mut config = tempfile::Builder::new()
+        .prefix("switchyard-server-config-")
+        .suffix(".toml")
+        .tempfile()?;
+    config.write_all(toml.as_bytes())?;
+    config.flush()?;
+    Ok(load_server_state_detected(config.path()).await?)
 }
 
 fn weighted_random_state(base_url: &str, weights: [u32; 2]) -> TestResult<ServerState> {
@@ -5567,6 +5588,51 @@ fn first_sse_event(body: &str) -> Option<Value> {
         .filter_map(|line| line.strip_prefix("data: "))
         .filter(|data| *data != "[DONE]")
         .find_map(|data| serde_json::from_str(data).ok())
+}
+
+// A `detect_model` target reports the model its backend actually serves, so a
+// backend swap does not leave the deployment config's id in responses forever.
+#[tokio::test]
+async fn detected_models_name_the_served_model() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let app = build_switchyard_router(
+        load_test_config_detected(&format!(
+            r#"
+schema_version = 1
+
+[llm_clients.mock]
+format = "openai_chat"
+base_url = "{base_url}"
+max_retries = 0
+
+[targets.first]
+id = "model/stale"
+llm_client = "mock"
+detect_model = true
+
+[routes.chat]
+id = "{ROUTE_MODEL}"
+type = "passthrough"
+target = "first"
+"#,
+            base_url = upstream.base_url,
+        ))
+        .await?,
+    );
+
+    let response = send(
+        &app,
+        "POST",
+        "/v1/chat/completions",
+        Some(json!({
+            "model": ROUTE_MODEL,
+            "messages": [{"role": "user", "content": "hi"}]
+        })),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(response.json()?["model"], "model/detected");
+    Ok(())
 }
 
 #[tokio::test]

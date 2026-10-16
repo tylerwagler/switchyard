@@ -20,7 +20,7 @@ use switchyard_protocol::{ModelId, RoutedDecisionClient, RoutedLlmClient, WireFo
 
 use crate::{
     AlgorithmSpec, AuxiliaryTarget, CallerAuthKind, DecisionTarget, ModelCapabilities, Route,
-    Runner, RunnerError,
+    Runner, RunnerError, detect,
 };
 
 const SUPPORTED_SCHEMA_VERSION: u32 = 1;
@@ -62,14 +62,15 @@ pub fn api_key_variables(source: &str) -> Result<BTreeSet<String>, RunnerError> 
 type RunnerResult<T> = Result<T, RunnerError>;
 
 pub(crate) fn load_runner(path: impl AsRef<Path>) -> RunnerResult<Runner> {
+    load_runner_with_models(path, &BTreeMap::new())
+}
+
+/// Loads a deployment file and replaces each `detect_model` target's id with the
+/// model its backend serves.
+pub(crate) async fn load_runner_detected(path: impl AsRef<Path>) -> RunnerResult<Runner> {
     let path = path.as_ref();
-    let source = fs::read_to_string(path).map_err(|error| {
-        RunnerError::configuration_source(
-            format!("failed to read server config {}: {error}", path.display()),
-            error,
-        )
-    })?;
-    runner_from_toml(&source).map_err(|error| {
+    let source = read_config(path)?;
+    runner_from_toml_detected(&source).await.map_err(|error| {
         RunnerError::configuration_source(
             format!("invalid server config {}: {error}", path.display()),
             error,
@@ -77,11 +78,52 @@ pub(crate) fn load_runner(path: impl AsRef<Path>) -> RunnerResult<Runner> {
     })
 }
 
+/// Loads a deployment file, applying already-detected model ids to targets.
+pub(crate) fn load_runner_with_models(
+    path: impl AsRef<Path>,
+    target_models: &BTreeMap<String, ModelId>,
+) -> RunnerResult<Runner> {
+    let path = path.as_ref();
+    let source = read_config(path)?;
+    runner_from_toml_with_models(&source, target_models).map_err(|error| {
+        RunnerError::configuration_source(
+            format!("invalid server config {}: {error}", path.display()),
+            error,
+        )
+    })
+}
+
+fn read_config(path: &Path) -> RunnerResult<String> {
+    fs::read_to_string(path).map_err(|error| {
+        RunnerError::configuration_source(
+            format!("failed to read server config {}: {error}", path.display()),
+            error,
+        )
+    })
+}
+
 pub(crate) fn runner_from_toml(source: &str) -> RunnerResult<Runner> {
-    let config: DeploymentConfig = toml::from_str(source).map_err(|error| {
+    runner_from_toml_with_models(source, &BTreeMap::new())
+}
+
+pub(crate) fn runner_from_toml_with_models(
+    source: &str,
+    target_models: &BTreeMap<String, ModelId>,
+) -> RunnerResult<Runner> {
+    parse_deployment(source)?.build(target_models)
+}
+
+pub(crate) async fn runner_from_toml_detected(source: &str) -> RunnerResult<Runner> {
+    let config = parse_deployment(source)?;
+    let detected = config.detected_targets()?;
+    let target_models = detect::resolve(&detected).await;
+    config.build(&target_models)
+}
+
+fn parse_deployment(source: &str) -> RunnerResult<DeploymentConfig> {
+    toml::from_str(source).map_err(|error| {
         RunnerError::configuration_source(format!("failed to parse TOML: {error}"), error)
-    })?;
-    config.build()
+    })
 }
 
 pub(crate) fn model_selection_from_toml(source: &str) -> RunnerResult<Runner> {
@@ -102,7 +144,7 @@ pub(crate) fn model_selection_from_toml(source: &str) -> RunnerResult<Runner> {
         RunnerError::configuration_source(message, error)
     })?;
     config.validate_model_selection()?;
-    config.build()
+    config.build(&BTreeMap::new())
 }
 
 #[derive(Debug, Deserialize)]
@@ -617,7 +659,42 @@ impl RouteConfig {
     }
 }
 
+/// A target that asks to discover its served model at startup.
+pub(crate) struct DetectedTarget {
+    /// The `[targets.<name>]` key.
+    pub name: String,
+    /// The llm client's base URL, probed for the served model.
+    pub base_url: String,
+    /// The configured id, kept when the backend cannot be reached.
+    pub fallback: ModelId,
+}
+
 impl DeploymentConfig {
+    /// Lists targets that ask to detect their served model, with the URL to probe.
+    ///
+    /// Runs on the parsed config, before `build`, so the discovered ids can
+    /// replace configured ones there.
+    pub(crate) fn detected_targets(&self) -> RunnerResult<Vec<DetectedTarget>> {
+        let mut detected = Vec::new();
+        for (name, target) in &self.targets {
+            if !target.detect_model {
+                continue;
+            }
+            let client = self.llm_clients.get(&target.llm_client).ok_or_else(|| {
+                RunnerError::configuration(format!(
+                    "target {name} references unknown llm client {}",
+                    target.llm_client
+                ))
+            })?;
+            detected.push(DetectedTarget {
+                name: name.clone(),
+                base_url: client.base_url.as_str().to_string(),
+                fallback: target.id.clone(),
+            });
+        }
+        Ok(detected)
+    }
+
     fn validate_model_selection(&self) -> RunnerResult<()> {
         for (name, client) in &self.llm_clients {
             if client.forward_auth {
@@ -660,12 +737,27 @@ impl DeploymentConfig {
         })
     }
 
-    fn build(self) -> RunnerResult<Runner> {
+    fn build(mut self, target_models: &BTreeMap<String, ModelId>) -> RunnerResult<Runner> {
         if self.schema_version != SUPPORTED_SCHEMA_VERSION {
             return Err(RunnerError::configuration(format!(
                 "unsupported schema_version {}; expected {SUPPORTED_SCHEMA_VERSION}",
                 self.schema_version
             )));
+        }
+
+        // Apply the ids detected from `detect_model` targets' backends before any
+        // validation, so a discovered id is what the rest of the build sees.
+        for name in target_models.keys() {
+            if !self.targets.contains_key(name) {
+                return Err(RunnerError::configuration(format!(
+                    "detected model for unknown target {name:?}"
+                )));
+            }
+        }
+        for (name, target) in &mut self.targets {
+            if let Some(id) = target_models.get(name) {
+                target.id = id.clone();
+            }
         }
 
         let mut route_names_by_id = HashMap::new();
@@ -1295,6 +1387,11 @@ struct DecisionTargetConfig {
 struct TargetConfig {
     id: ModelId,
     llm_client: String,
+    /// Discover the served model id from the backend at startup (`GET /v1/models`,
+    /// then `GET /health`) and use it in place of `id`. The configured `id` stays
+    /// the fallback when the backend cannot be reached.
+    #[serde(default)]
+    detect_model: bool,
     #[serde(default)]
     extra_body: BTreeMap<String, Value>,
     /// Top-level request fields dropped from the outbound body before `extra_body` is merged.

@@ -189,8 +189,9 @@ the two are distinguishable.
 
 | Key | Required | Default | Meaning |
 |---|:---:|---|---|
-| `id` | Yes | — | Exact model ID sent upstream. |
+| `id` | Yes | — | Exact model ID sent upstream. With `detect_model`, this is the fallback used when the backend cannot be reached at startup. |
 | `llm_client` | Yes | — | Key under `[llm_clients]`. |
+| `detect_model` | No | `false` | Discover the model ID the client's backend serves at startup (`GET /v1/models`, then `GET /health`) and use it in place of `id`. Update `id` to whatever the backend currently serves to avoid a warning-filled fallback. |
 | `system_prompt` | No | unset | System prompt prepended when this target serves a completion. |
 | `extra_body` | No | `{}` | Values merged into the upstream request when the request does not already set that key. |
 | `omit_body_fields` | No | `[]` | Top-level fields removed from every request body that Switchyard sends to this target. Switchyard removes them after it translates the request to the LLM client's `format`, so use that format's field names, for example `reasoning_effort` on `openai_chat` or `reasoning` on `openai_responses`. Switchyard applies `extra_body` and `reasoning_effort` after the removal, so either can set a removed field again. |

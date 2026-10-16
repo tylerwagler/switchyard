@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Target model detection** -- a target with `detect_model = true` reports the
+  model its backend serves at startup (`GET /v1/models`, then `GET /health`)
+  instead of the `id` configured beside it, so a backend model swap does not
+  leave a stale id in responses, routing headers, and logs. The configured `id`
+  remains the fallback when the backend cannot be reached.
+
 - **SearXNG-shaped search endpoint** -- `GET /search?q=<query>&format=json`
   serves the hosted web search pipeline (cached SearXNG candidates, re-ranked,
   cut to `max_results`) in SearXNG's own JSON shape, so SearXNG-capable clients

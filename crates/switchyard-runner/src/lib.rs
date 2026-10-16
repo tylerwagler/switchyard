@@ -5,6 +5,7 @@
 
 mod algorithm;
 mod config;
+mod detect;
 mod failure;
 mod provider_key_redactor;
 mod route;

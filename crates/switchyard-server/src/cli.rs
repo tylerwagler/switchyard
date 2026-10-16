@@ -7,7 +7,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 
 use clap::Parser;
-use switchyard_server::config::load_server_state;
+use switchyard_server::config::load_server_state_detected;
 use switchyard_server::{
     DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT, DEFAULT_LISTEN_BACKLOG, ServerError, ServerResult,
     ServerRunOptions, ServerState, TlsOptions, run_server,
@@ -67,8 +67,8 @@ impl ServerArgs {
         Self::parse()
     }
 
-    fn into_runtime(self) -> ServerResult<(ServerState, ServerRunOptions)> {
-        let mut state = load_server_state(&self.config)?;
+    async fn into_runtime(self) -> ServerResult<(ServerState, ServerRunOptions)> {
+        let mut state = load_server_state_detected(&self.config).await?;
         if let Some(path) = self.routing_log_file {
             state = state.with_routing_log(path)?;
         }
@@ -98,6 +98,6 @@ impl ServerArgs {
 
 /// Loads the configured algorithms and starts the server.
 pub(crate) async fn run(args: ServerArgs) -> ServerResult<()> {
-    let (state, options) = args.into_runtime()?;
+    let (state, options) = args.into_runtime().await?;
     run_server(state, options).await
 }

@@ -10,7 +10,7 @@ use std::sync::Arc;
 use clap::Parser;
 use switchyard_gate::keys::KeyStore;
 use switchyard_gate::{Gate, layer};
-use switchyard_server::config::load_server_state;
+use switchyard_server::config::load_server_state_detected;
 use switchyard_server::{
     DEFAULT_GRACEFUL_SHUTDOWN_TIMEOUT, DEFAULT_LISTEN_BACKLOG, ServerRunOptions, run_server_with,
 };
@@ -70,7 +70,9 @@ async fn main() -> ExitCode {
 }
 
 async fn run(args: Args) -> Result<(), String> {
-    let state = load_server_state(&args.config).map_err(|e| e.to_string())?;
+    let state = load_server_state_detected(&args.config)
+        .await
+        .map_err(|e| e.to_string())?;
     let options = ServerRunOptions {
         addr: SocketAddr::new(args.host, args.port),
         backlog: DEFAULT_LISTEN_BACKLOG,
