@@ -20,7 +20,7 @@ use crate::format::{FormatId, WireFormat};
 use crate::llm::{
     AggLlmResponse, ContentBlock, FileSource, ImageSource, InstructionBlock, LlmRequest,
     MediaSource, Message, OutputParams, ProviderExtensions, ReasoningParams, ResponseOutput, Role,
-    SamplingParams, StopReason, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
+    SamplingParams, StopReason, Tool, ToolCall, ToolChoice, ToolDefinition, ToolResult, Usage,
 };
 use crate::policy::{DeterministicIdPolicy, TranslationPolicy};
 use crate::util::{
@@ -159,7 +159,10 @@ impl FormatCodec for AnthropicMessagesCodec {
                 request.messages.push(Message { role, content });
             }
         }
-        request.tools = decode_anthropic_tools(body.get("tools"));
+        request.tools = decode_anthropic_tools(body.get("tools"))
+            .into_iter()
+            .map(Tool::from)
+            .collect();
         request.tool_choice = body.get("tool_choice").map(decode_anthropic_tool_choice);
         request.extensions.fields = provider_extensions(
             body,
@@ -266,7 +269,7 @@ impl FormatCodec for AnthropicMessagesCodec {
         );
 
         if !tools.is_empty() {
-            body.insert("tools".to_string(), encode_anthropic_tools(tools));
+            body.insert("tools".to_string(), encode_anthropic_tools(tools)?);
         }
         let parallel_tool_calls = request
             .extensions
@@ -1150,6 +1153,11 @@ fn encode_one_anthropic_block(block: &ContentBlock) -> Result<Vec<Value>> {
             }),
             MediaSource::Raw(raw) => raw.clone(),
         }],
+        ContentBlock::Mcp(_) => {
+            return Err(TranslationError::LossyConversion(
+                "MCP history encoding is not implemented".into(),
+            ));
+        }
         ContentBlock::Unknown { raw, .. } => vec![raw.clone()],
     })
 }
@@ -1169,6 +1177,9 @@ fn encode_one_anthropic_tool_result_block(block: &ContentBlock) -> Result<Vec<Va
         ContentBlock::Unknown { raw, .. } => {
             Ok(vec![json!({"type": "text", "text": json_string(raw)})])
         }
+        ContentBlock::Mcp(_) => Err(TranslationError::LossyConversion(
+            "MCP history encoding is not implemented".into(),
+        )),
         ContentBlock::Reasoning { .. }
         | ContentBlock::Audio { .. }
         | ContentBlock::Video { .. }
@@ -1230,11 +1241,16 @@ fn ensure_anthropic_tool_input_object(arguments: Value) -> Value {
 }
 
 // Encodes normalized tool definitions into Anthropic tool JSON.
-fn encode_anthropic_tools(tools: &[ToolDefinition]) -> Value {
-    Value::Array(
+fn encode_anthropic_tools(tools: &[Tool]) -> Result<Value> {
+    Ok(Value::Array(
         tools
             .iter()
             .map(|tool| {
+                let tool = tool.function().ok_or_else(|| {
+                    TranslationError::LossyConversion(
+                        "MCP and provider tool encoding is not implemented".into(),
+                    )
+                })?;
                 let mut item = json!({
                     "name": tool.name,
                     "description": tool.description.clone().unwrap_or_default(),
@@ -1243,10 +1259,10 @@ fn encode_anthropic_tools(tools: &[ToolDefinition]) -> Value {
                 if let Some(strict) = tool.strict {
                     item["strict"] = Value::Bool(strict);
                 }
-                item
+                Ok(item)
             })
-            .collect(),
-    )
+            .collect::<Result<_>>()?,
+    ))
 }
 
 // Encodes normalized tool choice into Anthropic tool-choice JSON.

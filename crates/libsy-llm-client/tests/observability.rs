@@ -1388,6 +1388,35 @@ async fn observed_run_reports_one_successful_routed_call() -> switchyard_libsy::
     Ok(())
 }
 
+#[tokio::test]
+async fn answered_routing_call_keeps_its_execution_phase() -> switchyard_libsy::Result<()> {
+    let _guard = serialize_test().lock().await;
+    let (store, _, _, _, _) = telemetry();
+    const ALGO: &str = "answered-routing-call";
+    const MODEL: &str = "answer-from-routing";
+
+    switchyard_llm_client::run(
+        Arc::new(RoutingCallAlgo {
+            name: ALGO.to_string(),
+            target: MODEL.into(),
+        }),
+        ClientRouter::single(Arc::new(UsageClient {
+            usage: Usage::default(),
+        })),
+        request_with_metadata("answered-routing-session", "answered-routing-correlation"),
+        Arc::new(RuntimeModels::default()),
+        None,
+    )
+    .await?;
+
+    let span = find_span(&store.spans(), "libsy.client_call", "selected_model", MODEL);
+    assert_eq!(
+        span.fields.get("switchyard.call_phase").map(String::as_str),
+        Some("routing")
+    );
+    Ok(())
+}
+
 /// A streamed response keeps the client span available until terminal usage arrives.
 struct StreamingUsageClient;
 
@@ -1424,6 +1453,17 @@ impl RoutedLlmClient for TimeoutClient {
     async fn call(&self, _request: Request) -> Result<Response, LlmClientError> {
         Err(LlmClientError::Timeout {
             source: Box::new(TestError("upstream timed out")),
+        })
+    }
+}
+
+struct HostErrorClient;
+
+#[async_trait]
+impl RoutedLlmClient for HostErrorClient {
+    async fn call(&self, _request: Request) -> Result<Response, LlmClientError> {
+        Err(LlmClientError::Host {
+            source: Box::new(TestError(LEAKED_CONTENT)),
         })
     }
 }
@@ -1553,6 +1593,28 @@ async fn typed_client_failure_records_semantic_error_type() {
         client_span.fields.get("error.type").map(String::as_str),
         Some("timeout")
     );
+}
+
+// Host error text must not appear in the client span.
+#[tokio::test]
+async fn host_error_source_is_redacted_from_the_client_call_span() {
+    let _guard = serialize_test().lock().await;
+    let (store, _, _, _, _) = telemetry();
+    const MODEL: &str = "obs-host-error-model";
+    let _ = run(
+        algo("obs-host-error-algo", MODEL),
+        Arc::new(HostErrorClient),
+        request_with_metadata("obs-host-error-session", "obs-host-error-corr"),
+    )
+    .await;
+
+    let spans = store.spans();
+    let client_span = find_span(&spans, "libsy.client_call", "selected_model", MODEL);
+    assert_eq!(
+        client_span.fields.get("error.type").map(String::as_str),
+        Some("host")
+    );
+    assert!(!format!("{client_span:?}").contains(LEAKED_CONTENT));
 }
 
 /// Verifies that the client span retains the HTTP status without the upstream body.
@@ -1840,7 +1902,7 @@ async fn failed_call_records_metrics_without_error_details() -> switchyard_libsy
 #[tokio::test]
 async fn classifier_metrics_count_routing_and_answer_calls_once() -> switchyard_libsy::Result<()> {
     let _guard = serialize_test().lock().await;
-    let (_store, exporter, provider, _, _) = telemetry();
+    let (store, exporter, provider, _, _) = telemetry();
     let before = flushed_metrics(exporter, provider);
     let total_requests_before =
         u64_gauge_value(&before, "switchyard.total_requests").unwrap_or_default();
@@ -1854,6 +1916,13 @@ async fn classifier_metrics_count_routing_and_answer_calls_once() -> switchyard_
         run_classifier("classifier", "weak", "strong", client, classifier_request()).await?;
 
     assert_eq!(selected_model, "weak");
+
+    let spans = store.spans();
+    let span = find_span(&spans, "libsy.client_call", "selected_model", "weak");
+    assert_eq!(
+        span.fields.get("switchyard.call_phase").map(String::as_str),
+        Some("completion")
+    );
 
     let snapshots = flushed_metrics(exporter, provider);
     assert_eq!(

@@ -89,6 +89,17 @@ every counter, so instrument names carry no suffix of their own.
 | `switchyard_websearch_rerank_errors_total` | counter | Rerank calls that failed during a web search. The search still returns results in raw order. |
 | `switchyard_websearch_cache_total{outcome}` | counter | Cache lookups for raw search results. `outcome` is `hit` or `miss`. |
 
+## Translation diagnostic counter
+
+| Metric | Type | Meaning |
+|---|---|---|
+| `switchyard_translation_diagnostics_total{code,format,operation,severity}` | counter | Buffered protocol translations that preserved service while dropping or degrading request or response data. |
+
+`operation` identifies the runtime boundary: `request_decode`, `request_encode`,
+`response_decode`, or `response_encode`. `format` is the wire format being decoded or
+encoded. Diagnostic messages and JSON paths are emitted only in structured logs; they are
+never metric labels.
+
 ## Outcome counters for error-rate ratios
 
 For HTTP-derived responses and attempts, the `outcome` label takes three values:
@@ -177,6 +188,10 @@ into label space.
 | `kind` | `embeddings` or `rerank`. | Auxiliary counters and histogram |
 | `name` | One per configured `[embeddings.*]` or `[rerank.*]` backend. | Auxiliary request counter |
 | `reason` | Exactly 8 fixed error categories. | Classifier fail-open counter |
+| `operation` | Exactly 4 translation boundaries: request/response decode/encode. | Translation diagnostic counter |
+| `format` | Exactly 3 built-in wire formats. | Translation diagnostic counter |
+| `severity` | Exactly 3 diagnostic levels: `info`, `warning`, `error`. | Translation diagnostic counter |
+| `code` | Translation diagnostic identifiers defined by the built-in codecs. | Translation diagnostic counter |
 
 ## Triage cheatsheet
 
@@ -187,6 +202,7 @@ into label space.
 | `switchyard_routing_overhead_ms_count` stuck at `0` | No successful algorithm run has recorded a successful routed model call. |
 | `switchyard_algorithms_in_flight` stuck above zero with no traffic | Runs are parked on an internal routing call that never returns. Check the classifier or judge target's upstream. |
 | `switchyard_classifier_fail_open_total` rising | The judge target is failing or returning a response the classifier cannot parse. Check `judge_model` and `reason`. |
+| `switchyard_translation_diagnostics_total` rising | Cross-provider translation is dropping or degrading request or response data. Check the matching structured warning for the diagnostic and JSON path. |
 | `switchyard_client_responses_total{outcome="retryable_error"}` rising | Either the upstream is genuinely flaky, or retries are exhausting; compare client responses with retryable upstream attempts. |
 
 ## Upstream attribution

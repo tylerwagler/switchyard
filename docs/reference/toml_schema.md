@@ -65,6 +65,7 @@ route reaches no upstream. A file without a `[targets]` table is rejected with
 | `api_key_env` | No | unset | Name of the environment variable holding the key. Omit to send no authentication. |
 | `forward_auth` | No | `false` | Forward the caller's provider credential and application headers. A route's forwarding clients must use one credential family unless they all use the same scheme, host, and port, such as one LLM gateway. |
 | `extra_headers` | No | `{}` | Custom HTTP headers sent to the model server. Set credentials with `api_key_env` or `forward_auth`; the server rejects headers owned by the selected auth mode. Header names are case-insensitive. |
+| `fallback_on_rate_limit` | No | `true` | Try another completion candidate after an upstream HTTP 429 exhausts retries. Set to `false` to return the 429 instead. |
 | `max_retries` | No | `2` | Retry budget, `0`–`10`. |
 | `failure_cooldown_ms` | No | `5000` (5 seconds) | Skip a backend for this many milliseconds after an exhausted transient completion failure. Zero disables it. |
 | `timeout_ms` | No | unset | Deadline in milliseconds for all attempts, retry delays, and the complete response, including stream reads. Must be at least `1`. Unset leaves the wait unbounded. |
@@ -78,11 +79,16 @@ The cooldown starts after retries are exhausted.
 `failure_cooldown_ms` tracks transport failures, timeouts, HTTP 408/429, and 5xx
 responses after retries. State is shared across callers per model within the client,
 including callers using forwarded credentials. With `forward_auth = true`, HTTP 429
-only triggers request-local retries and fallback; other callers keep trying the model.
-For shared credentials, HTTP 429 also triggers cooldown. During cooldown,
+triggers request-local retries and, by default, fallback; other callers keep trying the model.
+For shared credentials, HTTP 429 also triggers cooldown by default. During cooldown,
 ordered fallback tries the next candidate. A terminal cooldown error returns HTTP
 503. Calls resume together after expiry. Auxiliary calls and errors after a stream
 is returned leave cooldown state unchanged.
+
+With `fallback_on_rate_limit = false`, HTTP 429 does not start cooldown, so later
+requests can receive the upstream response too. Retry budgets and deadlines still
+apply. Other errors keep their existing fallback and cooldown behavior. This option
+controls completion candidates; judge and advisor error recovery is unchanged.
 
 `timeout_ms` applies separately to every call through the client, including judge
 verdicts and answers. To give a judge a short deadline without limiting the
@@ -428,15 +434,18 @@ one manually.
 ### `composite`
 
 Composes other algorithms, letting one set another's
-configuration. Today a classifier sets the tier a stage router falls open to when its own signals are not confident, leaving its scoring and escalation logic untouched. See
+configuration. Today a classifier selects the stage router's starting tier and
+confidence threshold. Tool signals still drive escalation and recovery. See
 [Composite Routing](../routing_algorithms/composite_routing.md).
 
 | Key | Required | Default | Meaning |
 |---|:---:|---|---|
 | `classifier.target` | Yes | — | Target the tier judge is called through. Not a routing destination. |
-| `classifier.base_threshold` | Yes | — | `p_solve` floor that still routes to the efficient tier. In `[0, 1]`. |
+| `classifier.base_threshold` | For LLM judges | unset | `p_solve` floor that still routes to the efficient tier. In `[0, 1]`. Omit with `classifier.decision`. |
 | `classifier.threshold_step` | No | `0.0` | Finite, non-negative amount added once for uncertain or unmatched verdicts and twice for unsupported verdicts. `base_threshold + 2 * threshold_step` must be at most `1`. |
 | `classifier.classify_trigger` | Yes | — | `user_turn` re-picks the tier whenever the user speaks, `new_session` picks once and holds it. `every_request` is rejected here: a judge call per tool step is the cost this route exists to avoid. |
+| `classifier.decision` | No | unset | Use a decision model instead of an LLM judge. The classifier target must be in `decision_targets`. |
+| `classifier.fail_open` | No | `true` | On judge failure, retain the last classified tier or default to efficient. Set `false` to return the error. |
 | `classifier.message_hash_fallback` | No | `false` | Retains the tier by hashing the first user message, for clients that send no session ID. Works with either supported trigger. Conversations opening with the same text share a tier. |
 | `classifier.recent_turn_window` | No | unset | When unset, the judge sees the opening task and latest user follow-up, when present. When set, it also sees trailing turns. |
 | `classifier.prompt` | No | packaged prompt | Replaces the classifier judge prompt. The verdict schema is unchanged. |
@@ -444,7 +453,8 @@ configuration. Today a classifier sets the tier a stage router falls open to whe
 | `classifier.max_output_tokens` | No | `4096` | Maximum completion tokens for the judge verdict. Must be at least `1`. |
 | `stage.capable_target` | Yes | — | Capable tier. |
 | `stage.efficient_target` | Yes | — | Efficient tier. |
-| `stage.confidence_threshold` | Yes | — | Corroboration a decisive signal needs. In `[0, 1]`. |
+| `stage.efficient_first_threshold` | No | `0.5` | Signal confidence required after an Efficient classification. In `[0, 1]`. Also accepts `confidence_threshold`. |
+| `stage.capable_first_threshold` | No | `0.0` | Signal confidence required after a Capable classification. In `[0, 1]`. |
 | `stage.recent_turn_window` | No | `3` | Trailing tool results the signals are computed over. |
 | `stage.capable_hold_turns` | No | `2` | Requests kept on the capable tier after escalation. A clean test pass clears the hold early; `0` disables it. |
 | `stage.tool_semantics.observe` | No | `[]` | Additional exact ASCII case-insensitive tool names that count as observation. |
@@ -453,6 +463,10 @@ configuration. Today a classifier sets the tier a stage router falls open to whe
 | `stage.tool_semantics.new` | No | `[]` | Additional exact ASCII case-insensitive tool names that count as neutral forward activity. |
 | `stage.handoff_notes` | No | unset | Optional guidance appended to forwarded requests. Uses the same fields and behavior as [stage-router handoff notes](../routing_algorithms/stage_router_routing.md#optional-handoff-notes). |
 | `subagents` | No | unset | Nested policy used only for delegated sub-agent work. |
+
+For decision classifier configuration, see
+[Decision model classifier](../routing_algorithms/composite_routing.md#decision-model-classifier).
+The same decision settings are accepted by the optional `stage_router` classifier.
 
 The tier is retained per session. A deployment that sends no session ID needs
 `classifier.message_hash_fallback = true`, which keys on the first user message

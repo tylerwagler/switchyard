@@ -9,6 +9,7 @@ mod capabilities;
 pub mod config;
 mod metrics;
 mod observability;
+mod observed_translation;
 mod redaction;
 mod response;
 mod routing_log;
@@ -46,7 +47,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use switchyard_llm_client::{AuxiliaryOperation, RunObservation, RunObserver};
-use switchyard_protocol::{LlmClientError, Metadata, ModelId, Request, Usage};
+use switchyard_protocol::{LlmClientError, Metadata, ModelId, ProviderExtensions, Request, Usage};
 use switchyard_runner::{
     CallerAuthKind, DecisionTarget, EmbeddingsConfig, ModelInfo, RerankConfig, ResolvedWebSearch,
     Route, RunOutput, Runner, RunnerError, SearchConfig,
@@ -54,7 +55,7 @@ use switchyard_runner::{
 use tokio::net::{TcpListener, TcpSocket};
 use tracing::{Instrument, Level};
 
-use switchyard_translation::{WireFormat, decode_request, encode_aggregated_response};
+use switchyard_translation::WireFormat;
 
 use crate::response::into_http_response;
 use crate::stats::{StatsAccumulator, StatsSnapshot, prefix_probe, tracking_enabled_from_env};
@@ -855,6 +856,15 @@ async fn decision(
     headers: HeaderMap,
     body: std::result::Result<Json<DecisionEndpointRequest>, JsonRejection>,
 ) -> Response {
+    let span = observability::request_span(&headers);
+    decision_inner(state, headers, body).instrument(span).await
+}
+
+async fn decision_inner(
+    state: ServerState,
+    headers: HeaderMap,
+    body: std::result::Result<Json<DecisionEndpointRequest>, JsonRejection>,
+) -> Response {
     let body = match body {
         Ok(Json(body)) if body.request.is_object() => body,
         Ok(_) => {
@@ -897,10 +907,11 @@ async fn decision(
             // The request moved into the decision run, so its namespace mapping
             // is gone by here. A Codex tool call in this preview keeps its
             // qualified name.
-            match encode_aggregated_response(
+            match observed_translation::encode_response(
                 &aggregate,
                 input_format,
                 outcome.selected_model_id().ok().map(ModelId::as_str),
+                &ProviderExtensions::default(),
             ) {
                 Ok(response) => Some(response),
                 Err(error) => return server_error(error.to_string()),
@@ -1123,7 +1134,7 @@ fn resolve_route(
     if let Some(metadata) = body.get_mut("metadata").and_then(Value::as_object_mut) {
         metadata.remove(switchyard_translation::util::SWITCHYARD_METADATA_KEY);
     }
-    let llm_request = decode_request(wire_format, &body)
+    let llm_request = observed_translation::decode_request(wire_format, &body)
         .map_err(|error| invalid_body_error(StatusCode::BAD_REQUEST, error.to_string()))?;
     let requested_model = llm_request
         .model
@@ -2021,16 +2032,89 @@ mod tests {
 
     use super::*;
 
-    /// A successful judge call lands in the per-session routing snapshot under its
-    /// model id with the classifier tier, while routed calls stay off the observer's
-    /// log path — they are logged with terminal usage when the served response is
-    /// observed, so an append here would double count them.
     #[tokio::test]
-    async fn stats_observer_logs_judge_calls_to_the_routing_log() {
+    async fn decision_continues_incoming_w3c_trace_context() {
+        use std::io::Write as _;
+
+        use opentelemetry::trace::TracerProvider as _;
+        use opentelemetry_sdk::trace::{InMemorySpanExporter, SdkTracerProvider};
+        use tower::ServiceExt as _;
+        use tracing_subscriber::layer::SubscriberExt as _;
+
+        let exporter = InMemorySpanExporter::default();
+        let provider = SdkTracerProvider::builder()
+            .with_simple_exporter(exporter.clone())
+            .build();
+        let subscriber = tracing_subscriber::registry()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("decision-test")));
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        let mut config = tempfile::NamedTempFile::new().expect("config file");
+        config
+            .write_all(
+                br#"schema_version = 1
+
+[llm_clients.upstream]
+format = "openai_chat"
+base_url = "http://127.0.0.1:9/v1"
+
+[targets.only]
+id = "only-model"
+llm_client = "upstream"
+
+[routes.pick]
+id = "pick"
+type = "random"
+targets = ["only"]
+"#,
+            )
+            .expect("write config");
+        let app = build_switchyard_router(config::load_server_state(config.path()).expect("state"));
+
+        let request = axum::http::Request::post("/v1/decision")
+            .header("content-type", "application/json")
+            .header(
+                "traceparent",
+                "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            )
+            .body(axum::body::Body::from(
+                r#"{"input_format":"openai_chat","request":{"model":"pick","messages":[{"role":"user","content":"hi"}]}}"#,
+            ))
+            .expect("request");
+        let response = app.oneshot(request).await.expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let spans = exporter.get_finished_spans().expect("finished spans");
+        let span = |name: &str| {
+            spans
+                .iter()
+                .find(|span| span.name == name)
+                .unwrap_or_else(|| panic!("{name} span"))
+        };
+        let request_span = span("switchyard.request");
+        assert_eq!(
+            request_span.span_context.trace_id().to_string(),
+            "4bf92f3577b34da6a3ce929d0e0e4736"
+        );
+        assert_eq!(request_span.parent_span_id.to_string(), "00f067aa0ba902b7");
+        let run_span = span("libsy.run");
+        assert_eq!(
+            run_span.span_context.trace_id(),
+            request_span.span_context.trace_id()
+        );
+    }
+
+    /// The observer logs judge calls with their model IDs, classifier tier, and
+    /// recorded session and turn IDs. The served response logs routed calls with
+    /// their final usage, so logging them here would count each routed call twice.
+    #[tokio::test]
+    async fn stats_observer_logs_judge_calls_to_the_routing_log()
+    -> Result<(), Box<dyn std::error::Error>> {
         let dir = tempfile::tempdir().expect("temp dir");
         let log = SharedRoutingLog::new(dir.path().join("routing.jsonl")).expect("routing log");
         let mut headers = HeaderMap::new();
         headers.insert("proxy_x_session_id", "session-1".parse().expect("header"));
+        headers.insert("x-switchyard-turn-id", "turn-1".parse()?);
         let metadata = metadata_from_headers(headers);
         let context = routing_log::RoutingLogContext::from_metadata(&metadata);
         let observer = stats_observer(StatsAccumulator::default(), Some((log.clone(), context)));
@@ -2067,6 +2151,10 @@ mod tests {
         assert_eq!(snapshot["models"]["judge-model"]["prompt_tokens"], 100);
         assert_eq!(snapshot["models"]["judge-model"]["completion_tokens"], 7);
         assert!(snapshot["models"].get("routed-model").is_none());
+        let record: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&log.path)?)?;
+        assert_eq!(record["session_id"], "session-1");
+        assert_eq!(record["turn_id"], "turn-1");
+        Ok(())
     }
 
     #[derive(Clone)]
