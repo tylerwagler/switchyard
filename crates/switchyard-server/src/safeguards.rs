@@ -22,10 +22,11 @@
 //! server returns, with the tool use it decided, so a judge's decisions on real
 //! traffic can be graded and its denials looked into.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use futures_util::StreamExt;
@@ -52,6 +53,24 @@ const REASON_MAX_CHARS: usize = 300;
 /// The verdict tag comes first and the reason is one short sentence; the
 /// longest answer in the 2026-10-12 replays of this prompt was 45 tokens.
 const JUDGE_MAX_TOKENS: u64 = 96;
+/// A tool input string longer than this keeps only its first three quarters
+/// and its last quarter, in the judged call: a large Write or Edit would
+/// otherwise make one judge prompt of tens of thousands of tokens.
+const ACTION_STRING_MAX_CHARS: usize = 4_000;
+/// The same for the tool calls of the transcript and the reply's other tool
+/// calls, which are context: a big Write there would also move the
+/// transcript's cut (and void the judge server's cache) at once.
+const CONTEXT_STRING_MAX_CHARS: usize = 2_000;
+/// Judge requests in flight at once. More would only be parallel prefills on
+/// the judge server, where each slows the others down.
+const JUDGE_CONCURRENCY: usize = 2;
+static JUDGE_CALLS: LazyLock<tokio::sync::Semaphore> =
+    LazyLock::new(|| tokio::sync::Semaphore::new(JUDGE_CONCURRENCY));
+/// The last judge prompt of each recent session, so the verdict log can show
+/// how much of it the next prompt repeats, which the judge server can reuse.
+static LAST_PROMPTS: LazyLock<parking_lot::Mutex<HashMap<String, String>>> =
+    LazyLock::new(Default::default);
+const LAST_PROMPTS_MAX: usize = 64;
 
 /// One tool use in a reply.
 #[derive(Debug, Clone, PartialEq)]
@@ -195,6 +214,7 @@ pub(crate) fn answer(
         timeout: judge.timeout,
         context,
         transcript: render_transcript(body),
+        session_id: session_id.clone(),
     };
     if let Some(log) = state.safeguards_shadow.clone() {
         return Box::new(move |tool_uses| {
@@ -262,6 +282,15 @@ fn record_verdicts(log: &VerdictLog, base: &Value, tool_uses: &[ToolUse], decisi
         record["latency_ms"] = json!(decision.latency.as_millis() as u64);
         record["judge_answer"] = json!(decision.answer);
         record["error"] = json!(decision.error);
+        let prompt = &decision.prompt;
+        record["queued_ms"] = json!(prompt.queued.as_millis() as u64);
+        record["judge_usage"] = decision.usage.clone();
+        record["prompt_chars"] = json!(prompt.chars);
+        record["transcript_chars"] = json!(prompt.transcript_chars);
+        record["common_prefix_chars"] = json!(prompt.common_prefix_chars);
+        record["prefix_hash"] = json!(prompt.prefix_hash);
+        record["env_hash"] = json!(prompt.env_hash);
+        record["env_chars"] = json!(prompt.env_chars);
         log.append(record);
     }
 }
@@ -470,6 +499,23 @@ struct Decision {
     answer: Option<String>,
     /// Why there is no verdict, when there is none.
     error: Option<String>,
+    /// The judge server's token usage: `cache_read_input_tokens` it reused
+    /// from its cache, `input_tokens` it computed.
+    usage: Value,
+    prompt: PromptStats,
+}
+
+/// The judge prompt's size, and how it relates to the session's previous one.
+struct PromptStats {
+    /// Time spent waiting for a free judge call.
+    queued: Duration,
+    chars: usize,
+    transcript_chars: usize,
+    /// Characters shared with the session's previous judge prompt.
+    common_prefix_chars: Option<usize>,
+    prefix_hash: String,
+    env_hash: String,
+    env_chars: usize,
 }
 
 struct Judge {
@@ -478,6 +524,7 @@ struct Judge {
     timeout: Duration,
     context: Value,
     transcript: String,
+    session_id: Option<String>,
 }
 
 impl Judge {
@@ -505,24 +552,47 @@ impl Judge {
     }
 
     async fn verdict(&self, all: &[ToolUse], tool: &ToolUse) -> Decision {
+        let input = render_input(&self.context, &self.transcript, all, tool);
+        let context = self.context.to_string();
+        let mut prompt = PromptStats {
+            queued: Duration::ZERO,
+            chars: input.chars().count(),
+            transcript_chars: self.transcript.chars().count(),
+            common_prefix_chars: self
+                .session_id
+                .as_deref()
+                .and_then(|session| common_prefix_with_last(session, &input)),
+            prefix_hash: hash_hex(&self.transcript),
+            env_hash: hash_hex(&context),
+            env_chars: context.chars().count(),
+        };
         let started = Instant::now();
-        let reply = tokio::time::timeout(self.timeout, self.ask(all, tool)).await;
+        let reply = tokio::time::timeout(self.timeout, async {
+            let _permit = JUDGE_CALLS
+                .acquire()
+                .await
+                .map_err(|error| error.to_string())?;
+            prompt.queued = started.elapsed();
+            self.ask(input).await
+        })
+        .await;
         let latency = started.elapsed();
-        let (verdict, answer, error) = match reply {
+        let (verdict, answer, error, usage) = match reply {
             Err(_) => {
                 tracing::warn!(tool = %tool.name, "safeguards judge timed out");
-                (unavailable("timeout"), None, Some("timeout".to_string()))
+                let error = Some("timeout".to_string());
+                (unavailable("timeout"), None, error, Value::Null)
             }
             Ok(Err(error)) => {
                 tracing::warn!(tool = %tool.name, %error, "safeguards judge failed");
-                (unavailable("error"), None, Some(error))
+                (unavailable("error"), None, Some(error), Value::Null)
             }
-            Ok(Ok(text)) => match parse_verdict(&text) {
-                Some(verdict) => (verdict, Some(text), None),
+            Ok(Ok((text, usage))) => match parse_verdict(&text) {
+                Some(verdict) => (verdict, Some(text), None, usage),
                 None => {
                     tracing::warn!(tool = %tool.name, "safeguards judge answer had no verdict");
                     let error = "the answer had no verdict".to_string();
-                    (unavailable("error"), Some(text), Some(error))
+                    (unavailable("error"), Some(text), Some(error), usage)
                 }
             },
         };
@@ -531,16 +601,19 @@ impl Judge {
             latency,
             answer,
             error,
+            usage,
+            prompt,
         }
     }
 
-    async fn ask(&self, all: &[ToolUse], tool: &ToolUse) -> Result<String, String> {
+    /// Returns the judge's answer text and its usage.
+    async fn ask(&self, input: String) -> Result<(String, Value), String> {
         let body = json!({
             "model": self.model.as_str(),
             "max_tokens": JUDGE_MAX_TOKENS,
             "temperature": 0,
             "system": PROMPT,
-            "messages": [{"role": "user", "content": render_input(&self.context, &self.transcript, all, tool)}],
+            "messages": [{"role": "user", "content": input}],
         });
         let (route, request) = crate::resolve_route(
             &self.state,
@@ -561,13 +634,37 @@ impl Judge {
             .map_err(|error| error.to_string())?;
         let message = encode_aggregated_response(&reply, WireFormat::AnthropicMessages, None)
             .map_err(|error| error.to_string())?;
-        Ok(message["content"]
+        let text = message["content"]
             .as_array()
             .into_iter()
             .flatten()
             .filter_map(|block| block.get("text").and_then(Value::as_str))
-            .collect())
+            .collect();
+        Ok((text, message["usage"].clone()))
     }
+}
+
+/// Remembers `prompt` as the session's last judge prompt and returns how many
+/// characters it shares with the one before.
+fn common_prefix_with_last(session: &str, prompt: &str) -> Option<usize> {
+    let mut prompts = LAST_PROMPTS.lock();
+    if prompts.len() >= LAST_PROMPTS_MAX && !prompts.contains_key(session) {
+        prompts.clear();
+    }
+    let previous = prompts.insert(session.to_string(), prompt.to_string())?;
+    Some(
+        previous
+            .chars()
+            .zip(prompt.chars())
+            .take_while(|(a, b)| a == b)
+            .count(),
+    )
+}
+
+fn hash_hex(text: &str) -> String {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    text.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
 }
 
 /// Renders the conversation for the judge. Tool results are left out, so text
@@ -588,7 +685,7 @@ fn render_transcript(body: &Value) -> String {
                         Some("tool_use") => out.push_str(&format!(
                             "{role} tool call {}: {}\n",
                             block["name"].as_str().unwrap_or_default(),
-                            block["input"]
+                            shorten_input(&block["input"], CONTEXT_STRING_MAX_CHARS)
                         )),
                         Some("tool_result") => out.push_str("[tool result removed]\n"),
                         Some("image") | Some("document") => out.push_str("[attachment]\n"),
@@ -632,14 +729,53 @@ fn shorten_transcript(out: String) -> String {
     )
 }
 
+/// Keeps the start and the end of every string in a tool input that is longer
+/// than `max_chars`.
+fn shorten_input(value: &Value, max_chars: usize) -> Value {
+    match value {
+        Value::String(text) => {
+            let chars = text.chars().count();
+            if chars <= max_chars {
+                return value.clone();
+            }
+            let (head_chars, tail_chars) = (max_chars * 3 / 4, max_chars / 4);
+            let head: String = text.chars().take(head_chars).collect();
+            let tail: String = text.chars().skip(chars - tail_chars).collect();
+            let hidden = chars - head_chars - tail_chars;
+            Value::String(format!(
+                "{head}[... {hidden} characters not shown ...]{tail}"
+            ))
+        }
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| shorten_input(item, max_chars))
+                .collect(),
+        ),
+        Value::Object(fields) => Value::Object(
+            fields
+                .iter()
+                .map(|(key, value)| (key.clone(), shorten_input(value, max_chars)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 /// Renders one judge request. `<action>` holds only the tool use under review.
 /// The reply's other tool uses come before it, in their own block, as context:
-/// each of them gets its own judge request. The parts every tool use of a reply
-/// shares come first, so the judge server can reuse their prompt cache.
+/// each of them gets its own judge request. The transcript comes first: a
+/// session's next judge request repeats it and only adds to its end, so the
+/// judge server reuses its prompt cache. The environment comes after it, so a
+/// change there (the agent changed directory) does not void that cache.
 fn render_input(context: &Value, transcript: &str, all: &[ToolUse], tool: &ToolUse) -> String {
     let mut siblings = String::new();
     for other in all.iter().filter(|other| other.id != tool.id) {
-        siblings.push_str(&format!("- {}: {}\n", other.name, other.input));
+        siblings.push_str(&format!(
+            "- {}: {}\n",
+            other.name,
+            shorten_input(&other.input, CONTEXT_STRING_MAX_CHARS)
+        ));
     }
     let siblings = if siblings.is_empty() {
         String::new()
@@ -651,9 +787,10 @@ fn render_input(context: &Value, transcript: &str, all: &[ToolUse], tool: &ToolU
         )
     };
     format!(
-        "<environment>\n{context}\n</environment>\n<transcript>\n{transcript}</transcript>\n\
+        "<transcript>\n{transcript}</transcript>\n<environment>\n{context}\n</environment>\n\
          {siblings}<action>\nTool: {}\nInput: {}\n</action>",
-        tool.name, tool.input,
+        tool.name,
+        shorten_input(&tool.input, ACTION_STRING_MAX_CHARS),
     )
 }
 
@@ -886,8 +1023,87 @@ mod tests {
                 assert!(!action.contains(&other.input.to_string()) || other_index == index);
             }
             // The shared parts come first, so the judge's prompt cache serves every sibling.
-            assert!(rendered.starts_with("<environment>\n{}\n</environment>\n<transcript>\n"));
+            assert!(rendered.starts_with(
+                "<transcript>\nuser: set up gitlab\n</transcript>\n<environment>\n{}\n</environment>\n"
+            ));
         }
+    }
+
+    #[test]
+    fn the_next_turn_repeats_the_transcript_even_when_the_environment_changes() {
+        let mut body = json!({"messages": [{"role": "user", "content": "tidy the repo"}]});
+        let ls = tool("t1", "Bash", json!({"command": "cd sub && ls"}));
+        let first = render_input(
+            &json!({"live_cwd": "/r"}),
+            &render_transcript(&body),
+            std::slice::from_ref(&ls),
+            &ls,
+        );
+        if let Some(messages) = body["messages"].as_array_mut() {
+            messages.push(json!({"role": "assistant", "content": [
+                {"type": "tool_use", "id": "t1", "name": "Bash", "input": ls.input}]}));
+            messages.push(json!({"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t1", "content": "a b"}]}));
+        }
+        let rm = tool("t2", "Bash", json!({"command": "rm a"}));
+        let next = render_input(
+            &json!({"live_cwd": "/r/sub"}),
+            &render_transcript(&body),
+            std::slice::from_ref(&rm),
+            &rm,
+        );
+        let shared = first.find("</transcript>").unwrap_or(0);
+        assert!(shared > 0);
+        assert_eq!(first[..shared], next[..shared]);
+        assert!(
+            next[shared..]
+                .starts_with("assistant tool call Bash: {\"command\":\"cd sub && ls\"}\n")
+        );
+    }
+
+    #[test]
+    fn long_tool_input_strings_keep_their_start_and_end() {
+        let text = format!(
+            "{}{}{}",
+            "h".repeat(3_000),
+            "m".repeat(5_000),
+            "t".repeat(1_000)
+        );
+        let input = json!({"file_path": "/r/a.rs", "edits": [{"new_string": text}], "n": 1});
+        let short = shorten_input(&input, 4_000);
+        assert_eq!(short["file_path"], "/r/a.rs");
+        assert_eq!(short["n"], 1);
+        assert_eq!(
+            short["edits"][0]["new_string"],
+            format!(
+                "{}[... 5000 characters not shown ...]{}",
+                "h".repeat(3_000),
+                "t".repeat(1_000)
+            )
+        );
+        let edge = json!("e".repeat(4_000));
+        assert_eq!(shorten_input(&edge, 4_000), edge);
+        // The judged call keeps more of a long input than the transcript does.
+        let write = tool("t", "Write", input.clone());
+        let rendered = render_input(&json!({}), "", std::slice::from_ref(&write), &write);
+        let action = shorten_input(&input, ACTION_STRING_MAX_CHARS);
+        assert!(rendered.ends_with(&format!("Input: {action}\n</action>")));
+        let body = json!({"messages": [{"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t", "name": "Write", "input": input}]}]});
+        let context = shorten_input(&write.input, CONTEXT_STRING_MAX_CHARS);
+        assert_eq!(
+            render_transcript(&body),
+            format!("assistant tool call Write: {context}\n")
+        );
+        assert!(context.to_string().len() < action.to_string().len());
+    }
+
+    #[test]
+    fn the_session_prefix_is_measured_against_its_last_prompt() {
+        let session = "test-session-prefix";
+        assert_eq!(common_prefix_with_last(session, "abcdef"), None);
+        assert_eq!(common_prefix_with_last(session, "abcxyz"), Some(3));
+        assert_eq!(common_prefix_with_last(session, "abcxyz and more"), Some(6));
     }
 
     #[test]
