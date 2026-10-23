@@ -9,31 +9,61 @@
 //! by what is left of the turn's deadline, and a call that fails or times out
 //! is evidence never gathered, which does not commit.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use switchyard_protocol::{AggLlmResponse, ContentBlock, ModelId, Request, Response, StopReason};
+use switchyard_protocol::{
+    AggLlmResponse, ContentBlock, Message, ModelId, Request, Response, StopReason,
+};
 
 use super::config::{ServingMode, VgrConfig};
 use super::decide::{self, AgenticRun, Route, Signals, Tri};
 use super::rungs::{self, Question};
 use super::safety::{CircuitBreaker, endpoint_failure, fallback_eligible};
 use super::{Branch, Capabilities, TaskType, derive_capabilities, readout, text};
-use crate::algorithms::util::affinity::has_new_user_turn;
+use crate::algorithms::util::affinity::{AffinityRouter, has_new_user_turn, initiated_by_user};
 use crate::algorithms::util::buffered_response::buffer_response;
 use crate::algorithms::util::decisive;
 use crate::algorithms::util::prompts::append_note;
 use crate::core::algorithm::Driver;
 use crate::core::classifier::{Classification, Classifier};
+use crate::core::state::{State, StateValue};
 use crate::{LibsyError, Result};
 
-#[derive(Default)]
-pub(super) struct VgrState {
-    pub(super) turn_streak: u32,
-    pub(super) turn_latched: bool,
-    pub(super) turn_started: Option<u32>,
-    pub(super) handoff_sent: bool,
-    pub(super) local_served: bool,
+/// Whether turn verification latched the capable tier; cleared when the user responds.
+const TURN_LATCHED_KEY: &str = "vgr_turn_latched";
+pub(super) const TURN_STREAK_KEY: &str = "vgr_turn_streak";
+/// Unix seconds at the first request of the current user turn.
+const TURN_STARTED_KEY: &str = "vgr_turn_started";
+/// Set once the handoff note was sent in the current user turn.
+const HANDOFF_SENT_KEY: &str = "vgr_handoff_sent";
+/// Set once the local tier served a response since the last handoff.
+pub(super) const LOCAL_SERVED_KEY: &str = "vgr_local_served";
+
+fn count(state: &State, key: &str) -> Option<u32> {
+    match state.extra.get(key) {
+        Some(StateValue::Count(n)) => Some(*n),
+        _ => None,
+    }
+}
+
+fn set_count(state: &mut State, key: &str, value: u32) {
+    state
+        .extra
+        .insert(key.to_string(), StateValue::Count(value));
+}
+
+pub(super) fn set_flag(state: &mut State, key: &str, on: bool) {
+    state.extra.insert(key.to_string(), StateValue::Bool(on));
+}
+
+fn flag(state: &State, key: &str) -> bool {
+    matches!(state.extra.get(key), Some(StateValue::Bool(true)))
+}
+
+pub(super) fn turn_streak(state: &State) -> u32 {
+    count(state, TURN_STREAK_KEY).unwrap_or(0)
 }
 
 struct RequestContext<'a> {
@@ -43,7 +73,7 @@ struct RequestContext<'a> {
 }
 
 /// Consecutive escalation votes that latch a session to the capable tier.
-const TURN_CONFIRMATIONS: u32 = 2;
+pub(super) const TURN_CONFIRMATIONS: u32 = 2;
 const TURN_ESCALATE_AT: f64 = 0.5;
 
 type Scored = (Classification, Option<Response>);
@@ -53,19 +83,47 @@ pub(super) struct VgrClassifier {
     pub(super) breaker: CircuitBreaker,
 }
 
+/// An escalation hold, recorded as a VGR decision with its reason whenever it serves a call.
+pub(super) struct Held(pub(super) Arc<AffinityRouter>, pub(super) &'static str);
+
 #[async_trait]
-impl Classifier<VgrState> for VgrClassifier {
+impl Classifier for Held {
     async fn score(
         &self,
-        state: &mut VgrState,
+        state: &mut State,
+        request: &mut Request,
+        driver: &Driver,
+    ) -> Result<Scored> {
+        let scored = self.0.score(state, request, driver).await?;
+        if matches!(&scored.0, Classification::Scores(scores) if !scores.is_empty()) {
+            log(driver, self.1, None, Route::Cloud);
+        }
+        Ok(scored)
+    }
+}
+
+#[async_trait]
+impl Classifier for VgrClassifier {
+    async fn score(
+        &self,
+        state: &mut State,
         request: &mut Request,
         driver: &Driver,
     ) -> Result<Scored> {
         let started = Instant::now();
         let local = &self.config.targets.local;
-        if has_new_user_turn(&request.llm_request.messages) {
-            state.turn_started = None;
-            state.handoff_sent = false;
+        let messages = &request.llm_request.messages;
+        let (new_turn, answered) = match initiated_by_user(request) {
+            Some(by_user) => (by_user, by_user),
+            None => (has_new_user_turn(messages), answers_final_reply(messages)),
+        };
+        if new_turn {
+            state.extra.remove(TURN_STARTED_KEY);
+            set_flag(state, HANDOFF_SENT_KEY, false);
+        }
+        if answered {
+            set_flag(state, TURN_LATCHED_KEY, false);
+            set_count(state, TURN_STREAK_KEY, 0);
         }
         let turn_budget_spent = self.turn_budget_spent(state);
         let short_circuit = if self.config.mode == ServingMode::Off {
@@ -77,12 +135,14 @@ impl Classifier<VgrState> for VgrClassifier {
             .is_some_and(|switch| switch.is_engaged())
         {
             Some("kill_switch")
-        } else if state.turn_latched {
+        } else if flag(state, TURN_LATCHED_KEY) || turn_streak(state) >= TURN_CONFIRMATIONS {
             Some("turn_verification_latched")
         } else if turn_budget_spent {
             Some("local_turn_budget")
         } else if !self.config.local_supports_images && request_has_image(request) {
             Some("local_image_unsupported")
+        } else if text::newest_prompt_is_blank(request) {
+            Some("empty_prompt")
         } else {
             None
         };
@@ -98,7 +158,7 @@ impl Classifier<VgrState> for VgrClassifier {
         };
         let attempted = tokio::time::timeout(budget, async {
             let response = driver
-                .call_model(request.clone(), vec![local.clone()])
+                .call_model_with_error_recovery(request.clone(), vec![local.clone()], true)
                 .await?;
             buffer_response(local.as_str(), response).await
         })
@@ -160,7 +220,7 @@ impl Classifier<VgrState> for VgrClassifier {
                 ));
             }
             log(driver, "turn_verification_complete", None, Route::Local);
-            state.local_served = true;
+            set_flag(state, LOCAL_SERVED_KEY, true);
             return Ok((decisive(local), Some(buffered.into_response())));
         }
 
@@ -180,7 +240,7 @@ impl Classifier<VgrState> for VgrClassifier {
             ));
         }
         log(driver, "decided", Some(caps.branch), Route::Local);
-        state.local_served = true;
+        set_flag(state, LOCAL_SERVED_KEY, true);
         Ok((decisive(local), Some(buffered.into_response())))
     }
 }
@@ -192,7 +252,7 @@ impl VgrClassifier {
         reason: &'static str,
         branch: Option<Branch>,
         request: &mut Request,
-        state: &mut VgrState,
+        state: &mut State,
         unverified_final: Option<&str>,
     ) -> Scored {
         if reason != "mode_off" {
@@ -207,33 +267,29 @@ impl VgrClassifier {
     /// The clock starts at the first request of the user turn and includes the
     /// client's tool execution, since that is the time the client's own limit
     /// is spending.
-    fn turn_budget_spent(&self, state: &mut VgrState) -> bool {
+    fn turn_budget_spent(&self, state: &mut State) -> bool {
         let Some(budget) = self.config.local_turn_budget else {
             return false;
         };
         let now = unix_seconds();
-        let started = *state.turn_started.get_or_insert(now);
+        let started = count(state, TURN_STARTED_KEY).unwrap_or(now);
+        set_count(state, TURN_STARTED_KEY, started);
         u64::from(now.saturating_sub(started)) >= budget.as_secs()
     }
 
     /// Tells the capable tier it is inheriting unverified tool-using work.
     ///
     /// Sent at most once per user turn, on its first escalation.
-    fn hand_off(
-        &self,
-        request: &mut Request,
-        state: &mut VgrState,
-        unverified_final: Option<&str>,
-    ) {
+    fn hand_off(&self, request: &mut Request, state: &mut State, unverified_final: Option<&str>) {
         if !self.config.agentic_handoff
-            || state.handoff_sent
-            || !state.local_served
-            || !text::has_tool_trajectory(request)
+            || flag(state, HANDOFF_SENT_KEY)
+            || !flag(state, LOCAL_SERVED_KEY)
+            || !text::turn_has_tool_trajectory(request)
         {
             return;
         }
-        state.handoff_sent = true;
-        state.local_served = false;
+        set_flag(state, HANDOFF_SENT_KEY, true);
+        set_flag(state, LOCAL_SERVED_KEY, false);
         let note = handoff_note(unverified_final);
         append_note(request, &note);
     }
@@ -243,7 +299,7 @@ impl VgrClassifier {
         &self,
         context: &RequestContext<'_>,
         proposed: &AggLlmResponse,
-        state: &mut VgrState,
+        state: &mut State,
     ) -> bool {
         let mut call = rungs::build_request(
             Question::TurnTrajectory,
@@ -260,7 +316,7 @@ impl VgrClassifier {
             Some(Err(error)) => {
                 if *judge == self.config.targets.local && endpoint_failure(&error) {
                     self.breaker.failure();
-                    state.turn_latched = true;
+                    set_flag(state, TURN_LATCHED_KEY, true);
                     return true;
                 }
                 return false;
@@ -270,13 +326,13 @@ impl VgrClassifier {
             return false;
         };
         if probability < TURN_ESCALATE_AT {
-            state.turn_streak = 0;
+            set_count(state, TURN_STREAK_KEY, 0);
             return false;
         }
-        state.turn_streak = state.turn_streak.saturating_add(1);
-        let streak = state.turn_streak;
+        let streak = turn_streak(state).saturating_add(1);
+        set_count(state, TURN_STREAK_KEY, streak);
         if streak >= TURN_CONFIRMATIONS {
-            state.turn_latched = true;
+            set_flag(state, TURN_LATCHED_KEY, true);
         }
         streak >= TURN_CONFIRMATIONS
     }
@@ -433,13 +489,17 @@ fn unix_seconds() -> u32 {
 fn handoff_note(unverified_final: Option<&str>) -> String {
     let mut note = String::from(
         "\n\n[Routing notice from the serving infrastructure, not from the user] Until now the \
-         work in this session was carried out by a smaller, faster model. That work has NOT been \
-         verified: it may be incomplete or incorrect, and it may have left the environment in a \
-         broken state. You are taking over from here. Do not assume that any earlier step \
-         succeeded or that the task is finished. Inspect the actual current state of the \
-         environment against every requirement of the original task, fix whatever is missing or \
-         wrong, and give your final answer only after you have confirmed that the requirements \
-         are met.",
+         work on the user's current request was carried out by a smaller, faster model. That work \
+         has NOT been verified: it may be incomplete or incorrect, and it may have left the \
+         environment in a broken state. You are taking over from here. Do not assume that any \
+         step taken on that request succeeded or that the task is finished. Inspect the actual \
+         current state of the environment against every requirement of the request, fix \
+         whatever is missing or wrong, and give your final answer only after you have confirmed \
+         that the requirements are met. Earlier steps may already have done part of the work. \
+         Keep what they did and build on it: confirm a step's effect by inspecting the \
+         environment rather than by running the step again, and repeat or reverse a step only \
+         when the request cannot be met otherwise. Replies to the user's earlier requests are \
+         not in question; do not revisit or correct them unless the user asks.",
     );
     if let Some(claim) = unverified_final.filter(|claim| !claim.trim().is_empty()) {
         const CLIPPING_MARKER_RESERVE: usize = 64;
@@ -464,8 +524,24 @@ fn log(driver: &Driver, reason: &'static str, branch: Option<Branch>, served: Ro
         "reason_code": reason,
         "verdict": if served == Route::Local { "local" } else { "cloud" },
         "branch": branch.map(|branch| format!("{branch:?}")),
+        "policy_version": decide::POLICY_VERSION,
     }));
-    tracing::info!(target: "libsy", reason, branch = ?branch, served = ?served, "vgr decision");
+    tracing::info!(
+        target: "libsy",
+        reason,
+        branch = ?branch,
+        served = ?served,
+        policy_version = decide::POLICY_VERSION,
+        "vgr decision"
+    );
+}
+
+/// Whether the user is answering a finished assistant reply.
+fn answers_final_reply(messages: &[Message]) -> bool {
+    messages
+        .len()
+        .checked_sub(1)
+        .is_some_and(|last| text::starts_user_turn(messages, last))
 }
 
 fn tool_use_is_complete(response: &AggLlmResponse) -> bool {

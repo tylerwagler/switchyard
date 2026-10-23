@@ -36,29 +36,29 @@ mod tests;
 
 /// A verification-gated route between a local and a capable tier.
 pub struct Vgr {
-    route: FallThrough<runtime::VgrState>,
+    route: FallThrough,
 }
 
 impl Vgr {
     /// Validates and constructs a verification-gated route.
     pub fn new(config: VgrConfig) -> Result<Self> {
         config.validate()?;
-        let cloud = config.targets.cloud.clone();
-        // Every local turn re-enters verification; an escalation holds until the
-        // next user turn.
-        let turn_affinity = Arc::new(
-            AffinityRouter::new()
-                .with_release_on_user_turn()
-                .with_latch_only([cloud.clone()]),
-        );
+        let mut affinity = AffinityRouter::new().with_latch_only([config.targets.cloud.clone()]);
+        let reason = if config.latch_escalation && config.mode != ServingMode::Shadow {
+            "session_latched"
+        } else {
+            affinity = affinity.with_release_on_user_turn();
+            "turn_verification_latched"
+        };
+        let affinity = Arc::new(affinity);
         let classifier = Arc::new(runtime::VgrClassifier {
             breaker: safety::CircuitBreaker::new(config.breaker),
             config,
         });
         let route = FallThrough::new_with_state()
             .with_name("vgr")
-            .with_processor(turn_affinity.clone())
-            .with_classifier(turn_affinity)
+            .with_processor(affinity.clone())
+            .with_classifier(Arc::new(runtime::Held(affinity, reason)))
             .with_classifier(classifier);
         Ok(Self { route })
     }

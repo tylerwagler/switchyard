@@ -67,6 +67,9 @@ pub struct VgrConfig {
     /// Wall-clock budget for the local tier within one user turn, including the
     /// client's tool execution.
     pub local_turn_budget: Option<Duration>,
+    /// Holds an escalated session on the capable tier past later user turns.
+    /// Shadow mode retains only the current turn's hold.
+    pub latch_escalation: bool,
 }
 
 impl VgrConfig {
@@ -88,6 +91,7 @@ impl VgrConfig {
             confirmed_recovery_min_clean_tail: None,
             agentic_handoff: false,
             local_turn_budget: None,
+            latch_escalation: false,
         }
     }
 

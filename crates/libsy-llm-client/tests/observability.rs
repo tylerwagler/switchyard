@@ -743,6 +743,7 @@ async fn affinity_warns_once_when_request_has_no_usable_identity() -> switchyard
         let mut steps = router.clone().run_stream(
             request.clone(),
             classifier_models("warning/judge", "warning/efficient", "warning/capable"),
+            switchyard_libsy::State::default(),
         );
         let _ = steps.next().await;
     }
@@ -996,6 +997,7 @@ async fn successful_run_records_metrics_spans_and_outcome_metadata() -> switchya
             total_tokens: Some(25),
             reasoning_tokens: Some(2),
             cache: Usage::cache_details(Some(3), Some(4)),
+            provider_cost: None,
         },
     }) as Arc<dyn RoutedLlmClient>;
     let mut request = request_with_metadata("obs-session-1", "obs-corr-1");
@@ -1705,6 +1707,7 @@ async fn decision_calls_record_each_terminal_path_once() -> switchyard_libsy::Re
         let mut stream = Box::pin(Arc::new(DecisionAlgo(algorithm.clone())).run_stream(
             request_with_metadata("decision-session", "decision-correlation"),
             Arc::new(RuntimeModels::default()),
+            switchyard_libsy::State::default(),
         ));
         let Some(Ok(Step::CallDecision(call))) = stream.next().await else {
             return Err(test_error("expected a decision call"));
@@ -1820,6 +1823,7 @@ async fn failed_call_records_metrics_without_error_details() -> switchyard_libsy
     let stream = algorithm.run_stream(
         request_with_metadata("obs-session-2", "obs-corr-2"),
         Arc::new(RuntimeModels::default()),
+        switchyard_libsy::State::default(),
     );
     tokio::pin!(stream);
 
@@ -2187,6 +2191,7 @@ async fn in_flight_gauge_reads_a_run_parked_on_an_unanswered_routing_call()
     let stream = algorithm.run_stream(
         request_with_metadata("obs-session-if", "obs-corr-if"),
         Arc::new(RuntimeModels::default()),
+        switchyard_libsy::State::default(),
     );
     tokio::pin!(stream);
     let attributes = [("algorithm", ALGO)];
@@ -2247,6 +2252,7 @@ async fn in_flight_gauge_clears_when_a_run_is_abandoned() -> switchyard_libsy::R
         let stream = algorithm.run_stream(
             request_with_metadata("obs-session-ab", "obs-corr-ab"),
             Arc::new(RuntimeModels::default()),
+            switchyard_libsy::State::default(),
         );
         tokio::pin!(stream);
         let Some(Ok(Step::CallModel(_call))) = stream.next().await else {

@@ -2279,19 +2279,116 @@ impl Response {
 }
 
 #[tokio::test]
-async fn vgr_serves_verified_attempts_locally_and_escalates_rejected_ones() -> TestResult {
-    let upstream = MockUpstream::start().await?;
-    for (judge, served) in [
-        ("model/vgr-judge", "model/vgr-local"),
-        ("model/vgr-reject", "model/vgr-cloud"),
-    ] {
+async fn models_probes_routes_concurrently_and_caches_failed_discovery() -> TestResult {
+    for stalled in [false, true] {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let captured = Arc::clone(&calls);
+        let upstream_app = Router::new().route(
+            "/props",
+            get(move || {
+                let barrier = Arc::clone(&barrier);
+                let calls = Arc::clone(&captured);
+                async move {
+                    calls.lock().await.push(json!({"path": "/props"}));
+                    barrier.wait().await;
+                    if stalled {
+                        std::future::pending::<()>().await;
+                    }
+                    StatusCode::SERVICE_UNAVAILABLE
+                }
+            }),
+        );
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+        let upstream = MockUpstream {
+            base_url: format!("http://{addr}/v1"),
+            calls,
+            task: tokio::spawn(async move {
+                axum::serve(listener, upstream_app).await.unwrap();
+            }),
+        };
+        let routes: String = (0..3)
+            .map(|index| {
+                format!(
+                    r#"
+[routes.vgr{index}]
+id = "switchyard/vgr{index}"
+type = "vgr"
+local_target = "local"
+cloud_target = "cloud"
+"#
+                )
+            })
+            .collect();
         let app = build_switchyard_router(load_test_config(&format!(
             r#"
+schema_version = 1
+[llm_clients.local]
+format = "openai_chat"
+base_url = "{}"
+context_discovery = "llama_cpp"
+[targets.local]
+id = "local"
+llm_client = "local"
+[targets.cloud]
+id = "cloud"
+llm_client = "local"
+{routes}
+"#,
+            upstream.base_url
+        ))?);
+
+        let (first, concurrent) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            tokio::join!(
+                send(&app, "GET", "/v1/models", None),
+                send(&app, "GET", "/v1/models", None)
+            )
+        })
+        .await?;
+        let models = first?.json()?;
+        assert_eq!(concurrent?.json()?, models);
+        assert_eq!(models["data"].as_array().unwrap().len(), 3);
+        assert!(
+            models["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|model| model["context_length"].is_null())
+        );
+        assert_eq!(send(&app, "GET", "/v1/models", None).await?.json()?, models);
+        assert_eq!(upstream.calls.lock().await.len(), 3);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn vgr_serves_verified_attempts_locally_and_escalates_rejected_ones() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    for (discovery, configured, expected_context, probes) in [
+        ("", "context_window = 32768", Some(32_768), false),
+        ("", "", None, false),
+        ("context_discovery = \"llama_cpp\"", "", Some(98_304), true),
+        (
+            "context_discovery = \"llama_cpp\"",
+            "context_window = 32768",
+            Some(32_768),
+            false,
+        ),
+    ] {
+        for (judge, served) in [
+            ("model/vgr-judge", "model/vgr-local"),
+            ("model/vgr-reject", "model/vgr-cloud"),
+        ] {
+            upstream.calls.lock().await.clear();
+            let app = build_switchyard_router(load_test_config(&format!(
+                r#"
 schema_version = 1
 
 [llm_clients.primary]
 format = "openai_chat"
 base_url = "{}"
+{discovery}
 
 [targets.local]
 id = "model/vgr-local"
@@ -2308,7 +2405,7 @@ llm_client = "primary"
 [routes.vgr]
 id = "switchyard/vgr"
 type = "vgr"
-context_window = 32768
+{configured}
 local_target = "local"
 cloud_target = "cloud"
 judge_target = "judge"
@@ -2316,8 +2413,78 @@ mode = "active"
 active_approval = "prospective-validation-and-canary-approved"
 task_typing = false
 "#,
-            upstream.base_url
-        ))?);
+                upstream.base_url
+            ))?);
+            let response = send(
+                &app,
+                "POST",
+                "/v1/chat/completions",
+                Some(json!({
+                    "model": "switchyard/vgr",
+                    "messages": [{"role": "user", "content": "answer the question"}]
+                })),
+            )
+            .await?;
+            assert_eq!(response.status, StatusCode::OK);
+            assert_eq!(
+                response.headers.get("x-model-router-selected-model"),
+                Some(&HeaderValue::from_str(served)?)
+            );
+            let models = send(&app, "GET", "/v1/models", None).await?.json()?;
+            assert_eq!(models["data"][0]["context_length"], json!(expected_context));
+            assert_eq!(send(&app, "GET", "/v1/models", None).await?.json()?, models);
+            assert_eq!(
+                upstream
+                    .calls
+                    .lock()
+                    .await
+                    .iter()
+                    .filter(|call| call["path"] == "/props")
+                    .count(),
+                usize::from(probes)
+            );
+        }
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn vgr_escalates_while_the_local_endpoint_is_down() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let closed = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?;
+    let app = build_switchyard_router(load_test_config(&format!(
+        r#"
+schema_version = 1
+
+[llm_clients.primary]
+format = "openai_chat"
+base_url = "{}"
+
+[llm_clients.down]
+format = "openai_chat"
+base_url = "http://{closed}/v1"
+
+[targets.local]
+id = "model/vgr-local"
+llm_client = "down"
+
+[targets.cloud]
+id = "model/vgr-cloud"
+llm_client = "primary"
+
+[routes.vgr]
+id = "switchyard/vgr"
+type = "vgr"
+local_target = "local"
+cloud_target = "cloud"
+mode = "active"
+active_approval = "prospective-validation-and-canary-approved"
+task_typing = false
+"#,
+        upstream.base_url
+    ))?);
+    // The second request meets the failed endpoint's cooldown rather than its socket.
+    for _ in 0..2 {
         let response = send(
             &app,
             "POST",
@@ -2328,21 +2495,74 @@ task_typing = false
             })),
         )
         .await?;
-        assert_eq!(response.status, StatusCode::OK);
+        assert_eq!(response.status, StatusCode::OK, "{}", response.text()?);
         assert_eq!(
             response.headers.get("x-model-router-selected-model"),
-            Some(&HeaderValue::from_str(served)?)
+            Some(&HeaderValue::from_static("model/vgr-cloud"))
         );
-        let models = send(&app, "GET", "/v1/models", None).await?.json()?;
-        assert_eq!(models["data"][0]["context_length"], 32_768);
-        assert!(
-            upstream
-                .calls
-                .lock()
-                .await
-                .iter()
-                .all(|call| call["path"] != "/props")
-        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn vgr_keeps_agent_nudges_in_their_session_and_releases_user_turns() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    for session_header in ["x-switchyard-session-id", "x-session-id"] {
+        let app = build_switchyard_router(load_test_config(&format!(
+            r#"
+schema_version = 1
+[llm_clients.primary]
+format = "openai_chat"
+base_url = "{}"
+[targets]
+local = {{ id = "model/vgr-local", llm_client = "primary" }}
+cloud = {{ id = "model/vgr-cloud", llm_client = "primary" }}
+judge = {{ id = "model/vgr-judge", llm_client = "primary" }}
+[routes.vgr]
+id = "switchyard/vgr"
+type = "vgr"
+local_target = "local"
+cloud_target = "cloud"
+judge_target = "judge"
+mode = "evaluate"
+task_typing = false
+"#,
+            upstream.base_url
+        ))?);
+        let initial = json!([{"role": "user", "content": " "}]);
+        let nudge = json!([
+            {"role": "user", "content": " "},
+            {"role": "assistant", "content": "4"},
+            {"role": "user", "content": "Verify the answer before stopping."}
+        ]);
+        for (session, initiator, messages, served) in [
+            ("a", Some("user"), &initial, "model/vgr-cloud"),
+            ("a", Some("agent"), &nudge, "model/vgr-cloud"),
+            ("b", Some("agent"), &nudge, "model/vgr-local"),
+            ("a", Some("user"), &nudge, "model/vgr-local"),
+            ("a", Some("agent"), &nudge, "model/vgr-local"),
+            ("c", None, &initial, "model/vgr-cloud"),
+            ("c", None, &nudge, "model/vgr-local"),
+        ] {
+            let mut headers = vec![(session_header, session)];
+            if let Some(initiator) = initiator {
+                headers.push(("x-initiator", initiator));
+            }
+            let response = send_with_headers(
+                &app,
+                "POST",
+                "/v1/chat/completions",
+                Some(json!({"model": "switchyard/vgr", "messages": messages})),
+                &headers,
+            )
+            .await?;
+            assert_eq!(response.status, StatusCode::OK, "{}", response.text()?);
+            assert_eq!(
+                response.headers.get("x-model-router-selected-model"),
+                Some(&HeaderValue::from_str(served)?),
+                "{session_header}: {session} {initiator:?}"
+            );
+        }
     }
     Ok(())
 }
@@ -5458,10 +5678,16 @@ async fn unavailable_target_fails_over_across_endpoints_and_stops_when_exhausted
         .lines()
         .map(serde_json::from_str::<Value>)
         .collect::<Result<Vec<_>, _>>()?;
-    assert_eq!(records.len(), 3);
-    assert!(records.iter().all(|record| {
-        record["model"] == "model/strong" && record.get("fallback_reason").is_none()
-    }));
+    assert_eq!(records.len(), 6);
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| {
+                record["model"] == "model/strong" && record.get("fallback_reason").is_none()
+            })
+            .count(),
+        3
+    );
 
     let previous_call_count = upstream.calls.lock().await.len();
     let response = send(

@@ -206,6 +206,7 @@ pub struct ServerState {
     search: BTreeMap<String, SearchConfig>,
     safeguards_shadow: Option<Arc<safeguards::ShadowLog>>,
     safeguards_verdicts: Option<Arc<safeguards::VerdictLog>>,
+    model_catalog: Arc<tokio::sync::Mutex<Option<(Instant, Value)>>>,
 }
 
 #[derive(Clone)]
@@ -310,12 +311,24 @@ impl ServerState {
             search,
             safeguards_shadow,
             safeguards_verdicts,
+            model_catalog: Arc::default(),
         })
     }
 
     /// Enables durable per-request routing records at `path`.
     pub fn with_routing_log(mut self, path: impl Into<PathBuf>) -> ServerResult<Self> {
         self.routing_log = Some(SharedRoutingLog::new(path.into())?);
+        Ok(self)
+    }
+
+    /// This method loads rates in USD per million tokens for saved routing records.
+    pub fn with_pricing_file(self, path: impl AsRef<std::path::Path>) -> ServerResult<Self> {
+        let prices = switchyard_costs::Pricing::load(path.as_ref()).map_err(ServerError::new)?;
+        let log = self
+            .routing_log
+            .as_ref()
+            .ok_or_else(|| ServerError::new("pricing requires a routing log"))?;
+        log.writer.lock().pricing = prices;
         Ok(self)
     }
 
@@ -559,13 +572,11 @@ struct RequestStart(Instant, Option<UsageSink>);
 /// Routing-log marker distinguishing classifier and judge calls from answer calls.
 const CLASSIFIER_TIER: &str = "classifier";
 
-/// Maps answer-call observations to backend stats, routing calls to classifier/judge
-/// stats, and records routing overhead once the algorithm run completes.
+/// This observer updates backend stats and records classifier and judge calls.
 ///
-/// Successful classifier/judge calls are also appended to `classifier_log` when one is
-/// configured, so per-session routing snapshots account for judge token overhead. Routed
-/// calls stay off this path: the served call is logged with its terminal usage in
-/// [`usage_metrics::observe`], which would make a second append here a double count.
+/// The routing log also records failed answer calls with unknown cost. Successful
+/// answer calls are recorded by [`usage_metrics::observe`] with their terminal usage;
+/// recording them here would count each answer twice.
 fn stats_observer(
     stats: StatsAccumulator,
     classifier_log: Option<(SharedRoutingLog, routing_log::RoutingLogContext)>,
@@ -583,22 +594,28 @@ fn stats_observer(
             if call.is_success {
                 stats.record_success(&call.selected_model, latency_ms);
             } else {
+                if let Some((log, context)) = classifier_log.as_ref() {
+                    log.append(
+                        context.clone(),
+                        &call.selected_model,
+                        None,
+                        &Usage::default(),
+                    );
+                }
                 stats.record_error(&call.selected_model);
             }
         }
         RunObservation::LlmCall(call) | RunObservation::DecisionCall(call) => {
             let latency_ms = call.duration.as_secs_f64() * 1_000.0;
+            if let Some((log, context)) = classifier_log.as_ref() {
+                log.append(
+                    context.clone(),
+                    &call.selected_model,
+                    Some(CLASSIFIER_TIER),
+                    call.usage.as_ref().unwrap_or(&Usage::default()),
+                );
+            }
             if call.is_success {
-                if let (Some((log, context)), Some(usage)) =
-                    (classifier_log.as_ref(), call.usage.as_ref())
-                {
-                    log.append(
-                        context.clone(),
-                        &call.selected_model,
-                        Some(CLASSIFIER_TIER),
-                        usage,
-                    );
-                }
                 stats.record_classifier_success(
                     call.selected_model,
                     call.usage.as_ref().map(usage_metrics::token_usage),
@@ -1679,8 +1696,27 @@ async fn models(
     if query.is_ok_and(|Query(query)| query.available) {
         return Json(available_models(&state).await);
     }
+    if let Some((updated, catalog)) = state.model_catalog.lock().await.as_ref()
+        && updated.elapsed() < Duration::from_secs(60)
+    {
+        return Json(catalog.clone());
+    }
+    let mut models: Vec<_> = state.runner.models().collect();
+    let probes = models
+        .iter_mut()
+        .filter(|model| model.capabilities.context_window.is_none())
+        .map(|model| async {
+            model.capabilities.context_window =
+                discover_context_window(&state.runner, model.id).await;
+        });
+    // Keep completed discoveries even when another backend exhausts the shared budget.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(2),
+        futures_util::future::join_all(probes),
+    )
+    .await;
     let mut payload = model_list_payload(
-        state.runner.models(),
+        models,
         state.runner.default_route().map(|id| id.as_str()),
     );
     // Advertise non-chat backends too, so /v1/models is a truthful capability
@@ -1688,7 +1724,18 @@ async fn models(
     if let Some(data) = payload.get_mut("data").and_then(Value::as_array_mut) {
         data.extend(auxiliary::capability_entries(&state));
     }
+    *state.model_catalog.lock().await = Some((Instant::now(), payload.clone()));
     Json(payload)
+}
+
+async fn discover_context_window(runner: &Runner, model: &ModelId) -> Option<u32> {
+    let body = runner
+        .model_properties(model.as_str(), Duration::from_secs(2))
+        .await?;
+    let context = body
+        .pointer("/default_generation_settings/n_ctx")?
+        .as_u64()?;
+    u32::try_from(context).ok().filter(|context| *context > 0)
 }
 
 /// The chat routes a caller can use right now: at least one of the route's upstreams

@@ -5,9 +5,12 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
+use std::time::Duration;
 
 use libsy::RoutingOutcome;
 use serde_json::Value;
+use switchyard_llm_client::TranslatingLlmClient;
 use switchyard_protocol::{ModelId, WireFormat};
 
 use crate::config;
@@ -35,6 +38,7 @@ pub struct Runner {
     /// reachable right now", which is the question an outage actually raises.
     upstreams: BTreeMap<String, String>,
     provider_api_keys: Vec<String>,
+    model_properties_probes: BTreeMap<ModelId, ModelPropertiesProbe>,
 }
 
 /// Borrowed model metadata returned while listing routes.
@@ -66,6 +70,12 @@ pub struct DecisionTarget {
     pub extra_body: BTreeMap<String, Value>,
 }
 
+pub(crate) struct ModelPropertiesProbe {
+    pub(crate) model: ModelId,
+    pub(crate) format: WireFormat,
+    pub(crate) client: Arc<TranslatingLlmClient>,
+}
+
 impl Runner {
     /// Loads and validates a version-1 deployment TOML file.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, RunnerError> {
@@ -77,15 +87,6 @@ impl Runner {
     /// Use [`Self::load`] when the deployment is stored in a file.
     pub fn from_toml(source: &str) -> Result<Self, RunnerError> {
         config::runner_from_toml(source)
-    }
-
-    /// Loads routes whose only completion-side effect is model selection.
-    ///
-    /// Accepts auto, passthrough, and capability classifiers with per-request decisions.
-    /// Completion request overrides and forwarded authentication are rejected;
-    /// the caller owns completion dispatch and session state.
-    pub fn from_toml_for_model_selection(source: &str) -> Result<Self, RunnerError> {
-        config::model_selection_from_toml(source)
     }
 
     /// Builds a runner from named routes in caller-provided order.
@@ -103,6 +104,7 @@ impl Runner {
             cache: BTreeMap::new(),
             upstreams: BTreeMap::new(),
             provider_api_keys: Vec::new(),
+            model_properties_probes: BTreeMap::new(),
         }
     }
 
@@ -169,6 +171,14 @@ impl Runner {
     /// Configured llm clients as (name, base URL), for liveness probing.
     pub fn upstreams(&self) -> &BTreeMap<String, String> {
         &self.upstreams
+    }
+
+    pub(crate) fn with_model_properties_probes(
+        mut self,
+        probes: BTreeMap<ModelId, ModelPropertiesProbe>,
+    ) -> Self {
+        self.model_properties_probes = probes;
+        self
     }
 
     /// Returns the resolved hosted web-search settings, if enabled.
@@ -244,6 +254,16 @@ impl Runner {
                 urls
             },
         })
+    }
+
+    /// Reads one route's configured local backend properties without exposing its credentials.
+    pub async fn model_properties(&self, model: &str, timeout: Duration) -> Option<Value> {
+        let probe = self.model_properties_probes.get(model)?;
+        probe
+            .client
+            .get_model_properties(&probe.model, probe.format, timeout)
+            .await
+            .ok()
     }
 
     /// Returns the validated API root used for unmatched HTTP requests.

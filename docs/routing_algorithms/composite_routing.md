@@ -111,6 +111,9 @@ evidence = { description = "Add task-relevant evidence comparing a and b." }
 ```
 
 Both candidates must be completion targets. The judge must be a decision target.
+See the [decision client reference](../reference/toml_schema.md#decision_clientsname)
+for OpenAI Decisions configuration.
+
 The classifier selects capable when `probabilities.advantage` exceeds `cutoff`.
 Calibrate the cutoff for your tasks and models. Omit LLM-only settings such as
 `base_threshold`, `threshold_step` and `prompt` when using a decision model.
@@ -123,6 +126,13 @@ The tier is retained per session, so send `x-switchyard-session-id` and each
 conversation keeps its own. A client that sends no session ID can set
 `classifier.message_hash_fallback = true`, which keys on the first user message
 instead. Conversations that open with the same text then share a tier.
+
+Rust code that calls `Algorithm::run_stream` directly can store the tier
+itself. Pass the stored `State` to `run_stream`, save `RoutingOutcome.state`
+after each turn, and send no session ID. With a session ID, the router uses its
+own session state and returns the passed `State` unchanged. `switchyard-server`
+starts each request with an empty `State`, so server clients still send
+`x-switchyard-session-id`.
 
 ## Example use
 

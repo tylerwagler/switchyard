@@ -1427,6 +1427,7 @@ mod tests {
                 output_tokens: Some(7),
                 total_tokens: Some(23),
                 reasoning_tokens: Some(5),
+                provider_cost: None,
             }),
         };
 

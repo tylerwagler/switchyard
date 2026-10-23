@@ -32,8 +32,26 @@ confirmed_recovery_min_clean_tail = 1
 ```
 
 `judge_target` defaults to `local_target`. `cloud_judge_target` is optional.
-The local and cloud targets must resolve to distinct model IDs. When the
-route sets `context_window`, `/v1/models` advertises that configured limit.
+The local and cloud targets must resolve to distinct model IDs. Set the route's
+`context_window` to advertise a configured limit through `/v1/models`; this works
+with any supported local service and takes precedence over discovery.
+
+Context discovery is disabled by default. For llama.cpp, set
+`context_discovery = "llama_cpp"` on the local target's `[llm_clients.<name>]`
+entry and leave the route's `context_window` unset. Switchyard then reads the
+service's `/props` response and advertises a positive context capacity when
+available. Missing or invalid properties leave the capacity unknown; routing
+continues normally. Discovery does not configure the service or load a model.
+
+See [the local-server example](../../examples/vgr-local-servers.toml)
+for an active llama.cpp configuration and commented Ollama/vLLM alternatives.
+For Ollama and vLLM, set `context_window` to match the running service; automatic
+discovery for those servers is not implemented.
+
+The server caches the model catalog, including unavailable discovery results,
+for one minute. Discovery probes run concurrently with a two-second total budget
+per refresh. Completed discoveries are retained when that budget expires.
+
 `confirmed_recovery_min_clean_tail`, when set, lets an agentic
 run that recovered from tool errors commit locally once that many trailing tool
 results are clean and the cloud judge confirms the evidence.
@@ -53,6 +71,37 @@ unchecked final message. It is sent at most once per user turn, and only after
 new local work has been served since the previous handoff. The handoff preserves
 the conversation's existing messages and content. `local_turn_budget_seconds`
 escalates a user turn once the local tier has spent that much wall-clock time on it.
+
+The notice covers the current request and asks the cloud tier to preserve earlier
+work, inspect its effects, and repeat or undo steps only when needed.
+
+Escalations release when a new user turn is decided locally. Set
+`latch_escalation = true` to retain the cloud tier across later user turns instead.
+Shadow mode always releases the hold at the next user turn.
+All configured VGR durations must be positive.
+
+## Hermes session headers
+
+Use a Hermes build that supports both provider options below. The session header
+must stay the same throughout a conversation; each conversation needs its own ID.
+
+```yaml
+model:
+  default: assistant
+  provider: custom
+  base_url: http://localhost:4000/v1
+providers:
+  switchyard:
+    api: http://localhost:4000/v1
+    session_affinity_header: x-switchyard-session-id
+    initiator_header: true
+```
+
+`x-initiator: user` releases the turn hold for a person's new request or steer.
+`x-initiator: agent` keeps the hold through tool calls, recovery nudges, and
+automatic continuations. Retries retain the original call's tag. Without a
+recognized tag, Switchyard uses the message shape to identify a user turn.
+`x-session-id` is also accepted as a session-header alias.
 
 ## Serving modes
 
