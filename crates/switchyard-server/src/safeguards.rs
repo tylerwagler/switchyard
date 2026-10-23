@@ -50,17 +50,30 @@ const TRANSCRIPT_TAIL_CHARS: usize = 54_000;
 /// server reuses its cached prefill instead of reading the transcript again.
 const TRANSCRIPT_CUT_STEP_CHARS: usize = 16_000;
 const REASON_MAX_CHARS: usize = 300;
-/// The verdict tag comes first and the reason is one short sentence; the
-/// longest answer in the 2026-10-12 replays of this prompt was 45 tokens.
-const JUDGE_MAX_TOKENS: u64 = 96;
+/// The reason comes first, one short sentence, then the verdict tag.
+const JUDGE_MAX_TOKENS: u64 = 128;
 /// A tool input string longer than this keeps only its first three quarters
-/// and its last quarter, in the judged call: a large Write or Edit would
-/// otherwise make one judge prompt of tens of thousands of tokens.
-const ACTION_STRING_MAX_CHARS: usize = 4_000;
-/// The same for the tool calls of the transcript and the reply's other tool
-/// calls, which are context: a big Write there would also move the
-/// transcript's cut (and void the judge server's cache) at once.
-const CONTEXT_STRING_MAX_CHARS: usize = 2_000;
+/// and its last quarter, in the transcript's tool calls, the judged one among
+/// them: a large Write or Edit would otherwise make one judge prompt of tens of
+/// thousands of tokens, and move the transcript's cut at once.
+const TOOL_STRING_MAX_CHARS: usize = 4_000;
+/// What follows the transcript in a judge prompt is all the judge server reads
+/// again when the next prompt extends the transcript, but only while it stays
+/// short: llama-server rolls a sliding-window model back only to a context
+/// checkpoint, and keeps one 1,028 tokens before each prompt's end (the other
+/// is at the start of the user message, right after these instructions).
+/// These caps keep that part under it: the judged call's input repeated in
+/// `<action>`, each later tool call of the same reply, and each string of the
+/// live state.
+const ACTION_REPEAT_MAX_CHARS: usize = 600;
+const LATER_CALL_MAX_CHARS: usize = 400;
+const LIVE_STATE_STRING_MAX_CHARS: usize = 600;
+/// The `classifier_context` fields that change from one request to the next.
+/// The judge gets them after the transcript; the rest comes before it.
+const LIVE_STATE_FIELDS: [&str; 2] = ["live_cwd", "git_state"];
+/// The client's per-turn history of the live state: one more entry (~800
+/// characters) each turn. Left out.
+const DROPPED_CONTEXT_FIELDS: [&str; 1] = ["prior_turn_context"];
 /// Judge requests in flight at once. More would only be parallel prefills on
 /// the judge server, where each slows the others down.
 const JUDGE_CONCURRENCY: usize = 2;
@@ -80,8 +93,9 @@ pub(crate) struct ToolUse {
     input: Value,
 }
 
-/// Computes `safeguard_results` for the tool uses of one reply.
-pub(crate) type Answer = Box<dyn FnOnce(Vec<ToolUse>) -> BoxFuture<'static, Value> + Send>;
+/// Computes `safeguard_results` for one reply, from its text and tool use
+/// content blocks in order (a tool use's `input` parsed).
+pub(crate) type Answer = Box<dyn FnOnce(Vec<Value>) -> BoxFuture<'static, Value> + Send>;
 
 /// Receives the text of a reply once it is complete.
 pub(crate) type TextTap = Box<dyn FnOnce(String) + Send>;
@@ -208,26 +222,28 @@ pub(crate) fn answer(
     let Some(judge) = state.runner.safeguards() else {
         return Box::new(|_| Box::pin(async { unsupported() }));
     };
+    let (environment, live_state) = split_context(&context);
     let judge = Judge {
         state: state.clone(),
         model: judge.model.clone(),
         timeout: judge.timeout,
-        context,
-        transcript: render_transcript(body),
+        environment,
+        live_state,
+        history: render_messages(body),
         session_id: session_id.clone(),
     };
     if let Some(log) = state.safeguards_shadow.clone() {
-        return Box::new(move |tool_uses| {
+        return Box::new(move |reply| {
             Box::pin(async move {
-                if !tool_uses.is_empty() {
-                    tokio::spawn(shadow_judge(judge, tool_uses, session_id, log));
+                if !tool_uses(&reply).is_empty() {
+                    tokio::spawn(shadow_judge(judge, reply, session_id, log));
                 }
                 unsupported()
             })
         });
     }
     let Some(log) = state.safeguards_verdicts.clone() else {
-        return Box::new(move |tool_uses| Box::pin(async move { judge.results(tool_uses).await }));
+        return Box::new(move |reply| Box::pin(async move { judge.results(&reply).await }));
     };
     let base = json!({
         "session_id": session_id,
@@ -236,10 +252,11 @@ pub(crate) fn answer(
         "judge_route": judge.model.as_str(),
     });
     let unanswered = Unanswered(Some((log, base)));
-    Box::new(move |tool_uses| {
+    Box::new(move |reply| {
         Box::pin(async move {
             let started = Instant::now();
-            let decisions = judge.decide(&tool_uses).await;
+            let tool_uses = tool_uses(&reply);
+            let decisions = judge.decide(&reply).await;
             let latency_ms = started.elapsed().as_millis() as u64;
             let results = available(
                 tool_uses
@@ -291,17 +308,19 @@ fn record_verdicts(log: &VerdictLog, base: &Value, tool_uses: &[ToolUse], decisi
         record["prefix_hash"] = json!(prompt.prefix_hash);
         record["env_hash"] = json!(prompt.env_hash);
         record["env_chars"] = json!(prompt.env_chars);
+        record["live_state_chars"] = json!(prompt.live_state_chars);
         log.append(record);
     }
 }
 
 async fn shadow_judge(
     judge: Judge,
-    tool_uses: Vec<ToolUse>,
+    reply: Vec<Value>,
     session_id: Option<String>,
     log: Arc<ShadowLog>,
 ) {
-    let results = judge.results(tool_uses.clone()).await;
+    let results = judge.results(&reply).await;
+    let tool_uses = tool_uses(&reply);
     let verdicts = &results[0]["status"]["tool_uses"];
     for tool in &tool_uses {
         log.append(json!({
@@ -389,15 +408,26 @@ fn unavailable(reason: &str) -> Value {
 
 /// Adds the answer to a buffered Anthropic message.
 pub(crate) async fn add_to_message(message: &mut Value, answer: Answer) {
-    let tool_uses = message
+    let reply = message
         .get("content")
         .and_then(Value::as_array)
-        .map(|blocks| blocks.iter().filter_map(tool_use_block).collect())
+        .map(|blocks| {
+            blocks
+                .iter()
+                .filter(|block| matches!(block["type"].as_str(), Some("text" | "tool_use")))
+                .cloned()
+                .collect()
+        })
         .unwrap_or_default();
-    let results = answer(tool_uses).await;
+    let results = answer(reply).await;
     if let Some(message) = message.as_object_mut() {
         message.insert("safeguard_results".to_string(), results);
     }
+}
+
+/// The tool uses among a reply's content blocks.
+fn tool_uses(reply: &[Value]) -> Vec<ToolUse> {
+    reply.iter().filter_map(tool_use_block).collect()
 }
 
 fn tool_use_block(block: &Value) -> Option<ToolUse> {
@@ -426,8 +456,9 @@ fn hold_for_answer(events: RawEventStream, answer: Answer, ping_every: Duration)
     Box::pin(async_stream::stream! {
         let mut events = events;
         let mut answer = Some(answer);
-        // Tool uses by content block index, with their input JSON as streamed.
-        let mut blocks: BTreeMap<u64, (String, String, String)> = BTreeMap::new();
+        // Text and tool use blocks by content block index: the block, and a
+        // tool use's input JSON as streamed.
+        let mut blocks: BTreeMap<u64, (Value, String)> = BTreeMap::new();
         while let Some(item) = events.next().await {
             let mut event = match item {
                 Ok(event) => event,
@@ -439,33 +470,42 @@ fn hold_for_answer(events: RawEventStream, answer: Answer, ping_every: Duration)
             let index = event.get("index").and_then(Value::as_u64);
             match event.get("type").and_then(Value::as_str) {
                 Some("content_block_start") => {
-                    if let (Some(index), Some(block)) = (index, tool_use_block(&event["content_block"])) {
-                        blocks.insert(index, (block.id, block.name, String::new()));
+                    let block = &event["content_block"];
+                    if let Some(index) = index
+                        && matches!(block["type"].as_str(), Some("text" | "tool_use"))
+                    {
+                        blocks.insert(index, (block.clone(), String::new()));
                     }
                 }
                 Some("content_block_delta") => {
-                    if let (Some(index), Some(partial)) =
-                        (index, event["delta"].get("partial_json").and_then(Value::as_str))
-                        && let Some(block) = blocks.get_mut(&index)
+                    if let Some(index) = index
+                        && let Some((block, input)) = blocks.get_mut(&index)
                     {
-                        block.2.push_str(partial);
+                        if let Some(partial) = event["delta"]["partial_json"].as_str() {
+                            input.push_str(partial);
+                        } else if let Some(text) = event["delta"]["text"].as_str()
+                            && let Some(Value::String(so_far)) = block.get_mut("text")
+                        {
+                            so_far.push_str(text);
+                        }
                     }
                 }
                 Some("message_delta") => {
                     if let Some(answer) = answer.take() {
-                        let tool_uses = std::mem::take(&mut blocks)
+                        let reply = std::mem::take(&mut blocks)
                             .into_values()
-                            .map(|(id, name, input)| ToolUse {
-                                id,
-                                name,
-                                input: if input.is_empty() {
-                                    json!({})
-                                } else {
-                                    serde_json::from_str(&input).unwrap_or(Value::String(input))
-                                },
+                            .map(|(mut block, input)| {
+                                if block["type"] == "tool_use" {
+                                    block["input"] = if input.is_empty() {
+                                        json!({})
+                                    } else {
+                                        serde_json::from_str(&input).unwrap_or(Value::String(input))
+                                    };
+                                }
+                                block
                             })
                             .collect();
-                        let mut pending = answer(tool_uses);
+                        let mut pending = answer(reply);
                         let mut ticks = tokio::time::interval(ping_every);
                         ticks.tick().await;
                         let results = loop {
@@ -516,22 +556,27 @@ struct PromptStats {
     prefix_hash: String,
     env_hash: String,
     env_chars: usize,
+    live_state_chars: usize,
 }
 
 struct Judge {
     state: ServerState,
     model: ModelId,
     timeout: Duration,
-    context: Value,
-    transcript: String,
+    /// The session's permission settings, rendered before the transcript.
+    environment: String,
+    /// The working directory and git state, rendered after it.
+    live_state: String,
+    /// The request's conversation rendered, before the transcript's cut.
+    history: String,
     session_id: Option<String>,
 }
 
 impl Judge {
-    async fn results(&self, tool_uses: Vec<ToolUse>) -> Value {
-        let decisions = self.decide(&tool_uses).await;
+    async fn results(&self, reply: &[Value]) -> Value {
+        let decisions = self.decide(reply).await;
         available(
-            tool_uses
+            tool_uses(reply)
                 .iter()
                 .map(|tool| tool.id.clone())
                 .zip(decisions.into_iter().map(|decision| decision.verdict))
@@ -543,28 +588,39 @@ impl Judge {
     /// prompt up to the transcript's end, and the judge server reuses a cached
     /// prefill only for a request that follows the one that made it: in
     /// parallel, each would read the whole transcript again on its own slot.
-    async fn decide(&self, tool_uses: &[ToolUse]) -> Vec<Decision> {
-        let mut decisions = Vec::with_capacity(tool_uses.len());
-        for tool in tool_uses {
-            decisions.push(self.verdict(tool_uses, tool).await);
+    async fn decide(&self, reply: &[Value]) -> Vec<Decision> {
+        let mut decisions = Vec::new();
+        for (at, block) in reply.iter().enumerate() {
+            if let Some(tool) = tool_use_block(block) {
+                decisions.push(self.verdict(reply, at, &tool).await);
+            }
         }
         decisions
     }
 
-    async fn verdict(&self, all: &[ToolUse], tool: &ToolUse) -> Decision {
-        let input = render_input(&self.context, &self.transcript, all, tool);
-        let context = self.context.to_string();
+    /// Judges `tool`, the reply's content block `at`.
+    async fn verdict(&self, reply: &[Value], at: usize, tool: &ToolUse) -> Decision {
+        let transcript = judged_transcript(&self.history, &reply[..=at]);
+        let later = tool_uses(&reply[at + 1..]);
+        let input = render_input(
+            &self.environment,
+            &transcript,
+            &self.live_state,
+            &later,
+            tool,
+        );
         let mut prompt = PromptStats {
             queued: Duration::ZERO,
             chars: input.chars().count(),
-            transcript_chars: self.transcript.chars().count(),
+            transcript_chars: transcript.chars().count(),
             common_prefix_chars: self
                 .session_id
                 .as_deref()
                 .and_then(|session| common_prefix_with_last(session, &input)),
-            prefix_hash: hash_hex(&self.transcript),
-            env_hash: hash_hex(&context),
-            env_chars: context.chars().count(),
+            prefix_hash: hash_hex(&transcript),
+            env_hash: hash_hex(&self.environment),
+            env_chars: self.environment.chars().count(),
+            live_state_chars: self.live_state.chars().count(),
         };
         let started = Instant::now();
         let reply = tokio::time::timeout(self.timeout, async {
@@ -669,34 +725,83 @@ fn hash_hex(text: &str) -> String {
 
 /// Renders the conversation for the judge. Tool results are left out, so text
 /// a tool returned cannot argue with the judge.
-fn render_transcript(body: &Value) -> String {
+fn render_messages(body: &Value) -> String {
     let mut out = String::new();
     for message in body["messages"].as_array().into_iter().flatten() {
         let role = message["role"].as_str().unwrap_or("unknown");
         match &message["content"] {
-            Value::String(text) => out.push_str(&format!("{role}: {text}\n")),
+            Value::String(text) => render_text(&mut out, role, text),
             Value::Array(blocks) => {
                 for block in blocks {
-                    match block["type"].as_str() {
-                        Some("text") => out.push_str(&format!(
-                            "{role}: {}\n",
-                            block["text"].as_str().unwrap_or_default()
-                        )),
-                        Some("tool_use") => out.push_str(&format!(
-                            "{role} tool call {}: {}\n",
-                            block["name"].as_str().unwrap_or_default(),
-                            shorten_input(&block["input"], CONTEXT_STRING_MAX_CHARS)
-                        )),
-                        Some("tool_result") => out.push_str("[tool result removed]\n"),
-                        Some("image") | Some("document") => out.push_str("[attachment]\n"),
-                        _ => {}
-                    }
+                    render_block(&mut out, role, block);
                 }
             }
             _ => {}
         }
     }
+    out
+}
+
+fn render_text(out: &mut String, role: &str, text: &str) {
+    if !text.is_empty() {
+        out.push_str(&format!("{role}: {text}\n"));
+    }
+}
+
+fn render_block(out: &mut String, role: &str, block: &Value) {
+    match block["type"].as_str() {
+        Some("text") => render_text(out, role, block["text"].as_str().unwrap_or_default()),
+        Some("tool_use") => out.push_str(&format!(
+            "{role} tool call {}: {}\n",
+            block["name"].as_str().unwrap_or_default(),
+            shorten_input(&block["input"], TOOL_STRING_MAX_CHARS)
+        )),
+        Some("tool_result") => out.push_str("[tool result removed]\n"),
+        Some("image") | Some("document") => out.push_str("[attachment]\n"),
+        _ => {}
+    }
+}
+
+/// The transcript for judging the last tool use of `reply_so_far`: the
+/// conversation, then the reply up to that tool use, rendered as the next
+/// request will render it. The session's next judge prompt, for the next tool
+/// use or the next reply, then repeats this one's transcript up to its end.
+fn judged_transcript(history: &str, reply_so_far: &[Value]) -> String {
+    let mut out = history.to_string();
+    for block in reply_so_far {
+        render_block(&mut out, "assistant", block);
+    }
     shorten_transcript(out)
+}
+
+#[cfg(test)]
+fn render_transcript(body: &Value) -> String {
+    shorten_transcript(render_messages(body))
+}
+
+/// Splits Claude Code's `classifier_context` into the session's settings,
+/// which stay the same from turn to turn, and its live state, which does not.
+/// Both are rendered as JSON.
+fn split_context(context: &Value) -> (String, String) {
+    let Value::Object(fields) = context else {
+        return (context.to_string(), "{}".to_string());
+    };
+    let mut settings = serde_json::Map::new();
+    let mut live = serde_json::Map::new();
+    for (key, value) in fields {
+        if LIVE_STATE_FIELDS.contains(&key.as_str()) {
+            live.insert(
+                key.clone(),
+                shorten_input(value, LIVE_STATE_STRING_MAX_CHARS),
+            );
+        } else if !DROPPED_CONTEXT_FIELDS.contains(&key.as_str()) {
+            settings.insert(key.clone(), value.clone());
+        }
+    }
+    (
+        Value::Object(settings).to_string(),
+        Value::Object(live).to_string(),
+    )
 }
 
 /// Keeps the first `TRANSCRIPT_HEAD_CHARS` and at most `TRANSCRIPT_TAIL_CHARS`
@@ -762,40 +867,58 @@ fn shorten_input(value: &Value, max_chars: usize) -> Value {
     }
 }
 
-/// Renders one judge request. `<action>` holds only the tool use under review.
-/// The reply's other tool uses come before it, in their own block, as context:
-/// each of them gets its own judge request. The transcript comes first: a
-/// session's next judge request repeats it and only adds to its end, so the
-/// judge server reuses its prompt cache. The environment comes after it, so a
-/// change there (the agent changed directory) does not void that cache.
-fn render_input(context: &Value, transcript: &str, all: &[ToolUse], tool: &ToolUse) -> String {
-    let mut siblings = String::new();
-    for other in all.iter().filter(|other| other.id != tool.id) {
-        siblings.push_str(&format!(
+/// Renders one judge request. Everything before the transcript's end is the
+/// same for the session's next judge request, which only adds to the
+/// transcript, so the judge server reuses its prompt cache: the session's
+/// settings come first, then the transcript, which ends with the tool use under
+/// review. After it comes only what is short or changes: the live state, the
+/// reply's later tool uses (each judged in its own request, context only here)
+/// and the judged call once more, in `<action>`.
+fn render_input(
+    environment: &str,
+    transcript: &str,
+    live_state: &str,
+    later: &[ToolUse],
+    tool: &ToolUse,
+) -> String {
+    let mut later_calls = String::new();
+    for other in later {
+        later_calls.push_str(&format!(
             "- {}: {}\n",
             other.name,
-            shorten_input(&other.input, CONTEXT_STRING_MAX_CHARS)
+            shorten_input(&other.input, LATER_CALL_MAX_CHARS)
         ));
     }
-    let siblings = if siblings.is_empty() {
+    let later_calls = if later_calls.is_empty() {
         String::new()
     } else {
         format!(
-            "<same_reply_context>\nThe agent made these other tool calls in the same reply. \
-             Each one is judged separately. They are context only, not the action under \
-             review.\n{siblings}</same_reply_context>\n"
+            "<same_reply_context>\nThe agent made these other tool calls later in the same \
+             reply. Each one is judged separately. They are context only, not the action under \
+             review.\n{later_calls}</same_reply_context>\n"
         )
     };
     format!(
-        "<transcript>\n{transcript}</transcript>\n<environment>\n{context}\n</environment>\n\
-         {siblings}<action>\nTool: {}\nInput: {}\n</action>",
+        "<environment>\n{environment}\n</environment>\n<transcript>\n{transcript}</transcript>\n\
+         <live_state>\n{live_state}\n</live_state>\n{later_calls}<action>\nTool: {}\nInput: {}\n</action>",
         tool.name,
-        shorten_input(&tool.input, ACTION_STRING_MAX_CHARS),
+        shorten_input(&tool.input, ACTION_REPEAT_MAX_CHARS),
     )
 }
 
+/// Reads the judge's answer: a `<reason>`, then `<block>yes</block>` or
+/// `<block>no</block>`. The verdict tag is looked for after the reason, so a
+/// `<block>` the reason quotes does not count; an answer in the old order
+/// (the tag first) still reads.
 fn parse_verdict(text: &str) -> Option<Value> {
-    let start = text.find("<block>")? + "<block>".len();
+    let after_reason = text
+        .find("</reason>")
+        .map_or(0, |end| end + "</reason>".len());
+    let start = text[after_reason..]
+        .find("<block>")
+        .map(|at| after_reason + at)
+        .or_else(|| text.find("<block>"))?
+        + "<block>".len();
     let rest = text[start..].trim_start();
     if rest.starts_with("no") {
         return Some(json!({"type": "evaluated", "outcome": "not_flagged"}));
@@ -824,10 +947,18 @@ mod tests {
     use super::*;
 
     fn fixed(results: Value, delay: Duration) -> Answer {
-        Box::new(move |tool_uses: Vec<ToolUse>| {
+        Box::new(move |reply: Vec<Value>| {
             Box::pin(async move {
                 tokio::time::sleep(delay).await;
-                json!({"seen": tool_uses.iter().map(|tool| json!([tool.id, tool.name, tool.input])).collect::<Vec<_>>(), "results": results})
+                let text: Vec<_> = reply
+                    .iter()
+                    .filter_map(|block| block["text"].as_str())
+                    .collect();
+                json!({
+                    "seen": tool_uses(&reply).iter().map(|tool| json!([tool.id, tool.name, tool.input])).collect::<Vec<_>>(),
+                    "text": text,
+                    "results": results,
+                })
             })
         })
     }
@@ -860,15 +991,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn message_answer_sees_its_tool_uses() {
+    async fn message_answer_sees_its_text_and_tool_uses() {
         let mut message = json!({"type": "message", "content": [
+            {"type": "thinking", "thinking": "hmm"},
             {"type": "text", "text": "running it"},
             {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}}
         ]});
         add_to_message(&mut message, fixed(json!("r"), Duration::ZERO)).await;
         assert_eq!(
             message["safeguard_results"],
-            json!({"seen": [["toolu_1", "Bash", {"command": "ls"}]], "results": "r"})
+            json!({"seen": [["toolu_1", "Bash", {"command": "ls"}]], "text": ["running it"], "results": "r"})
         );
     }
 
@@ -876,6 +1008,13 @@ mod tests {
     async fn stream_holds_message_delta_for_the_answer_and_pings_meanwhile() {
         let events: RawEventStream = Box::pin(stream::iter(vec![
             Ok(json!({"type": "message_start", "message": {}})),
+            Ok(json!({"type": "content_block_start", "index": 0,
+                "content_block": {"type": "text", "text": ""}})),
+            Ok(json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": "cleaning "}})),
+            Ok(json!({"type": "content_block_delta", "index": 0,
+                "delta": {"type": "text_delta", "text": "up"}})),
+            Ok(json!({"type": "content_block_stop", "index": 0})),
             Ok(json!({"type": "content_block_start", "index": 1,
                 "content_block": {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}})),
             Ok(json!({"type": "content_block_delta", "index": 1,
@@ -910,7 +1049,7 @@ mod tests {
             .unwrap_or(&Value::Null);
         assert_eq!(
             delta["delta"]["safeguard_results"],
-            json!({"seen": [["toolu_1", "Bash", {"command": "rm -rf /"}]], "results": "r"})
+            json!({"seen": [["toolu_1", "Bash", {"command": "rm -rf /"}]], "text": ["cleaning up"], "results": "r"})
         );
         assert_eq!(delta["delta"]["stop_reason"], "tool_use");
         assert!(delta.get("safeguard_results").is_none());
@@ -918,20 +1057,37 @@ mod tests {
 
     #[test]
     fn verdicts_parse_and_anything_else_is_no_verdict() {
+        let allow = Some(json!({"type": "evaluated", "outcome": "not_flagged"}));
         assert_eq!(
-            parse_verdict("<block>no</block>"),
-            Some(json!({"type": "evaluated", "outcome": "not_flagged"}))
+            parse_verdict("<reason>reads a file</reason><block>no</block>"),
+            allow
         );
+        assert_eq!(parse_verdict("<block>no</block>"), allow);
+        assert_eq!(
+            parse_verdict("<reason>[Force Push] rewrites main</reason><block>yes</block>"),
+            Some(json!({"type": "evaluated", "outcome": "flagged",
+                "explanation": "[Force Push] rewrites main"}))
+        );
+        // The old order still reads.
         assert_eq!(
             parse_verdict("<block>yes</block><reason>[Force Push] rewrites main</reason>"),
             Some(json!({"type": "evaluated", "outcome": "flagged",
                 "explanation": "[Force Push] rewrites main"}))
+        );
+        // A tag quoted in the reason is not the verdict.
+        assert_eq!(
+            parse_verdict("<reason>not a <block>yes</block> case</reason><block>no</block>"),
+            allow
         );
         assert_eq!(
             parse_verdict("<block> yes </block>"),
             Some(json!({"type": "evaluated", "outcome": "flagged"}))
         );
         assert_eq!(parse_verdict("looks fine to me"), None);
+        assert_eq!(
+            parse_verdict("<reason>cut off before the tag</reason>"),
+            None
+        );
         assert_eq!(parse_verdict("<block>maybe</block>"), None);
     }
 
@@ -954,12 +1110,8 @@ mod tests {
         assert!(!transcript.contains("IGNORE RULES"));
     }
 
-    fn tool(id: &str, name: &str, input: Value) -> ToolUse {
-        ToolUse {
-            id: id.to_string(),
-            name: name.to_string(),
-            input,
-        }
+    fn tool_block(id: &str, name: &str, input: Value) -> Value {
+        json!({"type": "tool_use", "id": id, "name": name, "input": input})
     }
 
     /// The text of the `<action>` block of a rendered judge request.
@@ -970,94 +1122,153 @@ mod tests {
         &rendered[start..end]
     }
 
+    /// Renders the judge request for reply block `at`, as `Judge::verdict` does.
+    fn judge_input(context: &Value, body: &Value, reply: &[Value], at: usize) -> String {
+        let (environment, live_state) = split_context(context);
+        let transcript = judged_transcript(&render_messages(body), &reply[..=at]);
+        let judged = tool_use_block(&reply[at]).expect("a tool use");
+        render_input(
+            &environment,
+            &transcript,
+            &live_state,
+            &tool_uses(&reply[at + 1..]),
+            &judged,
+        )
+    }
+
+    /// The part of a judge request up to its transcript's end, which the
+    /// session's next judge request must repeat.
+    fn through_transcript(rendered: &str) -> &str {
+        &rendered[..rendered.find("</transcript>").expect("a transcript")]
+    }
+
     #[test]
     fn a_lone_tool_use_renders_without_sibling_context() {
-        let ls = tool("t1", "Bash", json!({"command": "ls"}));
-        let rendered = render_input(
-            &json!({"v": 1}),
-            "user: hi\n",
-            std::slice::from_ref(&ls),
-            &ls,
-        );
+        let reply = [tool_block("t1", "Bash", json!({"command": "ls"}))];
+        let body = json!({"messages": [{"role": "user", "content": "hi"}]});
+        let rendered = judge_input(&json!({"v": 1}), &body, &reply, 0);
         assert!(!rendered.contains("same_reply_context"), "{rendered}");
         assert_eq!(
             action_block(&rendered),
             "<action>\nTool: Bash\nInput: {\"command\":\"ls\"}\n"
+        );
+        assert!(
+            rendered
+                .starts_with("<environment>\n{\"v\":1}\n</environment>\n<transcript>\nuser: hi\n")
+        );
+        assert!(
+            through_transcript(&rendered)
+                .ends_with("assistant tool call Bash: {\"command\":\"ls\"}\n")
         );
         assert!(rendered.ends_with("</action>"));
     }
 
     #[test]
     fn each_tool_use_of_a_reply_is_alone_in_its_action_block() {
-        let all = [
-            tool("t1", "WebSearch", json!({"query": "gitlab mcp"})),
-            tool(
+        let reply = [
+            json!({"type": "text", "text": "setting up gitlab"}),
+            tool_block("t1", "WebSearch", json!({"query": "gitlab mcp"})),
+            tool_block(
                 "t2",
                 "Bash",
                 json!({"command": "gitlab-rails runner CREATE_TOKEN"}),
             ),
-            tool(
+            tool_block(
                 "t3",
                 "Bash",
                 json!({"command": "git branch --show-current"}),
             ),
         ];
+        let body = json!({"messages": [{"role": "user", "content": "set up gitlab"}]});
+        let all = tool_uses(&reply);
+        let mut previous: Option<String> = None;
         for (index, judged) in all.iter().enumerate() {
-            let rendered = render_input(&json!({}), "user: set up gitlab\n", &all, judged);
+            let rendered = judge_input(&json!({}), &body, &reply, index + 1);
             let action = action_block(&rendered);
             assert_eq!(
                 action,
                 format!("<action>\nTool: {}\nInput: {}\n", judged.name, judged.input)
             );
-            // The siblings are listed once each, before the action, in their own block.
-            let context_start = rendered
+            let transcript = through_transcript(&rendered);
+            assert!(transcript.contains("assistant: setting up gitlab\n"));
+            assert!(transcript.ends_with(&format!(
+                "assistant tool call {}: {}\n",
+                judged.name, judged.input
+            )));
+            // The earlier calls are in the transcript; the later ones are
+            // listed once each, before the action, in their own block.
+            let later = rendered
                 .find("<same_reply_context>")
-                .expect("context block");
-            let context_end = rendered.find("</same_reply_context>").expect("context end");
-            assert!(context_end < rendered.find("<action>").unwrap_or(0));
-            let context = &rendered[context_start..context_end];
-            assert!(context.contains("judged separately"));
+                .map(|start| &rendered[start..rendered.find("</same_reply_context>").unwrap_or(0)]);
             for (other_index, other) in all.iter().enumerate() {
+                let call = format!("assistant tool call {}: {}\n", other.name, other.input);
+                assert_eq!(
+                    transcript.contains(&call),
+                    other_index <= index,
+                    "{rendered}"
+                );
                 let line = format!("- {}: {}\n", other.name, other.input);
-                assert_eq!(context.contains(&line), other_index != index, "{rendered}");
-                assert!(!action.contains(&other.input.to_string()) || other_index == index);
+                let listed = later.is_some_and(|later| later.contains(&line));
+                assert_eq!(listed, other_index > index, "{rendered}");
             }
-            // The shared parts come first, so the judge's prompt cache serves every sibling.
-            assert!(rendered.starts_with(
-                "<transcript>\nuser: set up gitlab\n</transcript>\n<environment>\n{}\n</environment>\n"
-            ));
+            assert_eq!(later.is_some(), index + 1 < all.len());
+            // Each sibling's request repeats the previous one's transcript.
+            if let Some(previous) = previous.replace(rendered.clone()) {
+                assert!(rendered.starts_with(through_transcript(&previous)));
+            }
         }
     }
 
     #[test]
-    fn the_next_turn_repeats_the_transcript_even_when_the_environment_changes() {
+    fn the_next_reply_repeats_the_transcript_even_when_the_live_state_changes() {
         let mut body = json!({"messages": [{"role": "user", "content": "tidy the repo"}]});
-        let ls = tool("t1", "Bash", json!({"command": "cd sub && ls"}));
-        let first = render_input(
-            &json!({"live_cwd": "/r"}),
-            &render_transcript(&body),
-            std::slice::from_ref(&ls),
-            &ls,
-        );
+        let settings = json!({"v": 1, "permission_mode": "auto",
+            "trusted_directories": {"primary": {"path": "/r"}}});
+        let mut context = settings.clone();
+        context["live_cwd"] = json!("/r");
+        context["git_state"] = json!({"branch": "main", "status": {"clean": true}});
+        let reply = [
+            json!({"type": "text", "text": "Listing the subfolder."}),
+            tool_block("t1", "Bash", json!({"command": "cd sub && ls"})),
+        ];
+        let first = judge_input(&context, &body, &reply, 1);
         if let Some(messages) = body["messages"].as_array_mut() {
             messages.push(json!({"role": "assistant", "content": [
-                {"type": "tool_use", "id": "t1", "name": "Bash", "input": ls.input}]}));
+                {"type": "thinking", "thinking": "the user wants it tidy"}, reply[0], reply[1]]}));
             messages.push(json!({"role": "user", "content": [
                 {"type": "tool_result", "tool_use_id": "t1", "content": "a b"}]}));
         }
-        let rm = tool("t2", "Bash", json!({"command": "rm a"}));
-        let next = render_input(
-            &json!({"live_cwd": "/r/sub"}),
-            &render_transcript(&body),
-            std::slice::from_ref(&rm),
-            &rm,
-        );
-        let shared = first.find("</transcript>").unwrap_or(0);
-        assert!(shared > 0);
-        assert_eq!(first[..shared], next[..shared]);
+        context["live_cwd"] = json!("/r/sub");
+        context["git_state"] = json!({"branch": "main", "status": {"clean": false,
+            "porcelain": " M a\n?? b\n"}});
+        context["prior_turn_context"] = json!([{"tool_use_ids": ["t1"],
+            "context": {"live_cwd": "/r", "platform": "linux"}}]);
+        let next_reply = [tool_block("t2", "Bash", json!({"command": "rm a"}))];
+        let next = judge_input(&context, &body, &next_reply, 0);
         assert!(
-            next[shared..]
-                .starts_with("assistant tool call Bash: {\"command\":\"cd sub && ls\"}\n")
+            next.starts_with(through_transcript(&first)),
+            "{first}\n---\n{next}"
+        );
+        assert!(next[through_transcript(&first).len()..].starts_with("[tool result removed]\n"));
+        assert!(!next.contains("prior_turn_context"));
+        assert!(next.contains("<live_state>\n{\"live_cwd\":\"/r/sub\",\"git_state\":"));
+    }
+
+    #[test]
+    fn the_context_splits_into_settings_and_live_state() {
+        let context = json!({"v": 1, "live_cwd": "/r/sub", "home_dir": "/h",
+            "git_state": {"branch": "dev", "status": {"porcelain": "x".repeat(5_000)}},
+            "prior_turn_context": [{"tool_use_ids": ["t"]}], "user_identity": "u"});
+        let (settings, live) = split_context(&context);
+        assert_eq!(
+            settings,
+            "{\"v\":1,\"home_dir\":\"/h\",\"user_identity\":\"u\"}"
+        );
+        assert!(live.starts_with("{\"live_cwd\":\"/r/sub\",\"git_state\":{\"branch\":\"dev\""));
+        assert!(live.len() < LIVE_STATE_STRING_MAX_CHARS + 200, "{live}");
+        assert_eq!(
+            split_context(&Value::Null),
+            ("null".to_string(), "{}".to_string())
         );
     }
 
@@ -1083,19 +1294,44 @@ mod tests {
         );
         let edge = json!("e".repeat(4_000));
         assert_eq!(shorten_input(&edge, 4_000), edge);
-        // The judged call keeps more of a long input than the transcript does.
-        let write = tool("t", "Write", input.clone());
-        let rendered = render_input(&json!({}), "", std::slice::from_ref(&write), &write);
-        let action = shorten_input(&input, ACTION_STRING_MAX_CHARS);
-        assert!(rendered.ends_with(&format!("Input: {action}\n</action>")));
-        let body = json!({"messages": [{"role": "assistant", "content": [
-            {"type": "tool_use", "id": "t", "name": "Write", "input": input}]}]});
-        let context = shorten_input(&write.input, CONTEXT_STRING_MAX_CHARS);
+        // The transcript keeps more of the judged call than `<action>` repeats,
+        // and renders it as the next request's transcript will.
+        let reply = [tool_block("t", "Write", input.clone())];
+        let rendered = judge_input(&json!({}), &json!({"messages": []}), &reply, 0);
+        let repeated = shorten_input(&input, ACTION_REPEAT_MAX_CHARS);
+        assert!(rendered.ends_with(&format!("Input: {repeated}\n</action>")));
+        let body = json!({"messages": [{"role": "assistant", "content": [reply[0].clone()]}]});
         assert_eq!(
-            render_transcript(&body),
-            format!("assistant tool call Write: {context}\n")
+            format!("<transcript>\n{}", render_transcript(&body)),
+            &through_transcript(&rendered)[rendered.find("<transcript>").unwrap_or(0)..]
         );
-        assert!(context.to_string().len() < action.to_string().len());
+        assert!(render_transcript(&body).len() > repeated.to_string().len() * 4);
+    }
+
+    #[test]
+    fn what_follows_the_transcript_stays_short() {
+        // A large Edit, two later calls and a dirty repository: the part the
+        // judge server reads again on the next turn stays well under its
+        // 1,028-token checkpoint distance (about 3 characters per token).
+        let big = "y".repeat(20_000);
+        let reply = [
+            tool_block(
+                "t1",
+                "Edit",
+                json!({"file_path": "/r/a.rs", "old_string": big, "new_string": big}),
+            ),
+            tool_block("t2", "Bash", json!({"command": big})),
+            tool_block("t3", "Bash", json!({"command": "cargo test"})),
+        ];
+        let context = json!({"live_cwd": "/r", "git_state": {"cwd": "/r", "root": "/r",
+            "branch": "dev", "status": {"clean": false, "porcelain": big}}});
+        let rendered = judge_input(&context, &json!({"messages": []}), &reply, 0);
+        let suffix = &rendered[through_transcript(&rendered).len()..];
+        assert!(
+            suffix.chars().count() < 3_000,
+            "{} chars",
+            suffix.chars().count()
+        );
     }
 
     #[test]
