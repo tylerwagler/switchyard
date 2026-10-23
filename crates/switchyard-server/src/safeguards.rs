@@ -12,7 +12,9 @@
 //! With a `[safeguards]` judge configured, one judge request per tool use
 //! decides it. Without one, the answer is `unsupported` and Claude Code runs its
 //! own classifier requests. A verdict that cannot be reached is reported as
-//! `unavailable`, never as allowed.
+//! `unavailable`, never as allowed. A tool use that provably only reads (a
+//! `Read`, or a Bash command of read-only programs that writes nowhere) is
+//! allowed without a judge request, and logged with `fast_path`.
 //!
 //! In shadow mode the answer stays `unsupported`. The judge still runs, in the
 //! background, and its verdicts are logged next to Claude Code's own
@@ -280,34 +282,41 @@ pub(crate) fn answer(
 
 fn record_verdicts(log: &VerdictLog, base: &Value, tool_uses: &[ToolUse], decisions: &[Decision]) {
     for (tool, decision) in tool_uses.iter().zip(decisions) {
-        let verdict = &decision.verdict;
-        let mut record = base.clone();
-        record["kind"] = json!("verdict");
-        record["tool_use_id"] = json!(tool.id);
-        record["name"] = json!(tool.name);
-        record["input"] = tool.input.clone();
-        record["outcome"] = if verdict["type"] == "unavailable" {
-            json!("unavailable")
-        } else {
-            verdict["outcome"].clone()
-        };
-        record["reason"] = verdict.get("reason").cloned().unwrap_or(Value::Null);
-        record["explanation"] = verdict.get("explanation").cloned().unwrap_or(Value::Null);
-        record["latency_ms"] = json!(decision.latency.as_millis() as u64);
-        record["judge_answer"] = json!(decision.answer);
-        record["error"] = json!(decision.error);
-        let prompt = &decision.prompt;
-        record["queued_ms"] = json!(prompt.queued.as_millis() as u64);
-        record["judge_usage"] = decision.usage.clone();
-        record["prompt_chars"] = json!(prompt.chars);
-        record["transcript_chars"] = json!(prompt.transcript_chars);
-        record["common_prefix_chars"] = json!(prompt.common_prefix_chars);
-        record["prefix_hash"] = json!(prompt.prefix_hash);
-        record["env_hash"] = json!(prompt.env_hash);
-        record["env_chars"] = json!(prompt.env_chars);
-        record["live_state_chars"] = json!(prompt.live_state_chars);
-        log.append(record);
+        log.append(verdict_record(base, tool, decision));
     }
+}
+
+/// One verdict log record. A fast-path verdict had no judge prompt, so the
+/// prompt's fields are null.
+fn verdict_record(base: &Value, tool: &ToolUse, decision: &Decision) -> Value {
+    let verdict = &decision.verdict;
+    let mut record = base.clone();
+    record["kind"] = json!("verdict");
+    record["tool_use_id"] = json!(tool.id);
+    record["name"] = json!(tool.name);
+    record["input"] = tool.input.clone();
+    record["outcome"] = if verdict["type"] == "unavailable" {
+        json!("unavailable")
+    } else {
+        verdict["outcome"].clone()
+    };
+    record["reason"] = verdict.get("reason").cloned().unwrap_or(Value::Null);
+    record["explanation"] = verdict.get("explanation").cloned().unwrap_or(Value::Null);
+    record["fast_path"] = json!(decision.fast_path);
+    record["latency_ms"] = json!(decision.latency.as_millis() as u64);
+    record["judge_answer"] = json!(decision.answer);
+    record["error"] = json!(decision.error);
+    let prompt = decision.prompt.as_ref();
+    record["queued_ms"] = json!(prompt.map(|prompt| prompt.queued.as_millis() as u64));
+    record["judge_usage"] = decision.usage.clone();
+    record["prompt_chars"] = json!(prompt.map(|prompt| prompt.chars));
+    record["transcript_chars"] = json!(prompt.map(|prompt| prompt.transcript_chars));
+    record["common_prefix_chars"] = json!(prompt.and_then(|prompt| prompt.common_prefix_chars));
+    record["prefix_hash"] = json!(prompt.map(|prompt| &prompt.prefix_hash));
+    record["env_hash"] = json!(prompt.map(|prompt| &prompt.env_hash));
+    record["env_chars"] = json!(prompt.map(|prompt| prompt.env_chars));
+    record["live_state_chars"] = json!(prompt.map(|prompt| prompt.live_state_chars));
+    record
 }
 
 async fn shadow_judge(
@@ -517,7 +526,10 @@ struct Decision {
     /// The judge server's token usage: `cache_read_input_tokens` it reused
     /// from its cache, `input_tokens` it computed.
     usage: Value,
-    prompt: PromptStats,
+    /// The judge prompt, when the judge was asked.
+    prompt: Option<PromptStats>,
+    /// The rule that decided without the judge, when one did.
+    fast_path: Option<&'static str>,
 }
 
 /// The judge prompt's size, and how it relates to the session's previous one.
@@ -571,6 +583,18 @@ impl Judge {
     }
 
     async fn verdict(&self, all: &[ToolUse], tool: &ToolUse) -> Decision {
+        // A provable read is allowed without waiting for a judge call.
+        if provably_read_only(tool) {
+            return Decision {
+                verdict: json!({"type": "evaluated", "outcome": "not_flagged"}),
+                latency: Duration::ZERO,
+                answer: None,
+                error: None,
+                usage: Value::Null,
+                prompt: None,
+                fast_path: Some("read_only"),
+            };
+        }
         let input = render_input(
             &self.environment,
             &self.transcript,
@@ -627,7 +651,8 @@ impl Judge {
             answer,
             error,
             usage,
-            prompt,
+            prompt: Some(prompt),
+            fast_path: None,
         }
     }
 
@@ -882,6 +907,1025 @@ fn parse_verdict(text: &str) -> Option<Value> {
         verdict["explanation"] = Value::String(reason);
     }
     Some(verdict)
+}
+
+/// Tools that only read files or the tool list.
+const READ_ONLY_TOOLS: [&str; 6] = ["Read", "Grep", "Glob", "LS", "NotebookRead", "ToolSearch"];
+/// Variables a read-only command may expand without setting them. Their
+/// values are paths or names, never options, and no command here sets them.
+const PATH_VARIABLES: [&str; 4] = ["HOME", "USER", "PWD", "TMPDIR"];
+/// Variables a command may not set: the shell or an allowed program reads
+/// them, so a value could run something (`PATH`, `LD_PRELOAD`,
+/// `GIT_EXTERNAL_DIFF`, `RIPGREP_CONFIG_PATH`, a `HOME` with another
+/// `.gitconfig`) or change how words split.
+const UNSETTABLE_VARIABLES: [&str; 27] = [
+    "PATH",
+    "HOME",
+    "USER",
+    "PWD",
+    "OLDPWD",
+    "TMPDIR",
+    "IFS",
+    "CDPATH",
+    "ENV",
+    "SHELL",
+    "SHELLOPTS",
+    "PS4",
+    "PROMPT_COMMAND",
+    "GLOBIGNORE",
+    "POSIXLY_CORRECT",
+    "PAGER",
+    "MANPAGER",
+    "EDITOR",
+    "VISUAL",
+    "GCONV_PATH",
+    "LOCPATH",
+    "NLSPATH",
+    "HOSTALIASES",
+    "RIPGREP_CONFIG_PATH",
+    "AWKPATH",
+    "AWKLIBPATH",
+    "TZDIR",
+];
+const UNSETTABLE_PREFIXES: [&str; 8] = [
+    "LD_", "DYLD_", "GIT_", "BASH", "XDG_", "SSH_", "MALLOC_", "GLIBC_",
+];
+/// `find` primaries that run a program, delete or write a file.
+const FIND_ACTIONS: [&str; 9] = [
+    "-exec", "-execdir", "-ok", "-okdir", "-delete", "-fprint", "-fprint0", "-fprintf", "-fls",
+];
+/// `hostname` options that only print; any other argument sets the name.
+const HOSTNAME_QUERIES: [&str; 15] = [
+    "-s",
+    "--short",
+    "-f",
+    "--fqdn",
+    "--long",
+    "-i",
+    "--ip-address",
+    "-I",
+    "--all-ip-addresses",
+    "-d",
+    "--domain",
+    "-A",
+    "--all-fqdns",
+    "-a",
+    "--alias",
+];
+/// `xxd` options that take the next word as their value.
+const XXD_VALUES: [&str; 12] = [
+    "-c",
+    "-cols",
+    "-g",
+    "-groupsize",
+    "-l",
+    "-len",
+    "-s",
+    "-seek",
+    "-o",
+    "-offset",
+    "-n",
+    "-name",
+];
+/// Git subcommands that only read the repository.
+const GIT_READS: [&str; 18] = [
+    "log",
+    "show",
+    "diff",
+    "status",
+    "blame",
+    "grep",
+    "ls-files",
+    "ls-tree",
+    "rev-parse",
+    "rev-list",
+    "describe",
+    "cat-file",
+    "merge-base",
+    "shortlog",
+    "count-objects",
+    "for-each-ref",
+    "name-rev",
+    "whatchanged",
+];
+/// Long options of git's read subcommands that write a file (`--output`) or
+/// run a program (`--ext-diff`, `git grep --open-files-in-pager`).
+const GIT_WRITE_OPTIONS: [&str; 3] = ["output", "ext-diff", "open-files-in-pager"];
+
+/// Whether a tool use provably only reads, so it needs no judge: a read-only
+/// tool, or a Bash command made only of read-only programs. Every doubt goes
+/// to the judge: this answers `true` only for what it fully understands.
+fn provably_read_only(tool: &ToolUse) -> bool {
+    READ_ONLY_TOOLS.contains(&tool.name.as_str())
+        || tool.name == "Bash"
+            && tool.input["command"]
+                .as_str()
+                .is_some_and(|command| read_only_shell(command).is_some())
+}
+
+/// A part of a shell word: literal text, or the value of `$NAME`.
+#[derive(Debug, Clone)]
+enum Piece {
+    Text { text: String, quoted: bool },
+    Var { name: String, quoted: bool },
+}
+
+#[derive(Debug)]
+enum Token {
+    Word(Vec<Piece>),
+    /// `;` (also a newline), `&&`, `||` or `|` (also `|&`).
+    Separator(&'static str),
+    /// `<`, `<&`, `>&` or `>` (also `>>`, `>|`, `&>`, `&>>`), with a file
+    /// descriptor or not. The next word is its target.
+    Redirect(&'static str),
+}
+
+/// Splits a command into words and operators as bash reads it. `None` for
+/// anything a read-only command does not need: command, process or
+/// arithmetic substitution, a heredoc, a subshell or group, brace expansion,
+/// backgrounding, and expansions other than `$NAME` and `${NAME}`.
+fn shell_tokens(command: &str) -> Option<Vec<Token>> {
+    let mut tokens = Vec::new();
+    let mut word = Vec::new();
+    // A word has started, even if it is still empty (`''`).
+    let mut started = false;
+    let mut chars = command.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' => end_word(&mut tokens, &mut word, &mut started),
+            '\n' => {
+                end_word(&mut tokens, &mut word, &mut started);
+                tokens.push(Token::Separator(";"));
+            }
+            ';' => {
+                if chars.peek() == Some(&';') {
+                    return None;
+                }
+                end_word(&mut tokens, &mut word, &mut started);
+                tokens.push(Token::Separator(";"));
+            }
+            '|' => {
+                end_word(&mut tokens, &mut word, &mut started);
+                if chars.next_if_eq(&'|').is_some() {
+                    tokens.push(Token::Separator("||"));
+                } else {
+                    chars.next_if_eq(&'&');
+                    tokens.push(Token::Separator("|"));
+                }
+            }
+            '&' => {
+                end_word(&mut tokens, &mut word, &mut started);
+                if chars.next_if_eq(&'&').is_some() {
+                    tokens.push(Token::Separator("&&"));
+                } else if chars.next_if_eq(&'>').is_some() {
+                    chars.next_if_eq(&'>');
+                    tokens.push(Token::Redirect(">"));
+                } else {
+                    return None;
+                }
+            }
+            '<' | '>' => {
+                // Digits right before the operator are the file descriptor
+                // it redirects, not a word.
+                let descriptor = !word.is_empty()
+                    && word.iter().all(|piece| {
+                        matches!(piece, Piece::Text { text, quoted: false }
+                            if text.chars().all(|c| c.is_ascii_digit()))
+                    });
+                if descriptor {
+                    word.clear();
+                    started = false;
+                } else {
+                    end_word(&mut tokens, &mut word, &mut started);
+                }
+                let op = match (c, chars.peek()) {
+                    (_, Some('(')) | ('<', Some('<' | '>')) => return None,
+                    (_, Some('&')) => {
+                        chars.next();
+                        if c == '<' { "<&" } else { ">&" }
+                    }
+                    ('>', Some('>' | '|')) => {
+                        chars.next();
+                        ">"
+                    }
+                    ('>', _) => ">",
+                    _ => "<",
+                };
+                tokens.push(Token::Redirect(op));
+            }
+            '\\' => match chars.next() {
+                Some('\n') => {}
+                Some(next) => {
+                    started = true;
+                    push_char(&mut word, next, true);
+                }
+                None => return None,
+            },
+            '\'' => {
+                started = true;
+                loop {
+                    match chars.next()? {
+                        '\'' => break,
+                        c => push_char(&mut word, c, true),
+                    }
+                }
+            }
+            '"' => {
+                started = true;
+                loop {
+                    match chars.next()? {
+                        '"' => break,
+                        '`' => return None,
+                        '$' => shell_expansion(&mut chars, &mut word, true)?,
+                        '\\' => match chars.peek() {
+                            Some('\n') => {
+                                chars.next();
+                            }
+                            Some(&next @ ('$' | '`' | '"' | '\\')) => {
+                                chars.next();
+                                push_char(&mut word, next, true);
+                            }
+                            _ => push_char(&mut word, '\\', true),
+                        },
+                        c => push_char(&mut word, c, true),
+                    }
+                }
+            }
+            '$' => {
+                started = true;
+                shell_expansion(&mut chars, &mut word, false)?;
+            }
+            '`' | '(' | ')' | '{' | '}' => return None,
+            // A comment runs to the end of the line.
+            '#' if !started => while chars.next_if(|&c| c != '\n').is_some() {},
+            c => {
+                started = true;
+                push_char(&mut word, c, false);
+            }
+        }
+    }
+    end_word(&mut tokens, &mut word, &mut started);
+    Some(tokens)
+}
+
+fn end_word(tokens: &mut Vec<Token>, word: &mut Vec<Piece>, started: &mut bool) {
+    if std::mem::take(started) {
+        tokens.push(Token::Word(std::mem::take(word)));
+    }
+}
+
+fn push_char(word: &mut Vec<Piece>, c: char, quoted: bool) {
+    if let Some(Piece::Text { text, quoted: last }) = word.last_mut()
+        && *last == quoted
+    {
+        text.push(c);
+    } else {
+        word.push(Piece::Text {
+            text: c.to_string(),
+            quoted,
+        });
+    }
+}
+
+/// Reads what follows a `$`: `NAME` or `{NAME}`. A `$` before a blank or the
+/// end (or a closing `"`) is literal; anything else is `None`.
+fn shell_expansion(
+    chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+    word: &mut Vec<Piece>,
+    quoted: bool,
+) -> Option<()> {
+    let braced = chars.next_if_eq(&'{').is_some();
+    let mut name = String::new();
+    while let Some(c) = chars.next_if(|c| c.is_ascii_alphanumeric() || *c == '_') {
+        name.push(c);
+    }
+    if braced && (name.is_empty() || chars.next() != Some('}')) {
+        return None;
+    }
+    if name.is_empty() {
+        let literal = matches!(chars.peek(), None | Some(' ' | '\t' | '\n'))
+            || quoted && chars.peek() == Some(&'"');
+        if !literal {
+            return None;
+        }
+        push_char(word, '$', quoted);
+        return Some(());
+    }
+    if name.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    word.push(Piece::Var { name, quoted });
+    Some(())
+}
+
+/// Checks a Bash command: simple commands of read-only programs, joined by
+/// `;`, `&&`, `||`, `|` and newlines, that write nowhere but stdout, stderr
+/// and `/dev/null`. `Some` only when it runs at least one program.
+fn read_only_shell(command: &str) -> Option<()> {
+    let tokens = shell_tokens(command)?;
+    let mut commands: Vec<(&[Token], &str)> = Vec::new();
+    let mut start = 0;
+    for (at, token) in tokens.iter().enumerate() {
+        if let Token::Separator(separator) = token {
+            commands.push((&tokens[start..at], separator));
+            start = at + 1;
+        }
+    }
+    commands.push((&tokens[start..], ";"));
+    let mut variables = HashMap::new();
+    let mut programs = 0;
+    let mut before = ";";
+    for (command, after) in commands {
+        // A variable set in a pipeline, or after `||`, may be unset for the
+        // commands that follow.
+        let keeps = before != "|" && after != "|" && before != "||";
+        programs += read_only_simple_command(command, &mut variables, keeps)?;
+        before = after;
+    }
+    (programs > 0).then_some(())
+}
+
+/// Checks one simple command and returns how many programs it runs (0 or 1).
+/// It may set shell variables (`NAME=value` alone) for the commands after it.
+fn read_only_simple_command(
+    tokens: &[Token],
+    variables: &mut HashMap<String, String>,
+    keeps: bool,
+) -> Option<usize> {
+    let mut words = Vec::new();
+    let mut tokens = tokens.iter();
+    while let Some(token) = tokens.next() {
+        match token {
+            Token::Word(word) => words.push(word),
+            Token::Redirect(op) => {
+                let Some(Token::Word(target)) = tokens.next() else {
+                    return None;
+                };
+                let target = expand_word(target, variables, true)?;
+                let descriptor = target == "-"
+                    || !target.is_empty() && target.bytes().all(|b| b.is_ascii_digit());
+                let allowed = match *op {
+                    "<" => true,
+                    "<&" => descriptor,
+                    ">&" => descriptor || target == "/dev/null",
+                    _ => target == "/dev/null",
+                };
+                if !allowed {
+                    return None;
+                }
+            }
+            Token::Separator(_) => return None,
+        }
+    }
+    let mut words = words.into_iter().peekable();
+    let mut assigned = Vec::new();
+    while let Some((name, value)) = words.peek().and_then(|word| assignment(word)) {
+        assigned.push((name, expand_word(&value, variables, false)?));
+        words.next();
+    }
+    let Some(program) = words.next() else {
+        for (name, value) in assigned {
+            if UNSETTABLE_VARIABLES.contains(&name.as_str())
+                || UNSETTABLE_PREFIXES
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+            {
+                return None;
+            }
+            if keeps {
+                variables.insert(name, value);
+            }
+        }
+        return Some(0);
+    };
+    // Only the locale, the time zone and colors may be set for one program.
+    let program_variable = |name: &str| {
+        matches!(name, "LANG" | "LANGUAGE" | "TZ" | "NO_COLOR" | "COLUMNS")
+            || name.starts_with("LC_")
+    };
+    if !assigned.iter().all(|(name, _)| program_variable(name)) {
+        return None;
+    }
+    // The program is named literally, never by a variable.
+    if program
+        .iter()
+        .any(|piece| matches!(piece, Piece::Var { .. }))
+    {
+        return None;
+    }
+    let program = expand_word(program, variables, true)?;
+    let args = words
+        .map(|word| expand_word(word, variables, true))
+        .collect::<Option<Vec<_>>>()?;
+    read_only_program(&program, &args).then_some(1)
+}
+
+/// Splits an assignment word, `NAME=value`, into the name and the value.
+fn assignment(word: &[Piece]) -> Option<(String, Vec<Piece>)> {
+    let Some(Piece::Text {
+        text,
+        quoted: false,
+    }) = word.first()
+    else {
+        return None;
+    };
+    let (name, rest) = text.split_once('=')?;
+    let valid = name.starts_with(|c: char| c.is_ascii_alphabetic() || c == '_')
+        && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !valid {
+        return None;
+    }
+    let mut value = Vec::new();
+    if !rest.is_empty() {
+        value.push(Piece::Text {
+            text: rest.to_string(),
+            quoted: false,
+        });
+    }
+    value.extend(word[1..].iter().cloned());
+    Some((name.to_string(), value))
+}
+
+/// The text of a word with its variables' values in place; `None` for a
+/// variable this command did not set (other than `PATH_VARIABLES`). A word
+/// that bash would split or match against file names (`split`, not an
+/// assignment's value) must stay one word that cannot become an option: an
+/// unquoted value must have no blank or pattern character, and a file name
+/// pattern must not start the word or follow a `-` before any `=` (`*.rs`
+/// and `-*` could match a file named `-i.rs`; `--include=*.rs` stays that
+/// option).
+fn expand_word(word: &[Piece], variables: &HashMap<String, String>, split: bool) -> Option<String> {
+    let mut text = String::new();
+    // The text before the word's first unquoted pattern character.
+    let mut before_pattern: Option<String> = None;
+    for piece in word {
+        match piece {
+            Piece::Text { text: part, quoted } => {
+                if !quoted
+                    && before_pattern.is_none()
+                    && let Some(at) = part.find(['*', '?', '['])
+                {
+                    before_pattern = Some(format!("{text}{}", &part[..at]));
+                }
+                text.push_str(part);
+            }
+            Piece::Var { name, quoted } => {
+                let value = variables
+                    .get(name)
+                    .map(String::as_str)
+                    .or_else(|| PATH_VARIABLES.contains(&name.as_str()).then_some("/env"))?;
+                if split
+                    && !quoted
+                    && (value.is_empty() || value.contains([' ', '\t', '\n', '*', '?', '[']))
+                {
+                    return None;
+                }
+                text.push_str(value);
+            }
+        }
+    }
+    if split
+        && text != "["
+        && let Some(prefix) = before_pattern
+        && (prefix.is_empty() || prefix.starts_with('-') && !prefix.contains('='))
+    {
+        return None;
+    }
+    Some(text)
+}
+
+/// The arguments before `--`, where the options are.
+fn options_of(args: &[String]) -> &[String] {
+    let end = args
+        .iter()
+        .position(|arg| arg == "--")
+        .unwrap_or(args.len());
+    &args[..end]
+}
+
+/// Whether `arg` is one of the long options `names`, or an abbreviation of
+/// one: GNU getopt and git take any unambiguous prefix.
+fn long_option(arg: &str, names: &[&str]) -> bool {
+    let Some(given) = arg.strip_prefix("--") else {
+        return false;
+    };
+    let given = given.split_once('=').map_or(given, |(name, _)| name);
+    !given.is_empty() && names.iter().any(|name| name.starts_with(given))
+}
+
+/// Whether `arg` is a cluster of short options with one of `letters`.
+fn short_option(arg: &str, letters: &str) -> bool {
+    arg.strip_prefix('-').is_some_and(|cluster| {
+        !cluster.starts_with('-') && cluster.contains(|c| letters.contains(c))
+    })
+}
+
+/// Counts the operands of a command line, skipping options and the values
+/// of the `with_value` options given as the next word.
+fn operands(args: &[String], with_value: &[&str]) -> usize {
+    let mut count = 0;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            return count + args.count();
+        }
+        if arg.len() > 1 && arg.starts_with('-') {
+            if with_value.contains(&arg.as_str()) {
+                args.next();
+            }
+        } else {
+            count += 1;
+        }
+    }
+    count
+}
+
+/// Whether one program, with these arguments, only reads and prints.
+fn read_only_program(program: &str, args: &[String]) -> bool {
+    let options = options_of(args);
+    match program {
+        "cd" | "pwd" | "ls" | "cat" | "head" | "tail" | "grep" | "egrep" | "fgrep" | "wc"
+        | "cut" | "tr" | "cmp" | "comm" | "nl" | "column" | "sha256sum" | "sha1sum" | "md5sum"
+        | "stat" | "du" | "df" | "echo" | "which" | "type" | "realpath" | "readlink"
+        | "dirname" | "basename" | "jq" | "od" | "hexdump" | "true" | "false" | "test" | "["
+        | "nproc" | "uname" | "free" | "uptime" | "id" | "whoami" => true,
+        "hostname" => args
+            .iter()
+            .all(|arg| HOSTNAME_QUERIES.contains(&arg.as_str())),
+        // `--pre` and `--hostname-bin` run a program.
+        "rg" => !options
+            .iter()
+            .any(|arg| long_option(arg, &["pre", "pre-glob", "hostname-bin"])),
+        "find" => !args.iter().any(|arg| FIND_ACTIONS.contains(&arg.as_str())),
+        "sed" => read_only_sed(args),
+        "awk" => read_only_awk(args),
+        "sort" => !options
+            .iter()
+            .any(|arg| short_option(arg, "o") || long_option(arg, &["output", "compress-program"])),
+        // A second operand is the output file.
+        "uniq" => {
+            operands(
+                args,
+                &[
+                    "-f",
+                    "-s",
+                    "-w",
+                    "--skip-fields",
+                    "--skip-chars",
+                    "--check-chars",
+                ],
+            ) <= 1
+        }
+        "xxd" => operands(args, &XXD_VALUES) <= 1,
+        "diff" => !options.iter().any(|arg| long_option(arg, &["output"])),
+        "printf" => !args.first().is_some_and(|arg| arg.starts_with("-v")),
+        "date" => !options
+            .iter()
+            .any(|arg| short_option(arg, "s") || long_option(arg, &["set"])),
+        "tree" => !options
+            .iter()
+            .any(|arg| short_option(arg, "oR") || long_option(arg, &["output"])),
+        // `-C` compiles a magic file.
+        "file" => !options
+            .iter()
+            .any(|arg| short_option(arg, "C") || long_option(arg, &["compile"])),
+        "git" => read_only_git(args),
+        _ => false,
+    }
+}
+
+/// `sed -n` whose scripts only print (`sed_prints_only`): no `-i`, no script
+/// file, options anywhere on the line (GNU sed permutes them).
+fn read_only_sed(args: &[String]) -> bool {
+    let mut quiet = false;
+    let mut scripts = Vec::new();
+    let mut operands = Vec::new();
+    let mut args = args.iter().map(String::as_str);
+    while let Some(arg) = args.next() {
+        match arg {
+            "--" => {
+                operands.extend(args.by_ref());
+                break;
+            }
+            "-n" | "--quiet" | "--silent" => quiet = true,
+            "-e" | "--expression" => match args.next() {
+                Some(script) => scripts.push(script),
+                None => return false,
+            },
+            "-l" | "--line-length" => {
+                args.next();
+            }
+            "-E" | "-r" | "--regexp-extended" | "-s" | "--separate" | "-z" | "--null-data"
+            | "-u" | "--unbuffered" | "--posix" | "--debug" | "--sandbox" => {}
+            _ if arg.starts_with("--line-length=") => {}
+            _ if arg.starts_with("--expression=") => {
+                scripts.push(&arg["--expression=".len()..]);
+            }
+            _ if arg.len() > 1 && arg.starts_with('-') => {
+                // A cluster of flags; a last `e` takes the next word as a script.
+                let cluster = &arg[1..];
+                let (flags, script) = cluster
+                    .strip_suffix('e')
+                    .map_or((cluster, false), |flags| (flags, true));
+                if !flags.chars().all(|c| "nErszu".contains(c)) {
+                    return false;
+                }
+                quiet |= flags.contains('n');
+                if script {
+                    match args.next() {
+                        Some(script) => scripts.push(script),
+                        None => return false,
+                    }
+                }
+            }
+            _ => operands.push(arg),
+        }
+    }
+    if scripts.is_empty() {
+        let Some(script) = operands.first() else {
+            return false;
+        };
+        scripts.push(script);
+    }
+    quiet && scripts.iter().all(|script| sed_prints_only(script))
+}
+
+/// Whether a sed script only selects and prints lines: commands `p`, `=`,
+/// `l`, `n`, `N`, `q`, `Q` and `s` (flags `g`, `p`, `i`, `I`, `m`, `M` and a
+/// number), each after an optional address or range, joined by `;` or
+/// newlines. No `w`, `W`, `e`, `r`, blocks, or `s` flags `w` and `e`.
+fn sed_prints_only(script: &str) -> bool {
+    let mut chars = script.chars().peekable();
+    let skip_blanks = |chars: &mut std::iter::Peekable<std::str::Chars<'_>>| {
+        while chars.next_if(|c| *c == ' ' || *c == '\t').is_some() {}
+    };
+    loop {
+        while chars
+            .next_if(|c| matches!(c, ' ' | '\t' | '\n' | ';'))
+            .is_some()
+        {}
+        if chars.peek().is_none() {
+            return true;
+        }
+        if sed_address(&mut chars).is_none() {
+            return false;
+        }
+        skip_blanks(&mut chars);
+        if chars.next_if_eq(&',').is_some() {
+            skip_blanks(&mut chars);
+            let second = if chars.next_if(|c| *c == '+' || *c == '~').is_some() {
+                chars.next_if(char::is_ascii_digit).is_some()
+            } else {
+                sed_address(&mut chars) == Some(true)
+            };
+            if !second {
+                return false;
+            }
+            while chars.next_if(char::is_ascii_digit).is_some() {}
+            skip_blanks(&mut chars);
+        }
+        chars.next_if_eq(&'!');
+        skip_blanks(&mut chars);
+        match chars.next() {
+            Some('p' | '=' | 'l' | 'n' | 'N') => {}
+            Some('q' | 'Q') => {
+                skip_blanks(&mut chars);
+                while chars.next_if(char::is_ascii_digit).is_some() {}
+            }
+            Some('s') => {
+                let Some(delimiter) = chars.next().filter(|c| *c != '\\' && *c != '\n') else {
+                    return false;
+                };
+                if !sed_until(&mut chars, delimiter) || !sed_until(&mut chars, delimiter) {
+                    return false;
+                }
+                while chars.next_if(|c| "gpiImM0123456789".contains(*c)).is_some() {}
+            }
+            _ => return false,
+        }
+        skip_blanks(&mut chars);
+        match chars.next() {
+            None => return true,
+            Some(';' | '\n') => {}
+            _ => return false,
+        }
+    }
+}
+
+/// Reads an optional sed address: a line number (or `first~step`), `$`, or
+/// `/regex/` with flags `I` and `M`. `Some(present)`, or `None` if malformed.
+fn sed_address(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<bool> {
+    match chars.peek() {
+        Some(c) if c.is_ascii_digit() => {
+            while chars.next_if(char::is_ascii_digit).is_some() {}
+            if chars.next_if_eq(&'~').is_some() {
+                while chars.next_if(char::is_ascii_digit).is_some() {}
+            }
+            Some(true)
+        }
+        Some('$') => {
+            chars.next();
+            Some(true)
+        }
+        Some('/') => {
+            chars.next();
+            if !sed_until(chars, '/') {
+                return None;
+            }
+            while chars.next_if(|c| *c == 'I' || *c == 'M').is_some() {}
+            Some(true)
+        }
+        // A custom delimiter (`\%regex%`) is left to the judge.
+        Some('\\') => None,
+        _ => Some(false),
+    }
+}
+
+/// Skips to just past the next unescaped `delimiter`; `false` if there is none.
+fn sed_until(chars: &mut std::iter::Peekable<std::str::Chars<'_>>, delimiter: char) -> bool {
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            chars.next();
+        } else if c == delimiter {
+            return true;
+        }
+    }
+    false
+}
+
+/// awk with only `-F` and `-v` options and a program that cannot run a
+/// command or write a file: no `system`, `getline`, `>`, `|` (so no
+/// comparison with `>` or `||` either), or gawk `@` directive.
+fn read_only_awk(args: &[String]) -> bool {
+    let mut args = args.iter().map(String::as_str);
+    let program = loop {
+        let Some(arg) = args.next() else {
+            return false;
+        };
+        match arg {
+            "-F" | "-v" => {
+                if args.next().is_none() {
+                    return false;
+                }
+            }
+            "--" => break args.next(),
+            _ if arg.starts_with("-F") || arg.starts_with("-v") => {}
+            _ if arg.starts_with('-') && arg != "-" => return false,
+            _ => break Some(arg),
+        }
+    };
+    let Some(program) = program else {
+        return false;
+    };
+    args.all(|arg| arg == "-" || !arg.starts_with('-'))
+        && !["system", "getline", ">", "|", "@"]
+            .iter()
+            .any(|word| program.contains(word))
+}
+
+/// Git that only reads: global options `-C`, `--no-pager`, `-P`,
+/// `--no-optional-locks` and `-c color.*` (any other `-c` can name a program
+/// to run), then a read subcommand, or a listing form of `branch`, `tag`,
+/// `remote`, `worktree`, `stash`, `reflog` or `config`.
+fn read_only_git(args: &[String]) -> bool {
+    let mut args = args;
+    let (subcommand, args) = loop {
+        let Some((first, rest)) = args.split_first() else {
+            return false;
+        };
+        match first.as_str() {
+            "-C" => match rest.split_first() {
+                Some((_, rest)) => args = rest,
+                None => return false,
+            },
+            "-c" => match rest.split_first() {
+                Some((setting, rest)) if setting.starts_with("color.") => args = rest,
+                _ => return false,
+            },
+            "--no-pager" | "-P" | "--no-optional-locks" => args = rest,
+            _ => break (first.as_str(), rest),
+        }
+    };
+    let options = options_of(args);
+    if options
+        .iter()
+        .any(|arg| long_option(arg, &GIT_WRITE_OPTIONS))
+    {
+        return false;
+    }
+    let first = args.first().map(String::as_str);
+    match subcommand {
+        // `-O` opens the matches in a pager or editor it names.
+        "grep" => !options.iter().any(|arg| short_option(arg, "O")),
+        _ if GIT_READS.contains(&subcommand) => true,
+        "reflog" => {
+            (matches!(first, None | Some("show")) || first.is_some_and(|arg| arg.starts_with('-')))
+                && !args
+                    .iter()
+                    .any(|arg| matches!(arg.as_str(), "expire" | "delete" | "drop"))
+        }
+        "branch" => git_lists_refs(args, &GIT_BRANCH_LISTING),
+        "tag" => git_lists_refs(args, &GIT_TAG_LISTING),
+        "remote" => git_remote_reads(args),
+        "worktree" => first == Some("list"),
+        "stash" => matches!(first, Some("list" | "show")),
+        "config" => git_config_reads(args),
+        _ => false,
+    }
+}
+
+/// The options of `git branch` or `git tag` that list refs, never create,
+/// delete or move one.
+struct RefListing {
+    /// Short options, and those of them that make it list.
+    letters: &'static str,
+    list_letters: &'static str,
+    /// Long options, and those of them that make it list.
+    flags: &'static [&'static str],
+    list_flags: &'static [&'static str],
+    /// Long options that take a value (`=value` or the next word).
+    valued: &'static [&'static str],
+    /// Filters that make it list and take an optional commit.
+    filters: &'static [&'static str],
+}
+
+const GIT_REF_FILTERS: [&str; 5] = [
+    "contains",
+    "no-contains",
+    "merged",
+    "no-merged",
+    "points-at",
+];
+const GIT_BRANCH_LISTING: RefListing = RefListing {
+    letters: "arvli",
+    // `-v` lists in git's builtin/branch.c, as `--list` does.
+    list_letters: "lv",
+    flags: &[
+        "all",
+        "remotes",
+        "show-current",
+        "ignore-case",
+        "omit-empty",
+        "color",
+        "no-color",
+        "column",
+        "no-column",
+        "abbrev",
+        "no-abbrev",
+        "format",
+        "sort",
+    ],
+    list_flags: &["list", "verbose"],
+    valued: &["format", "sort"],
+    filters: &GIT_REF_FILTERS,
+};
+const GIT_TAG_LISTING: RefListing = RefListing {
+    letters: "lni0123456789",
+    list_letters: "ln",
+    flags: &[
+        "ignore-case",
+        "omit-empty",
+        "color",
+        "no-color",
+        "column",
+        "no-column",
+        "format",
+        "sort",
+    ],
+    list_flags: &["list"],
+    valued: &["format", "sort"],
+    filters: &GIT_REF_FILTERS,
+};
+
+/// Whether `git branch` or `git tag` with `args` only lists: every option is
+/// a listing one, and names (patterns) come only with an option that lists;
+/// without one, a name creates a ref.
+fn git_lists_refs(args: &[String], listing: &RefListing) -> bool {
+    let mut lists = false;
+    let mut names = false;
+    let mut args = args.iter().map(String::as_str).peekable();
+    while let Some(arg) = args.next() {
+        if arg == "--" {
+            names |= args.next().is_some();
+            break;
+        }
+        if let Some(option) = arg.strip_prefix("--") {
+            let (name, value) = option
+                .split_once('=')
+                .map_or((option, None), |(name, value)| (name, Some(value)));
+            if listing.filters.contains(&name) {
+                lists = true;
+                if value.is_none() {
+                    args.next_if(|next| !next.starts_with('-'));
+                }
+            } else if listing.list_flags.contains(&name) {
+                lists = true;
+            } else if !listing.flags.contains(&name)
+                || listing.valued.contains(&name) && value.is_none() && args.next().is_none()
+            {
+                return false;
+            }
+        } else if let Some(cluster) = arg.strip_prefix('-')
+            && !cluster.is_empty()
+        {
+            if !cluster.chars().all(|c| listing.letters.contains(c)) {
+                return false;
+            }
+            lists |= cluster.contains(|c| listing.list_letters.contains(c));
+        } else {
+            names = true;
+        }
+    }
+    lists || !names
+}
+
+/// `git remote`, `git remote -v`, `git remote show` and `git remote get-url`.
+fn git_remote_reads(args: &[String]) -> bool {
+    let args: Vec<&str> = args
+        .iter()
+        .map(String::as_str)
+        .skip_while(|arg| matches!(*arg, "-v" | "--verbose"))
+        .collect();
+    match args.split_first() {
+        None => true,
+        Some((&"show", rest)) => rest.iter().all(|arg| !arg.starts_with('-') || *arg == "-n"),
+        Some((&"get-url", rest)) => rest
+            .iter()
+            .all(|arg| !arg.starts_with('-') || matches!(*arg, "--push" | "--all")),
+        _ => false,
+    }
+}
+
+/// `git config` that reads: `--get*`, `--list`/`-l`, `get`, `list`, or one
+/// key name alone (which gets it; a second operand would set it).
+fn git_config_reads(args: &[String]) -> bool {
+    const READS: [&str; 6] = [
+        "get",
+        "get-all",
+        "get-regexp",
+        "get-urlmatch",
+        "get-color",
+        "list",
+    ];
+    const OTHERS: [&str; 23] = [
+        "global",
+        "system",
+        "local",
+        "worktree",
+        "file",
+        "blob",
+        "show-origin",
+        "show-scope",
+        "show-names",
+        "name-only",
+        "null",
+        "includes",
+        "no-includes",
+        "type",
+        "bool",
+        "int",
+        "bool-or-int",
+        "path",
+        "expiry-date",
+        "default",
+        "all",
+        "regexp",
+        "value",
+    ];
+    const VALUED: [&str; 5] = ["file", "blob", "type", "default", "value"];
+    let mut args = args.iter().map(String::as_str).peekable();
+    // `git config get` and `git config list` (git 2.46).
+    let mut reads = args.next_if(|arg| matches!(*arg, "get" | "list")).is_some();
+    let mut names = Vec::new();
+    while let Some(arg) = args.next() {
+        match arg {
+            "-l" => reads = true,
+            "-z" => {}
+            "-f" => {
+                if args.next().is_none() {
+                    return false;
+                }
+            }
+            _ if arg.starts_with("--") => {
+                let option = &arg[2..];
+                let (name, value) = option
+                    .split_once('=')
+                    .map_or((option, None), |(name, value)| (name, Some(value)));
+                if READS.contains(&name) {
+                    reads = true;
+                } else if !OTHERS.contains(&name) {
+                    return false;
+                }
+                if VALUED.contains(&name) && value.is_none() && args.next().is_none() {
+                    return false;
+                }
+            }
+            _ if arg.starts_with('-') => return false,
+            _ => names.push(arg),
+        }
+    }
+    // A key always has a dot; a lone word is a subcommand (`edit`).
+    reads || matches!(names.as_slice(), [name] if name.contains('.'))
 }
 
 #[cfg(test)]
@@ -1277,5 +2321,268 @@ mod tests {
         assert!(transcript.contains("earlier conversation removed"));
         assert!(transcript.trim_end().ends_with("LATEST"));
         assert!(transcript.chars().count() < TRANSCRIPT_HEAD_CHARS + TRANSCRIPT_TAIL_CHARS + 100);
+    }
+
+    fn bash(command: &str) -> ToolUse {
+        tool("t", "Bash", json!({"command": command, "description": "d"}))
+    }
+
+    #[test]
+    fn reads_take_the_fast_path() {
+        let commands = [
+            // From the live verdict log.
+            "ls -la /Users/Shared/claude-vm/claude/Projects/AI",
+            "ls -la /r/hardware && find /r/hardware -maxdepth 2 -not -name '._*' | head -50",
+            "cd /r/hardware && git remote -v && git log --oneline -3 2>/dev/null",
+            r#"grep -n "attic/\|quant-research/\|tools/" /r/CLAUDE.md | head"#,
+            "git -C /r/hardware branch --show-current && git -C /r/hardware status --short",
+            "cat .gitmodules",
+            "git log -1 --format='%h %ci %s' && git merge-base --is-ancestor b12f01ce HEAD && echo yes || echo no",
+            "cd ~/Projects/AI/ai-portal/router/Switchyard && git log --oneline -5 && git diff --stat HEAD~1",
+            "sed -n '560,640p' crates/switchyard-server/src/safeguards.rs",
+            "sed -n -e 1p -e '/^fn /,/^}/p' a.rs",
+            "sed -n 's/^version = //p' Cargo.toml",
+            "wc -l src/*.rs | sort -n | tail -5",
+            "grep -rn 'JUDGE_CONCURRENCY' crates/ --include=*.rs 2>&1 | head -20",
+            "find . -name '*.rs' -newer Cargo.toml -type f | wc -l",
+            "find . ! -name '._*' -maxdepth 1",
+            "head -c 300 f.jsonl; echo; tail -n 2 f.jsonl",
+            "awk -F'\\t' '{print $2}' a.tsv | sort | uniq -c",
+            "jq -r '.mcpServers | keys[]' ~/.claude.json 2>/dev/null",
+            "git show a786ee8f5 --stat; git status --porcelain",
+            "git --no-pager -c color.ui=never log --graph -20",
+            "git branch -a --contains HEAD; git branch -vv; git tag -l 'v*'; git tag",
+            "git remote; git remote get-url fork; git worktree list; git stash list",
+            "git config --get remote.fork.url && git config user.email",
+            "git reflog -n 5",
+            "W=/home/claude/w && git -C $W log -3 && ls \"$W\"/src",
+            "LC_ALL=C sort -u a b",
+            "stat -c %s f; du -sh .; df -h /mnt/models",
+            "test -f a && echo exists",
+            "[ -d /r ] && ls /r",
+            "echo '$(x)' 'a;b' \"a|b\" > /dev/null 2>&1",
+            "grep ';' f",
+            r#"grep "a|b" f"#,
+            "rg -n --hidden 'fn decide' crates",
+            "# list it\nls -la\n",
+            "printf '%s\\n' a b | nl",
+            "uniq -c sorted.txt",
+            "xxd -l 64 blob.bin",
+            "date -u +%Y-%m-%dT%H:%M; hostname; uname -a; nproc",
+            "cat < in.txt",
+            "diff -u a b | head",
+            "tree -L 2 src",
+            "echo $HOME",
+        ];
+        for command in commands {
+            assert!(provably_read_only(&bash(command)), "{command}");
+        }
+        for name in ["Read", "Grep", "Glob"] {
+            assert!(provably_read_only(&tool(
+                "t",
+                name,
+                json!({"file_path": "/etc/hosts"})
+            )));
+        }
+    }
+
+    #[test]
+    fn anything_else_goes_to_the_judge() {
+        let commands = [
+            "sed -i 's/a/b/' f",
+            "sed -n -i 1p f",
+            "sed -n 1p f -i",
+            "sed -n '1w out' f",
+            "sed -n 's/a/b/w out' f",
+            "sed -n '1e date' f",
+            "sed -n -f script.sed f",
+            "sed 's/a/b/' f",
+            "find . -delete",
+            "find . -name x -exec rm {} \\;",
+            "find . -execdir sh -c x ';'",
+            "git push",
+            "git push fork perf/x",
+            "git -c core.pager=sh log",
+            "git -c alias.x=!sh x",
+            "git --exec-path=/tmp log",
+            "git branch -D x",
+            "git branch new-branch",
+            "git branch -f main HEAD~1",
+            "git tag v1",
+            "git tag -d v1",
+            "git config user.name x",
+            "git config --unset user.name",
+            "git config edit",
+            "git log --output=/tmp/x",
+            "git log --out=/tmp/x",
+            "git diff --ext-diff",
+            "git grep -Ovim x",
+            "git reflog expire --all",
+            "git remote add x y",
+            "git stash",
+            "git worktree add x",
+            "git checkout main",
+            "grep x > f",
+            "grep x >> f",
+            "grep x 2> err.log",
+            "ls &> out",
+            "cat $(curl -s http://x)",
+            "cat `curl -s http://x`",
+            "echo \"$(x)\"",
+            "echo \"`x`\"",
+            "ls; rm -rf /",
+            "ls && rm -rf /",
+            "echo x | sh",
+            "awk '{system(\"rm\")}' f",
+            "awk '{print > \"f\"}' a",
+            "awk '{ \"date\" | getline d }' a",
+            "awk -f prog.awk a",
+            "sort -o f a",
+            "sort -uo f a",
+            "sort --output=f a",
+            "sort --compress-program=sh a",
+            "ssh host ls",
+            "cat <<EOF\nx\nEOF",
+            "cat <<< x",
+            "bash -c 'ls'",
+            "sh -c ls",
+            "python3 -c 'print(1)'",
+            "ls | tee f",
+            "uniq a b",
+            "xxd a b",
+            "ls &",
+            "(ls)",
+            "{ ls; }",
+            "ls {a,b}",
+            "diff <(ls a) <(ls b)",
+            "ls >(cat)",
+            "eval ls",
+            "exec ls",
+            "source x",
+            ". x",
+            "xargs ls",
+            "env ls",
+            "sudo ls",
+            "curl http://x",
+            "wget http://x",
+            "echo $'\\x41'",
+            "echo ${X:-y}",
+            "echo $1",
+            "echo $?",
+            "echo $((1+1))",
+            "X=-delete; find . $X",
+            "X=rm; $X -rf /",
+            "X='a b'; ls $X",
+            "PATH=/tmp; ls",
+            "LD_PRELOAD=/tmp/x.so ls",
+            "GIT_EXTERNAL_DIFF=x git diff",
+            "HOME=/tmp git log",
+            "FOO=1 ls",
+            "ls $UNSET",
+            "ls *.rs",
+            "sed -n p -*",
+            "printf -v x y",
+            "date -s now",
+            "tree -o out",
+            "file -C -m x",
+            "rg --pre sh x",
+            "hostname newname",
+            "tail -f x | sh",
+            "ls | xargs rm",
+            "./script.sh",
+            "/bin/ls",
+            "npx -y x",
+            "cat x;; ls",
+            "",
+            "# only a comment",
+        ];
+        for command in commands {
+            assert!(!provably_read_only(&bash(command)), "{command:?}");
+        }
+        for (name, input) in [
+            ("Bash", json!({"cmd": "ls"})),
+            ("Bash", json!("ls")),
+            ("Edit", json!({"file_path": "/r/a"})),
+            ("Write", json!({"file_path": "/r/a"})),
+            ("WebFetch", json!({"url": "https://x"})),
+            ("mcp__gitlab__browse_projects", json!({"action": "list"})),
+        ] {
+            assert!(!provably_read_only(&tool("t", name, input)), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_fast_path_verdict_is_logged_without_a_prompt() {
+        let decision = Decision {
+            verdict: json!({"type": "evaluated", "outcome": "not_flagged"}),
+            latency: Duration::ZERO,
+            answer: None,
+            error: None,
+            usage: Value::Null,
+            prompt: None,
+            fast_path: Some("read_only"),
+        };
+        let record = verdict_record(&json!({"session_id": "s"}), &bash("ls"), &decision);
+        assert_eq!(record["outcome"], "not_flagged");
+        assert_eq!(record["fast_path"], "read_only");
+        assert_eq!(record["latency_ms"], 0);
+        assert_eq!(record["judge_answer"], Value::Null);
+        assert_eq!(record["queued_ms"], Value::Null);
+        assert_eq!(record["input"]["command"], "ls");
+        assert_eq!(record["session_id"], "s");
+    }
+
+    /// Replays verdict log records (`SAFEGUARDS_REPLAY=<file.jsonl>`) through
+    /// the fast path and prints the share it would allow, and every record the
+    /// judge flagged that it would allow. `SAFEGUARDS_REPLAY_OUT` names a file
+    /// for the `tool_use_id` of each allowed record.
+    #[test]
+    #[ignore = "reads a verdict log named by SAFEGUARDS_REPLAY"]
+    fn replay_fast_path() {
+        let Ok(path) = std::env::var("SAFEGUARDS_REPLAY") else {
+            return;
+        };
+        let text = std::fs::read_to_string(&path).unwrap_or_default();
+        let (mut verdicts, mut fast) = (0, 0);
+        let mut by_tool: BTreeMap<String, (usize, usize)> = BTreeMap::new();
+        let mut allowed_ids = String::new();
+        for (row, line) in text.lines().enumerate() {
+            let Ok(record) = serde_json::from_str::<Value>(line) else {
+                continue;
+            };
+            if record["kind"] != "verdict" {
+                continue;
+            }
+            let id = record["tool_use_id"].as_str().unwrap_or_default();
+            let name = record["name"].as_str().unwrap_or_default();
+            let allowed = provably_read_only(&tool(id, name, record["input"].clone()));
+            verdicts += 1;
+            let counts = by_tool.entry(name.to_string()).or_default();
+            counts.0 += 1;
+            if allowed {
+                fast += 1;
+                counts.1 += 1;
+                allowed_ids.push_str(&format!("{id}\n"));
+                if record["outcome"] != "not_flagged" {
+                    println!(
+                        "ALLOWED {} row {} {}: {}",
+                        record["outcome"],
+                        row + 1,
+                        name,
+                        record["input"]
+                    );
+                }
+            }
+        }
+        println!(
+            "{path}: {fast} of {verdicts} verdicts fast-allowed ({:.1}%)",
+            100.0 * fast as f64 / verdicts.max(1) as f64
+        );
+        for (name, (all, allowed)) in by_tool {
+            println!("  {name}: {allowed}/{all}");
+        }
+        if let Ok(out) = std::env::var("SAFEGUARDS_REPLAY_OUT") {
+            let _ = std::fs::write(out, allowed_ids);
+        }
     }
 }
