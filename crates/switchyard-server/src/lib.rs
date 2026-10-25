@@ -1696,7 +1696,9 @@ async fn models(
     if query.is_ok_and(|Query(query)| query.available) {
         return Json(available_models(&state).await);
     }
-    if let Some((updated, catalog)) = state.model_catalog.lock().await.as_ref()
+    // Held across the probes, so concurrent requests share one discovery.
+    let mut cache = state.model_catalog.lock().await;
+    if let Some((updated, catalog)) = cache.as_ref()
         && updated.elapsed() < Duration::from_secs(60)
     {
         return Json(catalog.clone());
@@ -1722,7 +1724,7 @@ async fn models(
     if let Some(data) = payload.get_mut("data").and_then(Value::as_array_mut) {
         data.extend(auxiliary::capability_entries(&state));
     }
-    *state.model_catalog.lock().await = Some((Instant::now(), payload.clone()));
+    *cache = Some((Instant::now(), payload.clone()));
     Json(payload)
 }
 
