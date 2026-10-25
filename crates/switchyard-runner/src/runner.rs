@@ -15,8 +15,8 @@ use switchyard_protocol::{ModelId, WireFormat};
 
 use crate::config;
 use crate::{
-    CacheConfig, EmbeddingsConfig, ModelCapabilities, RerankConfig, ResolvedWebSearch, Route,
-    RunnerError, SafeguardsJudge, SearchConfig,
+    CacheConfig, EmbeddingsConfig, ModelCapabilities, ParseConfig, RerankConfig, ResolvedWebSearch,
+    Route, RunnerError, SafeguardsJudge, SearchConfig,
 };
 
 /// Immutable named route table.
@@ -31,6 +31,7 @@ pub struct Runner {
     safeguards: Option<SafeguardsJudge>,
     embeddings: BTreeMap<String, EmbeddingsConfig>,
     rerank: BTreeMap<String, RerankConfig>,
+    parse: BTreeMap<String, ParseConfig>,
     search: BTreeMap<String, SearchConfig>,
     cache: BTreeMap<String, CacheConfig>,
     /// Configured llm client name -> base URL, for liveness probing. Every
@@ -100,6 +101,7 @@ impl Runner {
             safeguards: None,
             embeddings: BTreeMap::new(),
             rerank: BTreeMap::new(),
+            parse: BTreeMap::new(),
             search: BTreeMap::new(),
             cache: BTreeMap::new(),
             upstreams: BTreeMap::new(),
@@ -153,6 +155,11 @@ impl Runner {
         self
     }
 
+    pub(crate) fn with_parse(mut self, parse: BTreeMap<String, ParseConfig>) -> Self {
+        self.parse = parse;
+        self
+    }
+
     pub(crate) fn with_search(mut self, search: BTreeMap<String, SearchConfig>) -> Self {
         self.search = search;
         self
@@ -199,6 +206,11 @@ impl Runner {
     /// Named rerank backends (`[rerank.*]`).
     pub fn rerank(&self) -> &BTreeMap<String, RerankConfig> {
         &self.rerank
+    }
+
+    /// Named document-parse backends (`[parse.*]`).
+    pub fn parse(&self) -> &BTreeMap<String, ParseConfig> {
+        &self.parse
     }
 
     /// Named search endpoints (`[search.*]`).

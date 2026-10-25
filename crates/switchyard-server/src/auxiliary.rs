@@ -1,12 +1,13 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Transparent relay for non-chat backends: `/v1/embeddings` and `/v1/rerank`
-//! proxy to the configured `[embeddings.*]` / `[rerank.*]` backends. An optional
-//! `/{name}` path segment selects a named backend. Without it the request goes
-//! to the only configured backend of that kind; with several configured the
-//! caller must name one. Bodies pass through as-is — these are OpenAI/Cohere-
-//! shaped non-chat calls, not chat translation.
+//! Transparent relay for non-chat backends: `/v1/embeddings`, `/v1/rerank` and
+//! `/v1/parse` proxy to the configured `[embeddings.*]`, `[rerank.*]` and
+//! `[parse.*]` backends. An optional `/{name}` path segment selects a named
+//! backend. Without it the request goes to the only configured backend of that
+//! kind. With several configured, the request's `model` picks the backend whose
+//! `model` (or name) it equals. Bodies pass through as-is — these are
+//! OpenAI/Cohere-shaped non-chat calls, not chat translation.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -17,12 +18,14 @@ use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use opentelemetry::{KeyValue, global};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::ServerState;
 
 const EMBEDDINGS_PATH: &str = "/embeddings";
 const RERANK_PATH: &str = "/rerank";
+const PARSE_PATH: &str = "/parse";
 
 pub(crate) async fn embeddings_default(
     State(state): State<ServerState>,
@@ -66,12 +69,38 @@ pub(crate) async fn rerank_named(
     relay_kind(&state, "rerank", RERANK_PATH, Some(&name), &headers, body).await
 }
 
-/// Picks the named backend, or the only one when no name is given. The error is
-/// the status and message for the caller.
+pub(crate) async fn parse_default(
+    State(state): State<ServerState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    relay_kind(&state, "parse", PARSE_PATH, None, &headers, body).await
+}
+
+pub(crate) async fn parse_named(
+    State(state): State<ServerState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    relay_kind(&state, "parse", PARSE_PATH, Some(&name), &headers, body).await
+}
+
+/// The `model` field of a request body, if it has one.
+#[derive(Deserialize)]
+struct RequestModel {
+    model: Option<String>,
+}
+
+/// Picks the named backend; without a name, the only one, or with several the
+/// one whose `model` (or name) equals the request's `model`. The error is the
+/// status and message for the caller.
 fn pick<'a, T>(
     kind: &str,
     backends: &'a BTreeMap<String, T>,
+    model_of: impl Fn(&T) -> &str,
     name: Option<&str>,
+    body: &[u8],
 ) -> Result<(&'a str, &'a T), (StatusCode, String)> {
     if let Some(name) = name {
         return backends
@@ -92,12 +121,25 @@ fn pick<'a, T>(
         )),
         (Some((name, config)), None) => Ok((name.as_str(), config)),
         (Some(_), Some(_)) => {
-            let names: Vec<&str> = backends.keys().map(String::as_str).collect();
+            let requested = serde_json::from_slice::<RequestModel>(body)
+                .ok()
+                .and_then(|request| request.model);
+            if let Some(model) = requested.as_deref()
+                && let Some((name, config)) = backends
+                    .iter()
+                    .find(|(name, config)| model_of(config) == model || name.as_str() == model)
+            {
+                return Ok((name.as_str(), config));
+            }
+            let choices: Vec<String> = backends
+                .iter()
+                .map(|(name, config)| format!("{name} (model {})", model_of(config)))
+                .collect();
             Err((
                 StatusCode::BAD_REQUEST,
                 format!(
-                    "several {kind} backends are configured; choose one with POST /v1/{kind}/{{name}}: {}",
-                    names.join(", ")
+                    "several {kind} backends are configured; set \"model\" to one of their models or use POST /v1/{kind}/{{name}}: {}",
+                    choices.join(", ")
                 ),
             ))
         }
@@ -113,7 +155,7 @@ async fn relay_kind(
     body: Bytes,
 ) -> Response {
     let (selected_name, base_url, api_key_env, timeout) = match kind {
-        "embeddings" => match pick(kind, state.embeddings(), name) {
+        "embeddings" => match pick(kind, state.embeddings(), |c| c.model.as_str(), name, &body) {
             Ok((name, config)) => (
                 name,
                 config.base_url.as_str(),
@@ -122,7 +164,16 @@ async fn relay_kind(
             ),
             Err((status, message)) => return json_error(status, message),
         },
-        "rerank" => match pick(kind, state.rerank(), name) {
+        "rerank" => match pick(kind, state.rerank(), |c| c.model.as_str(), name, &body) {
+            Ok((name, config)) => (
+                name,
+                config.base_url.as_str(),
+                config.api_key_env.as_deref(),
+                config.timeout(),
+            ),
+            Err((status, message)) => return json_error(status, message),
+        },
+        "parse" => match pick(kind, state.parse(), |c| c.model.as_str(), name, &body) {
             Ok((name, config)) => (
                 name,
                 config.base_url.as_str(),
@@ -225,6 +276,20 @@ pub(crate) fn capability_entries(state: &ServerState) -> Vec<Value> {
             "object": "model",
             "type": "model",
             "kind": "rerank",
+            "served_by": config.base_url,
+            "model": config.model,
+            "created": 0,
+            "owned_by": "switchyard",
+            "display_name": name,
+            "capabilities": { "streaming": false, "tool_calling": false, "context_window": null },
+        }));
+    }
+    for (name, config) in state.parse() {
+        entries.push(json!({
+            "id": name,
+            "object": "model",
+            "type": "model",
+            "kind": "parse",
             "served_by": config.base_url,
             "model": config.model,
             "created": 0,

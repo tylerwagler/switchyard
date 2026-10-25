@@ -49,8 +49,8 @@ use serde_json::{Value, json};
 use switchyard_llm_client::{AuxiliaryOperation, RunObservation, RunObserver};
 use switchyard_protocol::{LlmClientError, Metadata, ModelId, ProviderExtensions, Request, Usage};
 use switchyard_runner::{
-    CallerAuthKind, DecisionTarget, EmbeddingsConfig, ModelInfo, RerankConfig, ResolvedWebSearch,
-    Route, RunOutput, Runner, RunnerError, SearchConfig,
+    CallerAuthKind, DecisionTarget, EmbeddingsConfig, ModelInfo, ParseConfig, RerankConfig,
+    ResolvedWebSearch, Route, RunOutput, Runner, RunnerError, SearchConfig,
 };
 use tokio::net::{TcpListener, TcpSocket};
 use tracing::{Instrument, Level};
@@ -203,6 +203,7 @@ pub struct ServerState {
     web_search: Option<ResolvedWebSearch>,
     embeddings: BTreeMap<String, EmbeddingsConfig>,
     rerank: BTreeMap<String, RerankConfig>,
+    parse: BTreeMap<String, ParseConfig>,
     search: BTreeMap<String, SearchConfig>,
     safeguards_shadow: Option<Arc<safeguards::ShadowLog>>,
     safeguards_verdicts: Option<Arc<safeguards::VerdictLog>>,
@@ -258,6 +259,7 @@ impl ServerState {
         let web_search = runner.web_search().cloned();
         let embeddings = runner.embeddings().clone();
         let rerank = runner.rerank().clone();
+        let parse = runner.parse().clone();
         let search = runner.search().clone();
         let redactor = redaction::Redactor::new(runner.provider_api_keys());
         let safeguards_shadow = match runner
@@ -308,6 +310,7 @@ impl ServerState {
             web_search,
             embeddings,
             rerank,
+            parse,
             search,
             safeguards_shadow,
             safeguards_verdicts,
@@ -360,6 +363,11 @@ impl ServerState {
     /// Named rerank backends (`[rerank.*]`).
     pub(crate) fn rerank(&self) -> &BTreeMap<String, RerankConfig> {
         &self.rerank
+    }
+
+    /// Named document-parse backends (`[parse.*]`).
+    pub(crate) fn parse(&self) -> &BTreeMap<String, ParseConfig> {
+        &self.parse
     }
 
     /// Named search endpoints (`[search.*]`).
@@ -674,6 +682,8 @@ pub fn build_switchyard_router(state: ServerState) -> Router {
         .route("/v1/embeddings/{name}", post(auxiliary::embeddings_named))
         .route("/v1/rerank", post(auxiliary::rerank_default))
         .route("/v1/rerank/{name}", post(auxiliary::rerank_named))
+        .route("/v1/parse", post(auxiliary::parse_default))
+        .route("/v1/parse/{name}", post(auxiliary::parse_named))
         .route("/search", get(websearch::searxng_compat));
     if state.routing_log.is_some() {
         router = router.route("/v1/routing/session-stats", get(get_session_stats));
@@ -1720,7 +1730,7 @@ async fn models(
     let mut payload =
         model_list_payload(models, state.runner.default_route().map(|id| id.as_str()));
     // Advertise non-chat backends too, so /v1/models is a truthful capability
-    // listing (chat + embeddings + rerank + search).
+    // listing (chat + embeddings + rerank + parse + search).
     if let Some(data) = payload.get_mut("data").and_then(Value::as_array_mut) {
         data.extend(auxiliary::capability_entries(&state));
     }
@@ -1816,7 +1826,7 @@ async fn get_session_stats(
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
 
 /// Live TCP reachability for every configured backend: LLM clients plus the
-/// embeddings, rerank, search, and cache backends.
+/// embeddings, rerank, parse, search, and cache backends.
 ///
 /// Deliberately a connect-and-close, not a model call: it answers "is that box
 /// accepting connections right now" without spending tokens, needing
@@ -1834,6 +1844,9 @@ async fn upstreams(State(state): State<ServerState>) -> Json<Value> {
     }
     for (name, config) in runner.rerank() {
         entries.push(("rerank", name, &config.base_url));
+    }
+    for (name, config) in runner.parse() {
+        entries.push(("parse", name, &config.base_url));
     }
     for (name, config) in runner.search() {
         entries.push(("search", name, &config.base_url));

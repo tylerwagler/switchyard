@@ -109,6 +109,8 @@ pub(crate) struct DeploymentConfig {
     #[serde(default)]
     embeddings: BTreeMap<String, EmbeddingsConfig>,
     #[serde(default)]
+    parse: BTreeMap<String, ParseConfig>,
+    #[serde(default)]
     cache: BTreeMap<String, CacheConfig>,
     #[serde(default)]
     safeguards: Option<SafeguardsConfig>,
@@ -260,6 +262,27 @@ pub struct EmbeddingsConfig {
     /// Deadline for one request to this backend.
     #[serde(default = "default_aux_timeout_ms")]
     pub timeout_ms: u64,
+}
+
+/// A named document-parse backend (`POST /v1/parse`: a page image in, its text
+/// out, e.g. pulsar serving Nemotron Parse).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ParseConfig {
+    pub base_url: String,
+    pub model: String,
+    /// Env var holding the API key, when the backend requires one.
+    #[serde(default)]
+    pub api_key_env: Option<String>,
+    /// Deadline for one request to this backend. A page can take minutes.
+    #[serde(default = "default_aux_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+impl ParseConfig {
+    pub const fn timeout(&self) -> std::time::Duration {
+        std::time::Duration::from_millis(self.timeout_ms)
+    }
 }
 
 impl EmbeddingsConfig {
@@ -773,6 +796,16 @@ impl DeploymentConfig {
                 config.api_key_env.as_deref(),
             )?;
         }
+        for (name, config) in &self.parse {
+            validate_aux_backend(
+                "parse",
+                name,
+                &config.base_url,
+                &config.model,
+                config.timeout_ms,
+                config.api_key_env.as_deref(),
+            )?;
+        }
         for (name, config) in &self.search {
             reqwest::Url::parse(&config.base_url).map_err(|error| {
                 RunnerError::configuration(format!(
@@ -823,6 +856,7 @@ impl DeploymentConfig {
             .with_safeguards(safeguards)
             .with_embeddings(self.embeddings)
             .with_rerank(self.rerank)
+            .with_parse(self.parse)
             .with_search(self.search)
             .with_cache(self.cache)
             .with_provider_api_keys(provider_api_keys)

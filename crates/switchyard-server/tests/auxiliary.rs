@@ -163,14 +163,14 @@ async fn started(
 // --- tests -------------------------------------------------------------------
 
 #[tokio::test]
-async fn embeddings_default_is_ambiguous_with_two_backends() -> TestResult {
+async fn embeddings_default_is_ambiguous_for_an_unknown_model() -> TestResult {
     let a = EchoStub::start("a", "/embeddings").await?;
     let b = EchoStub::start("b", "/embeddings").await?;
     let r = EchoStub::start("r", "/rerank").await?;
     let s = EchoStub::start("s", "/search").await?;
     let app = started(&a, &b, &r, &s).await?;
 
-    let body = json!({ "input": ["hello world"], "model": "m-a" });
+    let body = json!({ "input": ["hello world"], "model": "m-x" });
     let response = send(&app, "POST", "/v1/embeddings", Some(body)).await?;
     assert_eq!(response.status, StatusCode::BAD_REQUEST);
     let result: Value = serde_json::from_slice(&response.bytes)?;
@@ -179,6 +179,53 @@ async fn embeddings_default_is_ambiguous_with_two_backends() -> TestResult {
     assert!(message.contains("e_b"), "{message}");
     assert!(a.bodies().await.is_empty());
     assert!(b.bodies().await.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn embeddings_default_picks_the_backend_by_model() -> TestResult {
+    let a = EchoStub::start("a", "/embeddings").await?;
+    let b = EchoStub::start("b", "/embeddings").await?;
+    let r = EchoStub::start("r", "/rerank").await?;
+    let s = EchoStub::start("s", "/search").await?;
+    let app = started(&a, &b, &r, &s).await?;
+
+    let body = json!({ "input": ["x"], "model": "m-b" });
+    let response = send(&app, "POST", "/v1/embeddings", Some(body.clone())).await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let result: Value = serde_json::from_slice(&response.bytes)?;
+    assert_eq!(result["echo_id"], "b");
+    assert_eq!(b.bodies().await, vec![body]);
+    assert!(a.bodies().await.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn parse_relays_to_the_only_backend() -> TestResult {
+    let a = EchoStub::start("a", "/embeddings").await?;
+    let b = EchoStub::start("b", "/embeddings").await?;
+    let r = EchoStub::start("r", "/rerank").await?;
+    let s = EchoStub::start("s", "/search").await?;
+    let p = EchoStub::start("p", "/parse").await?;
+    let toml = format!(
+        "{}\n[parse.p_a]\nbase_url = \"{}\"\nmodel = \"p-a\"\n",
+        deployment(&a.base_url, &b.base_url, &r.base_url, &s.base_url),
+        p.base_url
+    );
+    let app = build_switchyard_router(ServerState::from_runner(Runner::from_toml(&toml)?)?);
+
+    let body = json!({ "image": "data:image/png;base64,AAAA" });
+    let response = send(&app, "POST", "/v1/parse", Some(body.clone())).await?;
+    assert_eq!(response.status, StatusCode::OK);
+    let result: Value = serde_json::from_slice(&response.bytes)?;
+    assert_eq!(result["echo_id"], "p");
+    assert_eq!(p.bodies().await, vec![body]);
+
+    let response = send(&app, "GET", "/v1/models", None).await?;
+    let payload: Value = serde_json::from_slice(&response.bytes)?;
+    assert!(payload["data"].as_array().unwrap().iter().any(|entry| {
+        entry["id"] == "p_a" && entry["kind"] == "parse" && entry["model"] == "p-a"
+    }));
     Ok(())
 }
 
