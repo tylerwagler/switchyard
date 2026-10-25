@@ -1715,10 +1715,8 @@ async fn models(
         futures_util::future::join_all(probes),
     )
     .await;
-    let mut payload = model_list_payload(
-        models,
-        state.runner.default_route().map(|id| id.as_str()),
-    );
+    let mut payload =
+        model_list_payload(models, state.runner.default_route().map(|id| id.as_str()));
     // Advertise non-chat backends too, so /v1/models is a truthful capability
     // listing (chat + embeddings + rerank + search).
     if let Some(data) = payload.get_mut("data").and_then(Value::as_array_mut) {
