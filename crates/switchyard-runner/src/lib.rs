@@ -20,8 +20,8 @@ pub use algorithm::{
 pub use failure::{RouteErrorKind, RouteErrorPhase, RouteErrorSummary, stream_error_summary};
 // Re-exported because `Route::new` takes it, so a host wiring routes does not need a libsy dep.
 pub use config::{
-    CacheConfig, EmbeddingsConfig, RerankConfig, ResolvedCache, ResolvedRerank, ResolvedWebSearch,
-    SafeguardsJudge, SearchConfig, WebSearchConfig,
+    CacheConfig, EmbeddingsConfig, ParseConfig, RerankConfig, ResolvedCache, ResolvedRerank,
+    ResolvedWebSearch, SafeguardsJudge, SearchConfig, WebSearchConfig,
 };
 pub use libsy::RuntimeModels;
 pub use provider_key_redactor::ProviderKeyRedactor;

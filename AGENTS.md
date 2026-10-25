@@ -8,7 +8,7 @@ Core components in `crates/`. These are layered:
 - `switchyard-runner`: Parsing TOML configuration, uses `libsy-llm-client` to run until the algorithm resolves to the selected model. The entry point is `Runner` struct.
 - `switchyard-server`: A thin HTTP demo server wrapped around `switchyard-runner`. Has a TOML config file.
     - Hosted web search (`websearch.rs`): answers Claude Code's `web_search` tool with the search engine, re-ranker and cache named in `[web_search]`.
-    - Embeddings and rerank relays (`auxiliary.rs`): forward `POST /v1/embeddings` and `POST /v1/rerank` unchanged to the backends in `[embeddings.*]` and `[rerank.*]`.
+    - Embeddings, rerank and parse relays (`auxiliary.rs`): forward `POST /v1/embeddings`, `POST /v1/rerank` and `POST /v1/parse` unchanged to the backends in `[embeddings.*]`, `[rerank.*]` and `[parse.*]`.
 - `switchyard-gate`: API-key auth, per-user quotas and usage metering in front of `switchyard-server`. Keys live in Postgres, counters and usage events in Valkey. The entry point is the `layer` function in `lib.rs`.
 - `switchyard-py`: Python bindings for `libsy` and `libsy-llm-client`.
 
