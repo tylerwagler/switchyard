@@ -488,6 +488,13 @@ async fn upstream_chat(
     } else {
         "ok".to_string()
     };
+    let logprobs = (body["logprobs"] == true).then(|| {
+        let yes = if content == "yes" { 0.9_f64 } else { 0.1_f64 };
+        json!({"content": [{"token": content, "logprob": 0.0, "top_logprobs": [
+            {"token": "yes", "logprob": yes.ln()},
+            {"token": "no", "logprob": (1.0 - yes).ln()}
+        ]}]})
+    });
     Json(json!({
         "id": "chatcmpl-test",
         "object": "chat.completion",
@@ -495,6 +502,7 @@ async fn upstream_chat(
         "choices": [{
             "index": 0,
             "message": {"role": "assistant", "content": content},
+            "logprobs": logprobs,
             "finish_reason": "stop"
         }],
         "usage": {
@@ -2315,8 +2323,8 @@ async fn models_probes_routes_concurrently_and_caches_failed_discovery() -> Test
 [routes.vgr{index}]
 id = "switchyard/vgr{index}"
 type = "vgr"
-local_target = "local"
-cloud_target = "cloud"
+efficient_target = "efficient"
+capable_target = "capable"
 "#
                 )
             })
@@ -2324,16 +2332,16 @@ cloud_target = "cloud"
         let app = build_switchyard_router(load_test_config(&format!(
             r#"
 schema_version = 1
-[llm_clients.local]
+[llm_clients.efficient]
 format = "openai_chat"
 base_url = "{}"
 context_discovery = "llama_cpp"
-[targets.local]
-id = "local"
-llm_client = "local"
-[targets.cloud]
-id = "cloud"
-llm_client = "local"
+[targets.efficient]
+id = "efficient"
+llm_client = "efficient"
+[targets.capable]
+id = "capable"
+llm_client = "efficient"
 {routes}
 "#,
             upstream.base_url
@@ -2363,7 +2371,8 @@ llm_client = "local"
 }
 
 #[tokio::test]
-async fn vgr_serves_verified_attempts_locally_and_escalates_rejected_ones() -> TestResult {
+async fn vgr_serves_verified_attempts_on_efficient_tier_and_escalates_rejected_ones() -> TestResult
+{
     let upstream = MockUpstream::start().await?;
     for (discovery, configured, expected_context, probes) in [
         ("", "context_window = 32768", Some(32_768), false),
@@ -2377,8 +2386,8 @@ async fn vgr_serves_verified_attempts_locally_and_escalates_rejected_ones() -> T
         ),
     ] {
         for (judge, served) in [
-            ("model/vgr-judge", "model/vgr-local"),
-            ("model/vgr-reject", "model/vgr-cloud"),
+            ("model/vgr-judge", "model/vgr-efficient"),
+            ("model/vgr-reject", "model/vgr-capable"),
         ] {
             upstream.calls.lock().await.clear();
             let app = build_switchyard_router(load_test_config(&format!(
@@ -2390,12 +2399,12 @@ format = "openai_chat"
 base_url = "{}"
 {discovery}
 
-[targets.local]
-id = "model/vgr-local"
+[targets.efficient]
+id = "model/vgr-efficient"
 llm_client = "primary"
 
-[targets.cloud]
-id = "model/vgr-cloud"
+[targets.capable]
+id = "model/vgr-capable"
 llm_client = "primary"
 
 [targets.judge]
@@ -2406,8 +2415,8 @@ llm_client = "primary"
 id = "switchyard/vgr"
 type = "vgr"
 {configured}
-local_target = "local"
-cloud_target = "cloud"
+efficient_target = "efficient"
+capable_target = "capable"
 judge_target = "judge"
 mode = "active"
 active_approval = "prospective-validation-and-canary-approved"
@@ -2449,7 +2458,7 @@ task_typing = false
 }
 
 #[tokio::test]
-async fn vgr_escalates_while_the_local_endpoint_is_down() -> TestResult {
+async fn vgr_escalates_while_the_efficient_endpoint_is_down() -> TestResult {
     let upstream = MockUpstream::start().await?;
     let closed = std::net::TcpListener::bind("127.0.0.1:0")?.local_addr()?;
     let app = build_switchyard_router(load_test_config(&format!(
@@ -2464,19 +2473,19 @@ base_url = "{}"
 format = "openai_chat"
 base_url = "http://{closed}/v1"
 
-[targets.local]
-id = "model/vgr-local"
+[targets.efficient]
+id = "model/vgr-efficient"
 llm_client = "down"
 
-[targets.cloud]
-id = "model/vgr-cloud"
+[targets.capable]
+id = "model/vgr-capable"
 llm_client = "primary"
 
 [routes.vgr]
 id = "switchyard/vgr"
 type = "vgr"
-local_target = "local"
-cloud_target = "cloud"
+efficient_target = "efficient"
+capable_target = "capable"
 mode = "active"
 active_approval = "prospective-validation-and-canary-approved"
 task_typing = false
@@ -2498,7 +2507,7 @@ task_typing = false
         assert_eq!(response.status, StatusCode::OK, "{}", response.text()?);
         assert_eq!(
             response.headers.get("x-model-router-selected-model"),
-            Some(&HeaderValue::from_static("model/vgr-cloud"))
+            Some(&HeaderValue::from_static("model/vgr-capable"))
         );
     }
     Ok(())
@@ -2515,14 +2524,14 @@ schema_version = 1
 format = "openai_chat"
 base_url = "{}"
 [targets]
-local = {{ id = "model/vgr-local", llm_client = "primary" }}
-cloud = {{ id = "model/vgr-cloud", llm_client = "primary" }}
+efficient = {{ id = "model/vgr-efficient", llm_client = "primary" }}
+capable = {{ id = "model/vgr-capable", llm_client = "primary" }}
 judge = {{ id = "model/vgr-judge", llm_client = "primary" }}
 [routes.vgr]
 id = "switchyard/vgr"
 type = "vgr"
-local_target = "local"
-cloud_target = "cloud"
+efficient_target = "efficient"
+capable_target = "capable"
 judge_target = "judge"
 mode = "evaluate"
 task_typing = false
@@ -2536,13 +2545,13 @@ task_typing = false
             {"role": "user", "content": "Verify the answer before stopping."}
         ]);
         for (session, initiator, messages, served) in [
-            ("a", Some("user"), &initial, "model/vgr-cloud"),
-            ("a", Some("agent"), &nudge, "model/vgr-cloud"),
-            ("b", Some("agent"), &nudge, "model/vgr-local"),
-            ("a", Some("user"), &nudge, "model/vgr-local"),
-            ("a", Some("agent"), &nudge, "model/vgr-local"),
-            ("c", None, &initial, "model/vgr-cloud"),
-            ("c", None, &nudge, "model/vgr-local"),
+            ("a", Some("user"), &initial, "model/vgr-capable"),
+            ("a", Some("agent"), &nudge, "model/vgr-capable"),
+            ("b", Some("agent"), &nudge, "model/vgr-efficient"),
+            ("a", Some("user"), &nudge, "model/vgr-efficient"),
+            ("a", Some("agent"), &nudge, "model/vgr-efficient"),
+            ("c", None, &initial, "model/vgr-capable"),
+            ("c", None, &nudge, "model/vgr-efficient"),
         ] {
             let mut headers = vec![(session_header, session)];
             if let Some(initiator) = initiator {
@@ -5335,8 +5344,11 @@ async fn routing_log_prefers_canonical_and_preserves_legacy_fallback() -> TestRe
     let upstream = MockUpstream::start().await?;
     let temp_dir = tempfile::tempdir()?;
     let log_path = temp_dir.path().join("routing.jsonl");
-    let state = random_state(&upstream.base_url, &[(ROUTE_MODEL, &["model/a"])])?
-        .with_routing_log(&log_path)?;
+    let state = random_state(
+        &upstream.base_url,
+        &[(ROUTE_MODEL, &["anthropic/claude-haiku-4.5"])],
+    )?
+    .with_routing_log(&log_path)?;
     let app = build_switchyard_router(state);
 
     let request = HttpRequest::builder()
@@ -5366,7 +5378,10 @@ async fn routing_log_prefers_canonical_and_preserves_legacy_fallback() -> TestRe
     assert_eq!(stats["total_calls"], 1);
     assert_eq!(stats["total_prompt_tokens"], 10);
     assert_eq!(stats["total_cached_tokens"], 7);
-    assert_eq!(stats["models"]["model/a"]["completion_tokens"], 2);
+    assert_eq!(
+        stats["models"]["anthropic/claude-haiku-4.5"]["completion_tokens"],
+        2
+    );
 
     let legacy = send(
         &app,
@@ -5404,6 +5419,9 @@ async fn routing_log_prefers_canonical_and_preserves_legacy_fallback() -> TestRe
     let first: Value =
         serde_json::from_str(records.lines().next().ok_or("routing log was empty")?)?;
     assert_eq!(first["session_id"], "canonical-session");
+    assert_eq!(first["model"], "anthropic/claude-haiku-4.5");
+    assert_eq!(first["cost"]["source"], "estimated");
+    assert!((first["cost"]["usd"].as_f64().ok_or("missing cost")? - 0.0000137).abs() < 1e-12);
     assert_eq!(first["turn_id"], "canonical-turn");
     assert_eq!(first["origin"], r#"custom-agent/"quoted"\path"#);
     let second: Value = serde_json::from_str(records.lines().nth(1).ok_or("missing record")?)?;
@@ -5498,8 +5516,11 @@ async fn routing_log_keeps_the_canonical_session_id_until_a_stream_drains() -> T
     let upstream = MockUpstream::start().await?;
     let temp_dir = tempfile::tempdir()?;
     let log_path = temp_dir.path().join("routing.jsonl");
-    let state = random_state(&upstream.base_url, &[(ROUTE_MODEL, &["model/a"])])?
-        .with_routing_log(&log_path)?;
+    let state = random_state(
+        &upstream.base_url,
+        &[(ROUTE_MODEL, &["anthropic/claude-haiku-4.5"])],
+    )?
+    .with_routing_log(&log_path)?;
     let app = build_switchyard_router(state);
 
     // `send_with_headers` collects the response body, so the stream wrapper reaches
@@ -5540,6 +5561,9 @@ async fn routing_log_keeps_the_canonical_session_id_until_a_stream_drains() -> T
 
     let record: Value = serde_json::from_str(&std::fs::read_to_string(log_path)?)?;
     assert_eq!(record["route_id"], ROUTE_MODEL);
+    assert_eq!(record["model"], "anthropic/claude-haiku-4.5");
+    assert_eq!(record["cost"]["source"], "estimated");
+    assert!((record["cost"]["usd"].as_f64().ok_or("missing cost")? - 0.0000312).abs() < 1e-12);
     assert_eq!(record["turn_id"], "streaming-turn");
     assert_eq!(record["algorithm"], "random");
     assert_eq!(record["origin"], "codex-cli");
@@ -6667,6 +6691,56 @@ async fn upstream_headers_forward_on_streaming_responses() -> TestResult {
             .and_then(|value| value.to_str().ok()),
         Some("model/a")
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn configured_responses_reasoning_policy_reaches_upstream() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let base_url = upstream.base_url.replace("/v1", "/buffered");
+    for (setting, expected_reasoning) in [("", 2), ("responses_reasoning = \"drop\"", 0)] {
+        let config = format!(
+            r#"
+schema_version = 1
+[llm_clients.upstream]
+format = "openai_responses"
+base_url = "{base_url}"
+{setting}
+[targets]
+answer = {{ id = "model/efficient", llm_client = "upstream" }}
+[routes.route]
+id = "route"
+type = "passthrough"
+target = "answer"
+"#
+        );
+        let app = build_switchyard_router(load_test_config(&config)?);
+        let response = send(&app, "POST", "/v1/responses", Some(json!({
+            "model": "route", "input": [
+                {"type": "message", "role": "user", "content": "continue"},
+                {"type": "reasoning", "encrypted_content": "opaque", "summary": []},
+                {"type": "reasoning", "id": "rs_stored", "summary": []},
+                {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "local"}], "summary": []}
+            ]
+        }))).await?;
+        assert_eq!(response.status, StatusCode::OK, "{}", response.json()?);
+        let calls = upstream.calls.lock().await;
+        let input = calls.last().expect("upstream request")["input"]
+            .as_array()
+            .expect("input array");
+        assert_eq!(
+            input
+                .iter()
+                .filter(|item| item["type"] == "reasoning")
+                .count(),
+            expected_reasoning
+        );
+        assert!(
+            input
+                .iter()
+                .any(|item| item["type"] == "message" && item["role"] == "user")
+        );
+    }
     Ok(())
 }
 

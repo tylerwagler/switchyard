@@ -4,7 +4,7 @@
 //! Verification-gated routing: fail-closed capability derivation.
 //!
 //! Capabilities are never client-declared. They come from the router's own
-//! typing of the request, the attempt it produced locally, and its own reading
+//! typing of the request, the attempt it produced on the efficient tier, and its own reading
 //! of the tool results in the conversation. No client-reachable input selects
 //! a weaker regime than the default one; unsupported content and missing
 //! evidence select [`Branch::Unknown`], which never commits.
@@ -19,6 +19,7 @@ use crate::algorithms::fall_through::FallThrough;
 use crate::algorithms::util::affinity::AffinityRouter;
 use crate::core::algorithm::{Algorithm, Driver, RoutingOutcome};
 
+mod compaction;
 mod config;
 mod decide;
 mod readout;
@@ -34,16 +35,17 @@ pub use safety::{BreakerConfig, KillSwitch};
 #[cfg(test)]
 mod tests;
 
-/// A verification-gated route between a local and a capable tier.
+/// A verification-gated route between an efficient and a capable tier.
 pub struct Vgr {
     route: FallThrough,
+    classifier: Arc<runtime::VgrClassifier>,
 }
 
 impl Vgr {
     /// Validates and constructs a verification-gated route.
     pub fn new(config: VgrConfig) -> Result<Self> {
         config.validate()?;
-        let mut affinity = AffinityRouter::new().with_latch_only([config.targets.cloud.clone()]);
+        let mut affinity = AffinityRouter::new().with_latch_only([config.targets.capable.clone()]);
         let reason = if config.latch_escalation && config.mode != ServingMode::Shadow {
             "session_latched"
         } else {
@@ -51,16 +53,19 @@ impl Vgr {
             "turn_verification_latched"
         };
         let affinity = Arc::new(affinity);
+        let mut route = FallThrough::new_with_state().with_name("vgr");
+        if config.compact_handoff {
+            route = route.with_classifier(Arc::new(compaction::Compactor));
+        }
         let classifier = Arc::new(runtime::VgrClassifier {
             breaker: safety::CircuitBreaker::new(config.breaker),
             config,
         });
-        let route = FallThrough::new_with_state()
-            .with_name("vgr")
+        let route = route
             .with_processor(affinity.clone())
             .with_classifier(Arc::new(runtime::Held(affinity, reason)))
-            .with_classifier(classifier);
-        Ok(Self { route })
+            .with_classifier(classifier.clone());
+        Ok(Self { route, classifier })
     }
 }
 
@@ -71,9 +76,27 @@ impl Algorithm for Vgr {
     }
 
     async fn route(self: Arc<Self>, driver: Driver, request: Request) -> Result<RoutingOutcome> {
+        // The handoff note is written for the capable tier, so an efficient stand-in gets the request
+        // as it arrived.
+        let arrived = self
+            .classifier
+            .efficient_may_stand_in(&request)
+            .then(|| request.clone());
         let mut outcome = self.route.execute(driver, request).await?;
-        // Local answers are already buffered; cloud decisions cannot fall back to local.
+        // Efficient answers are already buffered and have no fallback.
         outcome.selected_model_ids.truncate(1);
+        let config = &self.classifier.config;
+        if let Some(arrived) = arrived
+            && outcome.response.is_none()
+            && outcome.selected_model_ids.first() == Some(&config.targets.capable)
+            // The efficient tier may have failed while this request was routed.
+            && self.classifier.efficient_may_stand_in(&arrived)
+        {
+            outcome
+                .selected_model_ids
+                .push(config.targets.efficient.clone());
+            outcome.fallback_request = Some(arrived);
+        }
         Ok(outcome)
     }
 }
@@ -131,7 +154,9 @@ fn derive_capabilities(
         tools: Some(ToolRecord::from_request(request)),
     };
 
-    if task_type == Some(TaskType::Answer) && !text::has_assistant_turn(&turns) {
+    // Typing abstains on a request that leans on earlier context, so a typed answer stands
+    // on its own; only tool use in the current user turn takes it off this branch.
+    if task_type == Some(TaskType::Answer) && !text::turn_has_tool_trajectory(request) {
         return Capabilities {
             tools: None,
             ..caps(
@@ -150,10 +175,10 @@ fn derive_capabilities(
             Some(render::render_agentic_view(request, &turns, attempt)),
         );
     }
-    if text::observed_hardening(attempt) || task_type == Some(TaskType::Coding) {
-        return caps(Branch::Coding, None);
-    }
     let transcript = Some(render::render_session(&turns, attempt));
+    if text::observed_hardening(attempt) || task_type == Some(TaskType::Coding) {
+        return caps(Branch::Coding, transcript);
+    }
     if text::observed_tool_activity(attempt) {
         caps(Branch::Agentic, transcript)
     } else if matches!(task_type, Some(TaskType::Chat | TaskType::Answer)) {

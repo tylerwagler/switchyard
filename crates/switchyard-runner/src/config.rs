@@ -14,7 +14,7 @@ use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use switchyard_llm_client::{
     AuxiliaryOperation, Backend, ClientRouter, DEFAULT_MAX_RETRIES, HttpBackendConfig, ModelConfig,
-    OpenAiDecisionClient, SystemOneClient, TranslatingLlmClient,
+    OpenAiDecisionClient, ResponsesReasoningPolicy, SystemOneClient, TranslatingLlmClient,
 };
 use switchyard_protocol::{ModelId, RoutedDecisionClient, RoutedLlmClient, WireFormat};
 
@@ -543,6 +543,7 @@ struct RouteConfig {
     description: Option<String>,
     strip_attribution: bool,
     algorithm: AlgorithmSpec,
+    infra: Option<libsy::InfraPolicy>,
 }
 
 struct TargetPromptPolicy {
@@ -564,6 +565,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let display_name = take_optional(&mut table, "display_name")?;
         let description = take_optional(&mut table, "description")?;
         let strip_attribution = take_optional(&mut table, "strip_attribution")?.unwrap_or(false);
+        let infra = take_optional(&mut table, "infra")?;
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
             .map_err(serde::de::Error::custom)?;
         Ok(Self {
@@ -576,6 +578,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             description,
             strip_attribution,
             algorithm,
+            infra,
         })
     }
 }
@@ -744,8 +747,22 @@ impl DeploymentConfig {
                 .algorithm
                 .build_with_runtime_models(route_name, &targets)
                 .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
+            if let Some(infra) = &config.infra {
+                if !matches!(&config.algorithm, AlgorithmSpec::LlmClassifier { config }
+                    if matches!(config.mode, None | Some(crate::ClassifierMode::Capability))
+                        && config.escalation.is_none())
+                {
+                    return Err(RunnerError::configuration(format!(
+                        "route {route_name}: infra requires capability llm_classifier without escalation"
+                    )));
+                }
+                infra.validate().map_err(|error| {
+                    RunnerError::configuration_source(format!("route {route_name}: {error}"), error)
+                })?;
+            }
             if let AlgorithmSpec::Vgr { config: vgr } = &config.algorithm
-                && let Some(probe) = self.build_model_properties_probe(&vgr.local_target, &clients)
+                && let Some(probe) =
+                    self.build_model_properties_probe(&vgr.efficient_target, &clients)
             {
                 model_properties_probes.insert(config.id.clone(), probe);
             }
@@ -771,7 +788,8 @@ impl DeploymentConfig {
                 models,
             )
             .with_listing(config.display_name.clone(), config.description.clone())
-            .with_attribution_strip(config.strip_attribution);
+            .with_attribution_strip(config.strip_attribution)
+            .with_infra(config.infra.clone());
             routes.push((config.id.clone(), route));
         }
         let web_search =
@@ -876,6 +894,13 @@ impl DeploymentConfig {
 
         for (name, client_config) in &self.llm_clients {
             validate_value("llm client name", name)?;
+            if client_config.responses_reasoning.is_some()
+                && !matches!(client_config.format, ClientFormat::OpenAiResponses)
+            {
+                return Err(RunnerError::configuration(format!(
+                    "llm client {name} responses_reasoning is only valid for openai_responses"
+                )));
+            }
             let backend = build_backend(
                 name,
                 client_config,
@@ -914,17 +939,20 @@ impl DeploymentConfig {
                     )));
                 }
             }
-            model_configs.push(ModelConfig::new(
-                target.id.clone(),
-                build_backend(
-                    &target.llm_client,
-                    client_config,
-                    &target.extra_body,
-                    &target.omit_body_fields,
-                    target.reasoning_effort.clone(),
-                )?,
-                None,
-            ));
+            model_configs.push(
+                ModelConfig::new(
+                    target.id.clone(),
+                    build_backend(
+                        &target.llm_client,
+                        client_config,
+                        &target.extra_body,
+                        &target.omit_body_fields,
+                        target.reasoning_effort.clone(),
+                    )?,
+                    None,
+                )
+                .with_responses_reasoning(client_config.responses_reasoning.unwrap_or_default()),
+            );
         }
 
         let mut clients = BTreeMap::new();
@@ -1160,20 +1188,20 @@ impl DeploymentConfig {
 
     fn build_model_properties_probe(
         &self,
-        local_target_name: &str,
+        efficient_target_name: &str,
         clients: &BTreeMap<String, Arc<TranslatingLlmClient>>,
     ) -> Option<ModelPropertiesProbe> {
-        let local_target = self.targets.get(local_target_name)?;
-        let client_config = self.llm_clients.get(&local_target.llm_client)?;
+        let efficient_target = self.targets.get(efficient_target_name)?;
+        let client_config = self.llm_clients.get(&efficient_target.llm_client)?;
         if !matches!(
             client_config.context_discovery,
             Some(ContextDiscovery::LlamaCpp)
         ) {
             return None;
         }
-        let client = clients.get(&local_target.llm_client)?;
+        let client = clients.get(&efficient_target.llm_client)?;
         Some(ModelPropertiesProbe {
-            model: local_target.id.clone(),
+            model: efficient_target.id.clone(),
             format: client_config.format.wire_format(),
             client: Arc::clone(client),
         })
@@ -1272,7 +1300,7 @@ impl<'de> Deserialize<'de> for HttpBaseUrl {
 struct LlmClientConfig {
     format: ClientFormat,
     base_url: HttpBaseUrl,
-    /// Opt-in context discovery for VGR's local target. Unset disables discovery.
+    /// Opt-in context discovery for VGR's efficient target. Unset disables discovery.
     context_discovery: Option<ContextDiscovery>,
     api_key_env: Option<String>,
     #[serde(default)]
@@ -1288,6 +1316,7 @@ struct LlmClientConfig {
     failure_cooldown_ms: u64,
     /// Deadline in milliseconds for all attempts and the complete response. Unset is unbounded.
     timeout_ms: Option<u64>,
+    responses_reasoning: Option<ResponsesReasoningPolicy>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1581,7 +1610,17 @@ efficient_target = "weak"
 
     #[test]
     fn public_runner_from_toml_builds_a_deployment() -> RunnerResult<()> {
-        let runner = Runner::from_toml(VALID_CONFIG)?;
+        let config = format!(
+            "{VALID_CONFIG}\n[routes.classifier.infra]\n\
+             max_signal_age_ms = 1000\nmin_waiting_requests = 4\nmax_capable_inflight = 2"
+        );
+        let runner = Runner::from_toml(&config)?;
+        assert!(
+            Runner::from_toml(
+                &config.replace("min_waiting_requests = 4", "min_waiting_requests = 0")
+            )
+            .is_err()
+        );
 
         let classifier = runner
             .route("switchyard/classifier")
@@ -1683,8 +1722,8 @@ target = "strong"
 [routes.vgr]
 id = "switchyard/vgr"
 type = "vgr"
-local_target = "weak"
-cloud_target = "strong"
+efficient_target = "weak"
+capable_target = "strong"
 judge_target = "classifier"
 mode = "active"
 active_approval = "prospective-validation-and-canary-approved"
@@ -1694,23 +1733,47 @@ task_typing = false
     }
 
     #[test]
+    fn vgr_compaction_is_opt_in_from_toml() -> RunnerResult<()> {
+        for setting in ["", "compact_handoff = false", "compact_handoff = true"] {
+            let source = format!("{}\nagentic_handoff = true\n{setting}\n", vgr_config());
+            let parsed: DeploymentConfig = toml::from_str(&source).expect("valid VGR config");
+            let AlgorithmSpec::Vgr { config } = &parsed.routes["vgr"].algorithm else {
+                panic!("expected VGR route");
+            };
+            assert_eq!(config.compact_handoff, setting.ends_with("= true"));
+            assert!(runner_from_toml(&source)?.route("switchyard/vgr").is_some());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn vgr_route_builds_and_rejects_unsafe_configuration() -> RunnerResult<()> {
         let runner = runner_from_toml(&vgr_config())?;
         assert!(runner.route("switchyard/vgr").is_some());
 
         let compact = format!("{}\ncompact_handoff = true\n", vgr_config());
-        assert!(error_message(&compact).contains("unknown field `compact_handoff`"));
+        assert!(error_message(&compact).contains("compact_handoff requires agentic_handoff"));
+        let compact = format!("{compact}\nagentic_handoff = true\n");
+        assert!(
+            runner_from_toml(&compact)?
+                .route("switchyard/vgr")
+                .is_some()
+        );
 
-        let identical_ids =
-            vgr_config().replace("local_target = \"weak\"", "local_target = \"strong\"");
-        assert!(error_message(&identical_ids).contains("distinct local and cloud model IDs"));
+        let identical_ids = vgr_config().replace(
+            "efficient_target = \"weak\"",
+            "efficient_target = \"strong\"",
+        );
+        assert!(error_message(&identical_ids).contains("distinct efficient and capable model IDs"));
 
         let bad_approval =
             vgr_config().replace("prospective-validation-and-canary-approved", "approved");
         assert!(error_message(&bad_approval).contains("approval attestation"));
 
-        let missing_target =
-            vgr_config().replace("local_target = \"weak\"", "local_target = \"missing\"");
+        let missing_target = vgr_config().replace(
+            "efficient_target = \"weak\"",
+            "efficient_target = \"missing\"",
+        );
         assert!(error_message(&missing_target).contains("unknown target missing"));
 
         let zero_cooldown = format!("{}breaker_cooldown_seconds = 0\n", vgr_config());
@@ -1831,6 +1894,34 @@ capable_hold_turns = 2
 new = ["send_message"]
 "#
         )
+    }
+
+    #[test]
+    fn stage_and_composite_validate_hold_turns() {
+        for source in [
+            stage_config(),
+            stage_config().replace("efficient_first", "capable_first"),
+            composite_config(),
+        ] {
+            for field in ["capable_hold_turns", "efficient_hold_turns"] {
+                for (turns, valid) in [
+                    (-2_i64, false),
+                    (-1, true),
+                    (0, true),
+                    (3, true),
+                    (i64::from(u32::MAX), true),
+                    (i64::from(u32::MAX) + 1, false),
+                ] {
+                    let configured =
+                        source.replace("capable_hold_turns = 2", &format!("{field} = {turns}"));
+                    let result = runner_from_toml(&configured);
+                    assert_eq!(result.is_ok(), valid, "{field} = {turns}");
+                    if let Err(error) = result {
+                        assert!(error.to_string().contains(field), "{error}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -2648,6 +2739,61 @@ confidence_threshold = 0.5
         };
         assert_eq!(primary.max_retries, MAX_CONFIGURED_RETRIES);
         Ok(())
+    }
+
+    #[test]
+    fn responses_reasoning_defaults_and_accepts_drop() -> RunnerResult<()> {
+        let default: DeploymentConfig = toml::from_str(VALID_CONFIG).map_err(|error| {
+            RunnerError::configuration(format!("failed to parse config: {error}"))
+        })?;
+        let responses = default
+            .llm_clients
+            .get("responses")
+            .ok_or_else(|| RunnerError::configuration("responses llm client is missing"))?;
+        assert_eq!(responses.responses_reasoning, None);
+
+        let configured = VALID_CONFIG.replacen(
+            "[llm_clients.responses]\nformat = \"openai_responses\"\nbase_url = \"https://example.test/v1\"",
+            "[llm_clients.responses]\nformat = \"openai_responses\"\nbase_url = \"https://example.test/v1\"\nresponses_reasoning = \"drop\"",
+            1,
+        );
+        let config: DeploymentConfig = toml::from_str(&configured).map_err(|error| {
+            RunnerError::configuration(format!("failed to parse config: {error}"))
+        })?;
+        let responses = config
+            .llm_clients
+            .get("responses")
+            .ok_or_else(|| RunnerError::configuration("responses llm client is missing"))?;
+        assert_eq!(
+            responses.responses_reasoning,
+            Some(ResponsesReasoningPolicy::Drop)
+        );
+        runner_from_toml(&configured)?;
+        Ok(())
+    }
+
+    #[test]
+    fn responses_reasoning_rejects_other_formats() {
+        let invalid = VALID_CONFIG.replacen(
+            "format = \"openai_chat\"",
+            "format = \"openai_chat\"\nresponses_reasoning = \"drop\"",
+            1,
+        );
+        assert!(
+            error_message(&invalid)
+                .contains("responses_reasoning is only valid for openai_responses")
+        );
+    }
+
+    #[test]
+    fn responses_reasoning_rejects_unreferenced_other_format() {
+        let invalid = format!(
+            "{VALID_CONFIG}\n[llm_clients.unused]\nformat = \"openai_chat\"\nbase_url = \"https://example.test/v1\"\nresponses_reasoning = \"drop\"\n"
+        );
+        assert!(
+            error_message(&invalid)
+                .contains("responses_reasoning is only valid for openai_responses")
+        );
     }
 
     #[test]

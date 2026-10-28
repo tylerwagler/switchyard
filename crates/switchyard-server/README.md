@@ -126,12 +126,16 @@ routing logging is disabled.
 
 The routing log saves each call's reported charge in USD. When the upstream reports no
 charge, the server estimates it using [bundled rates](../switchyard-costs/prices.toml).
+A reported charge, including zero, takes precedence over the bundled rates.
 Bundled rates stay fixed until you install a version with updated rates.
-The table includes OpenAI and Claude text-token rates. Model IDs match exactly,
-including provider prefixes; an unlisted ID has no estimated cost.
-These are standard-rate estimates. They exclude long-context and service-tier
-adjustments, OpenAI's 12-hour cache-write pricing, tool fees, and time-based cache
-storage. Entries with provider prefixes use list-rate estimates; billed charges may differ.
+The table includes text-token rates for OpenAI, Claude, Gemini, and DeepSeek models, plus
+OpenRouter rates for other popular models. Model IDs match exactly, including provider
+prefixes; an unlisted ID has no estimated cost. Direct-provider and OpenRouter rates use
+separate IDs, such as `gemini-3.8-flash` and `google/gemini-3.8-flash`.
+Estimates exclude long-context and service-tier adjustments, OpenAI's 12-hour cache-write
+pricing, tool fees, and time-based cache storage. Each model has one rate at all times of
+day. Billed charges can differ when a gateway selects another provider or a promotion
+ends. The table lists the Gemini promotion end dates.
 Use `--pricing-file prices.toml` to replace the entire bundled table with your own rates.
 Use a `.toml` file with quoted served model IDs and rates in USD per million tokens:
 
@@ -144,7 +148,9 @@ cache_write = 2
 ```
 
 The `.toml` extension check ignores case. Other filenames are read as JSON, so existing
-JSON overrides still work.
+JSON overrides still work. TOML and JSON also accept groups of exact IDs that share
+one set of rates, as shown in the [pi guide](../../docs/integrations/pi.md#estimate-the-cost).
+The bundled table uses this grouped format and can be supplied to `--pricing-file`.
 
 Session stats include cost totals. Missing usage or rates leave cost unknown; `known_usd`
 keeps the priced subtotal and `total_usd` is null when any cost is unknown. Rates load once
@@ -152,8 +158,7 @@ at startup, and saved costs do not change when prices change. An unreadable or i
 `--pricing-file` stops startup; the server does not use bundled rates instead.
 
 The [pi guide](../../docs/integrations/pi.md#estimate-the-cost) explains how to supply
-rates for your own models. The menubar reads the same file through its `pricing_file`
-setting when you override the bundled rates; its actual spending comes from recorded costs.
+rates for your own models.
 
 Clients can send `x-switchyard-origin: codex-cli` (or another client label) to include an
 `origin` field in each routing record. Missing, empty, or non-text header values produce
