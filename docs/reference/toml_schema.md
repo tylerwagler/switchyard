@@ -62,14 +62,25 @@ route reaches no upstream. A file without a `[targets]` table is rejected with
 |---|:---:|---|---|
 | `format` | Yes | — | `openai_chat`, `openai_responses`, or `anthropic_messages`. |
 | `base_url` | Yes | — | Upstream base URL. |
-| `context_discovery` | No | unset | Set to `"llama_cpp"` to enable `/props` context discovery for VGR local targets. Disabled when unset. An explicit route `context_window` takes precedence. |
+| `context_discovery` | No | unset | Set to `"llama_cpp"` to enable `/props` context discovery for VGR efficient targets. Disabled when unset. An explicit route `context_window` takes precedence. |
 | `api_key_env` | No | unset | Name of the environment variable holding the key. Omit to send no authentication. |
 | `forward_auth` | No | `false` | Forward the caller's provider credential and application headers. A route's forwarding clients must use one credential family unless they all use the same scheme, host, and port, such as one LLM gateway. |
 | `extra_headers` | No | `{}` | Custom HTTP headers sent to the model server. Set credentials with `api_key_env` or `forward_auth`; the server rejects headers owned by the selected auth mode. Header names are case-insensitive. |
+| `responses_reasoning` | No | `"preserve_encrypted"` | Responses reasoning replay: `"preserve_encrypted"` or `"drop"`. Only valid for `openai_responses`. |
 | `fallback_on_rate_limit` | No | `true` | Try another completion candidate after an upstream HTTP 429 exhausts retries. Set to `false` to return the 429 instead. |
 | `max_retries` | No | `2` | Retry budget, `0`–`10`. |
 | `failure_cooldown_ms` | No | `5000` (5 seconds) | Skip a backend for this many milliseconds after an exhausted transient completion failure. Zero disables it. |
 | `timeout_ms` | No | unset | Deadline in milliseconds for all attempts, retry delays, and the complete response, including stream reads. Must be at least `1`. Unset leaves the wait unbounded. |
+
+For `openai_responses`, `responses_reasoning` controls replay of reasoning
+history. Every client defaults to `"preserve_encrypted"`: reasoning items with
+non-empty `encrypted_content` or a stored reasoning `id` are retained with empty
+`content`. ID-only reasoning is removed when the request sets `store: false`.
+Switchyard's translated Anthropic reasoning is always removed.
+Reasoning without either is removed. Set `responses_reasoning = "drop"` explicitly for a backend
+that cannot consume provider reasoning. Both modes keep messages, tool
+calls and tool results. The setting is rejected on other client formats, even
+when no target uses the client. It is not inferred from the model name or URL.
 
 The TOML never contains the secret itself. `api_key_env` names a variable that
 must exist and be non-empty when the server loads.
@@ -257,6 +268,25 @@ Every route takes the common keys below, plus the keys for its type.
 | `description` | No | unset | One-line description `GET /v1/models` shows as `data[].description`. Claude Code's `/model` picker shows it under the name. Unset values leave the key out. |
 | `strip_attribution` | No | `false` | Remove Claude Code's attribution block (`x-anthropic-billing-header: …`, the first `system` block of an Anthropic request) before forwarding. Set it on routes whose targets are not Anthropic's API: those see the block as prompt text, and its per-conversation fingerprint stops prompts from sharing a prefix. The server reads the block's `cc_version`, `cc_entrypoint` and `cc_workload` for usage reporting either way. |
 
+### Optional infrastructure check
+
+A capability `llm_classifier` route without escalation may include `[routes.<name>.infra]`. Both tiers must have one model; each model may have
+multiple workers. A host applies the policy explicitly with `Route::apply_infra`
+after `Route::decide`, using periodically collected model-pool metrics and local in-flight
+counts. Plain `decide` and `execute` retain task routing. Sub-agent routing is unchanged.
+
+```toml
+[routes.example.infra]
+max_signal_age_ms = 3000
+min_waiting_requests = 4
+max_capable_inflight = 2
+```
+
+All keys are required. Limits must be positive. Missing or stale observations retain
+the task decision. See the
+[Dynamo PreProc example](../../examples/dynamo-preproc/README.md#task-classification-and-queue-based-routing)
+for collection and capacity safeguards.
+
 ### `noop`
 
 Returns a buffered assistant response containing `OK` without calling an
@@ -437,7 +467,8 @@ the signals work and for tuning.
 | `confidence_threshold` | Yes | — | Corroboration a decisive pick needs. In `[0, 1]`. `efficient_first_threshold` is accepted as an alias. |
 | `capable_first_threshold` | No | `0.0` | Threshold used after an outer classifier selects the capable tier. Only a [composite](#composite) route sets that tier, so this key has no effect on a standalone `stage_router` route. |
 | `recent_turn_window` | No | `3` | Trailing tool results the signals are computed over. |
-| `capable_hold_turns` | No | `2` | Requests kept on the capable tier after an escalation the signals or a hard override picked. A clean test pass clears the hold early; `0` disables it. |
+| `capable_hold_turns` | No | `2` | Requests kept on capable after a switch. Signal-driven capable decisions also start finite holds. Active holds skip signal processing and classification; `0` disables; `-1` pins after a switch. |
+| `efficient_hold_turns` | No | `0` | Requests kept on efficient after a switch, even when errors appear. `0` disables; `-1` pins after a switch. |
 | `tool_semantics.observe` | No | `[]` | Exact ASCII case-insensitive domain tool names that count as read-only investigation. |
 | `tool_semantics.mutate` | No | `[]` | Exact ASCII case-insensitive domain tool names that count as state-changing production. |
 | `tool_semantics.plan` | No | `[]` | Exact ASCII case-insensitive domain tool names that count as planning or task decomposition. |
@@ -452,7 +483,7 @@ the signals work and for tuning.
 |---|:---:|---|---|
 | `handoff_notes.escalation_note` | Yes, when the table is present | — | Note appended to the request when the signals or a hard override escalate to the capable tier. |
 | `handoff_notes.deescalation_note` | No | unset | Note appended to the request whenever the signals select the efficient tier, whether or not a capable turn came before. |
-| `handoff_notes.only_on_wrong_signal_escalation` | No | `true` | When `true`, only the escalating turn itself carries the escalation note. `false` also adds it to the capable-hold turns that follow. |
+| `handoff_notes.only_on_wrong_signal_escalation` | No | `true` | When `true`, restricts escalation notes to signal-driven capable decisions. Held turns receive no notes with either setting. |
 
 #### `classifier` keys
 
@@ -545,7 +576,8 @@ confidence threshold. Tool signals still drive escalation and recovery. See
 | `stage.efficient_first_threshold` | No | `0.5` | Signal confidence required after an Efficient classification. In `[0, 1]`. Also accepts `confidence_threshold`. |
 | `stage.capable_first_threshold` | No | `0.0` | Signal confidence required after a Capable classification. In `[0, 1]`. |
 | `stage.recent_turn_window` | No | `3` | Trailing tool results the signals are computed over. |
-| `stage.capable_hold_turns` | No | `2` | Requests kept on the capable tier after escalation. A clean test pass clears the hold early; `0` disables it. |
+| `stage.capable_hold_turns` | No | `2` | Same capable hold as `stage_router`: `0` disables; `-1` pins after a switch. |
+| `stage.efficient_hold_turns` | No | CF: `-1`; EF: `0` | Defaults to pinning efficient after a switch when the classifier selected capable-first. Explicit `0` disables; positive values hold that many requests. |
 | `stage.tool_semantics.observe` | No | `[]` | Additional exact ASCII case-insensitive tool names that count as observation. |
 | `stage.tool_semantics.mutate` | No | `[]` | Additional exact ASCII case-insensitive tool names that count as mutation. |
 | `stage.tool_semantics.plan` | No | `[]` | Additional exact ASCII case-insensitive tool names that count as planning. |

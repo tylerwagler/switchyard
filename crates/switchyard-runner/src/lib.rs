@@ -23,7 +23,7 @@ pub use config::{
     CacheConfig, EmbeddingsConfig, ParseConfig, RerankConfig, ResolvedCache, ResolvedRerank,
     ResolvedWebSearch, SafeguardsJudge, SearchConfig, WebSearchConfig,
 };
-pub use libsy::RuntimeModels;
+pub use libsy::{RoutingOutcome, RuntimeModels};
 pub use provider_key_redactor::ProviderKeyRedactor;
 pub use route::{
     AuxiliaryTarget, CallerAuthKind, ModelCapabilities, Route, RunOutput, RunnerError,

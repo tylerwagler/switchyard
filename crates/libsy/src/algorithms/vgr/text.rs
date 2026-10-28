@@ -11,7 +11,7 @@ use regex::Regex;
 use serde_json::Value;
 use switchyard_protocol::{ContentBlock, InstructionBlock, Message, Request, Role, ToolResult};
 
-use crate::algorithms::util::affinity::is_user_turn;
+use crate::algorithms::util::affinity::{initiated_by_user, is_user_turn};
 use crate::algorithms::util::tool_signals::classify_text;
 
 /// One flattened turn: instructions first, then messages.
@@ -115,10 +115,6 @@ pub(super) fn newest_prompt_is_blank(request: &Request) -> bool {
         })
 }
 
-pub(super) fn has_assistant_turn(turns: &[Turn]) -> bool {
-    turns.iter().any(|turn| turn.role == Role::Assistant)
-}
-
 /// Whether the conversation contains an executed or proposed tool step.
 pub(super) fn has_tool_trajectory(request: &Request) -> bool {
     request.llm_request.messages.iter().any(is_tool_step)
@@ -144,14 +140,25 @@ pub(super) fn starts_user_turn(messages: &[Message], index: usize) -> bool {
             .any(|block| matches!(block, ContentBlock::ToolCall(_)))
 }
 
-/// Whether the current user turn contains an executed or proposed tool step.
-pub(super) fn turn_has_tool_trajectory(request: &Request) -> bool {
+/// The current turn's start, using the initiator header for the newest message.
+pub(super) fn turn_start(request: &Request) -> usize {
     let messages = &request.llm_request.messages;
-    let start = (0..messages.len())
+    let end = match initiated_by_user(request) {
+        Some(true) => return messages.len().saturating_sub(1),
+        Some(false) => messages.len().saturating_sub(1),
+        None => messages.len(),
+    };
+    (0..end)
         .rev()
         .find(|&index| starts_user_turn(messages, index))
-        .unwrap_or(0);
-    messages[start..].iter().any(is_tool_step)
+        .unwrap_or(0)
+}
+
+/// Whether the current user turn contains an executed or proposed tool step.
+pub(super) fn turn_has_tool_trajectory(request: &Request) -> bool {
+    request.llm_request.messages[turn_start(request)..]
+        .iter()
+        .any(is_tool_step)
 }
 
 fn is_tool_step(message: &Message) -> bool {
@@ -205,14 +212,14 @@ pub(super) fn clip_mid(text: &str, budget: usize, head_frac: f64) -> String {
     format!("{head_text}\n...[{omitted} chars omitted]...\n{tail_text}")
 }
 
-/// Detects heuristic code/test markers in the local attempt.
+/// Detects heuristic code/test markers in the efficient attempt.
 pub(super) fn observed_hardening(attempt: &str) -> bool {
     CODE_ACTIVITY
         .as_ref()
         .is_some_and(|pattern| pattern.is_match(attempt))
 }
 
-/// Detects tool transcript labels and JSON tool-call fields in the local attempt.
+/// Detects tool transcript labels and JSON tool-call fields in the efficient attempt.
 pub(super) fn observed_tool_activity(attempt: &str) -> bool {
     TOOL_ACTIVITY
         .as_ref()

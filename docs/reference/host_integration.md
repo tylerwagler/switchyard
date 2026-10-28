@@ -1,77 +1,63 @@
 # Host Integration
 
-Use this guide when embedding libsy algorithms that ask the host to serve model or decision calls. For a first routing result and model-client handoff, start with the [libsy quickstart](../getting_started.md).
+Add libsy where your gateway or agent harness chooses and calls a model. Your
+application keeps its transport, credentials, and lifecycle.
 
-## Development API
+Start with the **[Rust quickstart](../getting_started.md)** for a working example.
+Use **[Mechanics of Libsy](../mechanics_of_libsy.md)** for execution and
+**[Switchyard Protocols](../protocols/index.md)** for data conversion. This page
+covers the responsibilities specific to your host.
 
-This page uses the development API, including its asynchronous `respond` method. The Rust examples pin the same revision as the [quickstart](../getting_started.md). The released `v0.3.0` callback API is synchronous. Use matching source-built [Python bindings](../../INSTALLATION.md#development) for this page's Python callback example.
+## Choose the integration boundary
 
-## Route in Rust
+| Host | Insert routing here | Preserve from the existing application |
+|---|---|---|
+| Gateway | After request admission and input decoding, before model dispatch. | Authentication, tenant isolation, budgets, model inventory, provider credentials, and response delivery. |
+| Agent harness | Before each model turn, after assembling conversation and tool history. | Tool execution, task state, model clients, conversation storage, and the agent loop. |
 
-With Rust 1.96.1+ and a native build toolchain, create a project:
+## Host responsibilities
 
-```bash
-cargo new switchyard-rust-demo
-cd switchyard-rust-demo
-```
+**Dispatch every requested call.** Apply your credentials, budgets, and access
+policy to routing-time judge calls as well as answer calls. Send internal calls
+through model dispatch without entering the same router again. Supply only
+models your host can reach. See [call handling](../mechanics_of_libsy.md#read-the-next-step)
+and [final-outcome handling](../mechanics_of_libsy.md#stepdone).
 
-Add these dependencies to `Cargo.toml`. Both Switchyard crates use the same pinned revision:
+**Keep history and state.** Supply the tool history required by the algorithm;
+provider continuation IDs alone can hide that evidence. Scope session IDs to
+the tenant and conversation. Reuse algorithm instances when they retain session
+decisions, and decide how your host handles concurrent turns and multiple
+processes. State behavior is algorithm-specific; see [Composite sessions](../routing_algorithms/composite_routing.md#sessions)
+and the [Plan/Execute history requirement](../routing_algorithms/plan_execute_routing.md#responses-api-history-requirement).
 
-```toml
-[dependencies]
-async-trait = "0.1"
-futures = "0.3"
-switchyard-libsy = { git = "https://github.com/NVIDIA-NeMo/Switchyard.git", rev = "5415db205c1f4db7e079731e7bf33a6609c67c8e" }
-switchyard-protocol = { git = "https://github.com/NVIDIA-NeMo/Switchyard.git", rev = "5415db205c1f4db7e079731e7bf33a6609c67c8e" }
-tokio = { version = "1", features = ["macros", "rt"] }
-```
+**Observe the complete run.** Include judge calls and final model work in your
+host's observations. Configure telemetry collection in your application and
+instrument model I/O performed by your own clients. See the
+[OpenTelemetry reference](opentelemetry.md#host-setup).
 
-Replace `src/main.rs` with this complete routing-only example:
-
-```rust
-use std::{collections::HashMap, sync::Arc};
-
-use futures::StreamExt;
-use switchyard_libsy::{
-    Algorithm, PickerMode, RuntimeModels, StageRouter, StageRouterConfig, State, Step,
-};
-use switchyard_protocol::{Category, LlmRequest, Message, Request, Role};
-
-#[tokio::main(flavor = "current_thread")]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let router = Arc::new(StageRouter::new(StageRouterConfig::new(
-        PickerMode::EfficientFirst, 0.5,
-    ))?);
-    let models = Arc::new(RuntimeModels::new(HashMap::from([
-        (Category::Efficient, vec!["Efficient".into()]),
-        (Category::Capable, vec!["Capable".into()]),
-        (Category::Any, vec!["Efficient".into(), "Capable".into()]),
-    ])));
-    let request = Request {
-        llm_request: LlmRequest {
-            messages: vec![Message::text(Role::User, "Hello")],
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    let mut steps = router.run_stream(request, models, State::default());
-    while let Some(step) = steps.next().await {
-        match step? {
-            Step::Done(outcome) => println!("Selected: {}", outcome.selected_model_ids[0]),
-            _ => unreachable!("This Stage configuration makes no routing-time calls"),
-        }
-    }
-    Ok(())
-}
-```
-
-Run `cargo run`. It prints `Selected: Efficient` without making a network call. This example uses the pinned development API, including its `State` argument. For a complete routing and client example, follow the [Rust quickstart](../getting_started.md#use-libsy-with-your-client). Use [switchyard-translation](../../crates/switchyard-translation/README.md) to convert provider requests and libsy's protocol types, or [switchyard-llm-client](../../crates/libsy-llm-client/README.md) to drive an algorithm over HTTP.
+For existing integrations, check [NeMo Relay](../integrations/nemo_relay.md)
+or the [LiteLLM compatibility notes](../../examples/litellm/README.md#supported-algorithm-semantics).
+The experimental LiteLLM plugin supports decision-only routing and cannot serve
+intermediate model calls.
 
 ## Serve routing-time calls
 
-An algorithm yields a stream of steps. Each `Step::CallModel` is a routing-time classifier or judge call your host performs over its own transport. The run ends with `Step::Done` carrying a `RoutingOutcome`: the selected model, ordered fallbacks, rewritten request, and an optional response when routing already produced the answer. Otherwise the host makes the terminal answer call from that outcome.
+Use your existing client as shown in the [Step loop](../mechanics_of_libsy.md#read-the-next-step).
+The shared client traits below are optional.
 
-Pass each call's work to `respond` before awaiting it. In Rust:
+<details markdown="1">
+<summary>Optional: adapt the shared client traits</summary>
+
+### Development API
+
+These adapters use the [quickstart's development dependencies](../getting_started.md#install).
+Their asynchronous reply method differs from the synchronous callback API in
+the released `v0.3.0` crates.
+
+When using
+<a href="../../rust/switchyard_protocol/client/trait.RoutedLlmClient.html"><code>RoutedLlmClient</code></a>
+or <a href="../../rust/switchyard_protocol/client/trait.RoutedDecisionClient.html"><code>RoutedDecisionClient</code></a>,
+adapt errors to <a href="../../rust/switchyard_libsy/enum.LibsyError.html"><code>LibsyError</code></a>:
 
 ```rust
 use switchyard_libsy::{CallDecision, CallModel, LibsyError, Result};
@@ -94,37 +80,20 @@ async fn serve_decision(call: CallDecision, client: &dyn RoutedDecisionClient) -
 }
 ```
 
-These traits belong to `switchyard-protocol`. Implement them over your own transport or SDK. The quickstart's custom [OpenRouter client](../getting_started.md#use-libsy-with-your-client) calls HTTP directly; `run_stream` also works without implementing these traits. Switchyard's HTTP client is optional.
-
-In Python, the client coroutine returns `LlmResponse.Agg` or `LlmResponse.Stream`:
-
-```python
-await call.respond(client.call(call.request, call.models[0]))
-```
-
-`respond` accepts a future or awaitable instead of a completed response. Move the provider await into this method. Python `call.fail(error)` is also awaitable. Decision calls use the same pattern with their existing decision response type.
-
-## Concurrent calls and cancellation
-
-In Rust, `respond` drops the supplied work and returns `Ok(())` when the algorithm stops waiting for that call. Dropping a pending `respond` or `libsy::drive` future also drops its host work. Use `libsy::drive` to manage concurrent handlers and their lifetime.
-
-Python `respond` cancels and awaits the supplied provider work before returning. For concurrent algorithms, the host creates handler tasks with `asyncio.create_task` and must cancel and await remaining handlers when the run ends; see the complete [Python example](../../examples/libsy.py). Awaiting handlers one at a time inside the step loop serializes their execution.
-
-After a response stream is delivered, its consumer controls its lifetime. Cancellation cannot guarantee that an upstream provider stops generating or billing.
-
-## Metadata and telemetry
-
-Successful runs also include `OutcomeMetadata`: a unique `outcome_id`, the algorithm name, and optional JSON evidence. In Python, read `outcome.metadata.outcome_id`, `outcome.metadata.algorithm`, and `outcome.metadata.evidence` after checking that `outcome.metadata` is present. Evidence is a normal Python value, usually a dictionary; algorithms without evidence return `None`.
-
-With a host-installed OpenTelemetry subscriber, the existing `libsy.run` span records the same identity, selected models, and supported evidence fields. See the [OpenTelemetry reference](opentelemetry.md) for field names, metrics, and export setup. libsy does not install an exporter or send telemetry itself.
-
-For the request, response, and streaming types the steps carry, see [`switchyard-protocol`](../../crates/protocol/README.md).
-
-For plan/execute, supply conversation history, including tool calls and results, before routing. Responses API continuation IDs alone are not enough. See the [Responses API history requirement](../routing_algorithms/plan_execute_routing.md#responses-api-history-requirement).
+</details>
 
 ## Python bindings
 
-Python bindings run the same Rust algorithms. With Python 3.10+ and [uv](https://docs.astral.sh/uv/getting-started/installation/), create a project and install the released package:
+The bindings run the same Rust algorithms. The local routing example below works
+with the released package. For the asynchronous callbacks and cleanup described
+after it, build matching [development bindings](../../INSTALLATION.md#development)
+and follow the complete [Python host example](../../examples/libsy.py).
+
+<details markdown="1">
+<summary>Python setup, callbacks, and metadata</summary>
+
+With Python 3.10+ and [uv](https://docs.astral.sh/uv/getting-started/installation/),
+create a project and install the released package:
 
 ```bash
 uv init --bare switchyard-python-demo
@@ -152,4 +121,31 @@ async def main():
 asyncio.run(main())
 ```
 
-`uv run route.py` prints `Selected: Efficient` without making a network call. This routing-only example works with the released package. For the development API's host callbacks and cancellation, build the matching bindings from source as described at the top of this page, then see [the complete host example](../../examples/libsy.py).
+`uv run route.py` prints `Selected: Efficient` without making a network call.
+
+### Concurrent calls and cancellation
+
+The client coroutine returns `LlmResponse.Agg` or `LlmResponse.Stream`.
+Pass the coroutine itself to `respond`:
+
+```python
+await call.respond(client.call(call.request, call.models[0]))
+```
+
+`respond` cancels and awaits the supplied provider work before returning.
+For concurrent algorithms, create handler tasks and cancel and await the remaining
+handlers when the run ends, as in the [Python host example](../../examples/libsy.py).
+Awaiting one handler at a time serializes execution. `call.fail(error)` is also
+awaitable; decision calls use the same reply pattern.
+
+For the shared cancellation behavior and upstream limits, see
+[Mechanics](../mechanics_of_libsy.md#control-how-work-runs).
+
+### Metadata and telemetry
+
+After checking that `outcome.metadata` is present, read its `outcome_id`,
+`algorithm`, and `evidence` attributes. Evidence is a normal Python value, usually
+a dictionary; algorithms without evidence return `None`. See the
+[OpenTelemetry reference](opentelemetry.md) for signals and export setup.
+
+</details>
