@@ -18,7 +18,7 @@ pub use decision::DecisionJudgeConfig;
 use super::escalation;
 use super::fall_through::FallThrough;
 use super::util::DEFAULT_JUDGE_MAX_OUTPUT_TOKENS;
-use super::util::affinity::{AffinityRouter, ClassifyTrigger};
+use super::util::affinity::{AffinityRouter, ClassifyTrigger, is_user_turn};
 use super::util::classifier_contract::{
     ClassifierContract, ClassifierContractConfig, ClassifierResponseFormat,
 };
@@ -77,10 +77,15 @@ impl TaskClassifierVerdict {
     }
 
     /// Returns the number of threshold steps assigned to this capability boundary.
-    fn boundary_steps(&self) -> Option<u8> {
+    ///
+    /// `unmatched_steps` comes from the route configuration: a request that matches no
+    /// capability rule has no evidence behind its solve probability, so operators can
+    /// require more confidence for it than for an uncertain verdict.
+    fn boundary_steps(&self, unmatched_steps: u8) -> Option<u8> {
         match self.capability_boundary.as_str() {
             "supported" => Some(0),
-            "uncertain" | "unmatched" => Some(1),
+            "uncertain" => Some(1),
+            "unmatched" => Some(unmatched_steps),
             "unsupported" => Some(2),
             _ => None,
         }
@@ -99,7 +104,7 @@ impl TaskClassifierVerdict {
 fn trim_messages(messages: &[Message], recent_turn_window: usize) -> Vec<Message> {
     let is_instruction = |message: &Message| matches!(message.role, Role::System | Role::Developer);
     let mut kept: Vec<&Message> = messages.iter().filter(|m| is_instruction(m)).collect();
-    let Some(task) = messages.iter().position(|m| m.role == Role::User) else {
+    let Some(task) = messages.iter().position(is_user_turn) else {
         return kept.into_iter().cloned().collect();
     };
     kept.push(&messages[task]);
@@ -164,9 +169,9 @@ fn task_messages(messages: &[Message]) -> Vec<Message> {
                 | ContentBlock::Reasoning { .. }
         )
     };
-    let mut user_messages = messages.iter().filter(|message| {
-        message.role == Role::User && message.content.iter().any(is_task_content)
-    });
+    let mut user_messages = messages
+        .iter()
+        .filter(|message| is_user_turn(message) && message.content.iter().any(is_task_content));
     let Some(opening_task) = user_messages.next() else {
         return Vec::new();
     };
@@ -232,6 +237,7 @@ impl ClassifierInput for TaskInput {
 struct TaskClassifierPolicy {
     base_threshold: f64,
     threshold_step: f64,
+    unmatched_steps: u8,
 }
 
 impl TaskClassifierPolicy {
@@ -239,12 +245,14 @@ impl TaskClassifierPolicy {
         Self {
             base_threshold: config.base_threshold,
             threshold_step: config.threshold_step,
+            unmatched_steps: config.unmatched_steps,
         }
     }
 
     /// Returns the required solve probability for one validated verdict.
     fn threshold(&self, verdict: &TaskClassifierVerdict) -> Option<f64> {
-        Some(self.base_threshold + f64::from(verdict.boundary_steps()?) * self.threshold_step)
+        let steps = verdict.boundary_steps(self.unmatched_steps)?;
+        Some(self.base_threshold + f64::from(steps) * self.threshold_step)
     }
 }
 
@@ -346,8 +354,12 @@ pub struct LlmCapabilityConfig {
     /// Lowest solve probability that routes a supported task to the efficient target.
     pub base_threshold: f64,
     /// Amount added per capability-boundary step: zero for supported, one for
-    /// uncertain or unmatched, and two for unsupported.
+    /// uncertain, `unmatched_steps` for unmatched, and two for unsupported.
     pub threshold_step: f64,
+    /// Threshold steps applied to an unmatched verdict (no capability rule applies).
+    ///
+    /// Defaults to 1, the same as an uncertain verdict. 2 treats it like unsupported.
+    pub unmatched_steps: u8,
     /// Prompt and verdict contract settings for the classifier judge.
     pub contract: ClassifierContractConfig,
     /// Maximum completion tokens available to the classifier verdict.
@@ -359,6 +371,7 @@ impl Default for LlmCapabilityConfig {
         Self {
             base_threshold: 0.0,
             threshold_step: 0.0,
+            unmatched_steps: DEFAULT_UNMATCHED_STEPS,
             contract: ClassifierContractConfig::default(),
             max_output_tokens: DEFAULT_JUDGE_MAX_OUTPUT_TOKENS,
         }
@@ -374,6 +387,8 @@ struct TaskClassifierConfigWire {
     fail_open: bool,
     #[serde(default)]
     threshold_step: f64,
+    #[serde(default = "default_unmatched_steps")]
+    unmatched_steps: u8,
     #[serde(default)]
     classify_trigger: ClassifyTrigger,
     #[serde(default)]
@@ -403,6 +418,7 @@ impl<'de> Deserialize<'de> for TaskClassifierConfig {
             judge: CapabilityJudgeConfig::Llm(LlmCapabilityConfig {
                 base_threshold: wire.base_threshold,
                 threshold_step: wire.threshold_step,
+                unmatched_steps: wire.unmatched_steps,
                 contract,
                 max_output_tokens: wire.max_output_tokens,
             }),
@@ -416,6 +432,13 @@ impl<'de> Deserialize<'de> for TaskClassifierConfig {
 
 const fn default_fail_open() -> bool {
     true
+}
+
+/// Unmatched verdicts share the uncertain step unless the route says otherwise.
+pub const DEFAULT_UNMATCHED_STEPS: u8 = 1;
+
+const fn default_unmatched_steps() -> u8 {
+    DEFAULT_UNMATCHED_STEPS
 }
 
 const fn default_judge_max_output_tokens() -> u64 {
@@ -449,6 +472,14 @@ impl LlmCapabilityConfig {
                 message: format!(
                     "threshold_step must be finite and greater than or equal to 0, got {}",
                     self.threshold_step
+                ),
+            });
+        }
+        if self.unmatched_steps > 2 {
+            return Err(LibsyError::AlgorithmError {
+                message: format!(
+                    "unmatched_steps must be 0, 1, or 2, got {}",
+                    self.unmatched_steps
                 ),
             });
         }
@@ -1301,6 +1332,7 @@ mod tests {
         let settings = DecisionJudgeConfig {
             cutoff: 0.4,
             instructions: None,
+            criteria: None,
             candidates: BTreeMap::from([
                 ("a".into(), "capable".into()),
                 ("b".into(), "efficient".into()),
@@ -1366,7 +1398,7 @@ mod tests {
                     config: TaskClassifierConfig {
                         judge: CapabilityJudgeConfig::Decision(config),
                         fail_open,
-                        recent_turn_window: Some(3),
+                        recent_turn_window: None,
                         classify_trigger: ClassifyTrigger::NewSession,
                         ..TaskClassifierConfig::default()
                     },
@@ -1529,6 +1561,17 @@ mod tests {
             .candidates
             .insert("duplicate-a".into(), "capable".into());
         assert!(duplicate.validate().is_err());
+        let mut custom = settings.clone();
+        custom.candidates.remove("c");
+        custom.criteria = Some(BTreeMap::from([
+            ("a".into(), json!("Start capable")),
+            ("b".into(), json!("Start efficient")),
+        ]));
+        assert!(custom.validate().is_err());
+        custom.instructions = Some(json!("Choose a profile."));
+        assert!(custom.validate().is_ok());
+        custom.candidates.remove("b");
+        assert!(custom.validate().is_err());
         Ok(())
     }
 
@@ -1723,6 +1766,55 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn unmatched_steps_raise_only_the_unmatched_threshold() -> Result<()> {
+        let policy = TaskClassifierPolicy::new(&LlmCapabilityConfig {
+            threshold_step: 0.1,
+            unmatched_steps: 2,
+            ..llm_config(0.75)
+        });
+
+        // 0.85 clears one step but not two: unmatched now routes to the capable target.
+        assert_eq!(
+            selected(&policy, Some(&verdict(0.85, "unmatched", "none")))?,
+            "capable"
+        );
+        assert_eq!(
+            selected(&policy, Some(&verdict(0.95, "unmatched", "none")))?,
+            "efficient"
+        );
+        // Other boundaries keep their steps.
+        assert_eq!(
+            selected(&policy, Some(&verdict(0.85, "uncertain", "UNC-1")))?,
+            "efficient"
+        );
+        assert_eq!(
+            selected(&policy, Some(&verdict(0.75, "supported", "SUP-2")))?,
+            "efficient"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unmatched_steps_default_to_one_and_reject_values_above_two() {
+        let parsed: TaskClassifierConfig =
+            serde_json::from_value(serde_json::json!({ "base_threshold": 0.5 }))
+                .expect("config without unmatched_steps parses");
+        let CapabilityJudgeConfig::Llm(judge) = &parsed.judge else {
+            panic!("a flat capability config builds an LLM judge");
+        };
+        assert_eq!(judge.unmatched_steps, 1);
+
+        let invalid = TaskClassifierConfig {
+            judge: CapabilityJudgeConfig::Llm(LlmCapabilityConfig {
+                unmatched_steps: 3,
+                ..llm_config(0.5)
+            }),
+            ..TaskClassifierConfig::default()
+        };
+        assert!(invalid.validate().is_err());
+    }
+
     /// The text of each message a judge with `recent_turn_window` would be sent.
     /// The no-window case is covered by `capability_judge_builds_a_structured_request`.
     fn capability_judge(recent_turn_window: Option<usize>) -> Result<CapabilityJudge> {
@@ -1740,6 +1832,10 @@ mod tests {
             llm_request: LlmRequest {
                 messages: vec![
                     Message::text(Role::System, "client instructions"),
+                    Message::text(
+                        Role::User,
+                        "<environment_context>setup</environment_context>",
+                    ),
                     Message::text(Role::User, "initial task"),
                     Message::text(Role::Assistant, "old response"),
                     Message::text(Role::User, "old follow-up"),
@@ -1807,6 +1903,10 @@ mod tests {
 
     #[test]
     fn default_task_input_keeps_user_content_around_tool_results() {
+        let context = Message::text(
+            Role::User,
+            "<environment_context><current_date>2026-10-31</current_date></environment_context>",
+        );
         let mut result = tool_result("call-1");
         result.role = Role::User;
         let mut mixed = result.clone();
@@ -1819,11 +1919,13 @@ mod tests {
         let mut request = Request {
             llm_request: LlmRequest {
                 messages: vec![
+                    context.clone(),
                     result.clone(),
                     Message::text(Role::User, "initial task"),
                     tool_call("call-1"),
                     mixed,
                     result.clone(),
+                    context,
                 ],
                 ..LlmRequest::default()
             },

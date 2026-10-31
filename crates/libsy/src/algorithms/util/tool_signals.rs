@@ -23,6 +23,7 @@ use serde_json::Value;
 use switchyard_protocol::codex_namespaces::{split_qualified_name, tool_namespaces};
 use switchyard_protocol::{ContentBlock, Request, Role, WireFormat};
 
+use super::affinity::is_user_turn;
 use crate::{LibsyError, Result};
 
 use crate::core::processor::{Event, Processor};
@@ -421,6 +422,7 @@ impl ToolSignals {
             request,
             window_size.unwrap_or(DEFAULT_RECENT_WINDOW),
             semantics,
+            false,
         )
     }
 }
@@ -470,6 +472,17 @@ impl Default for ToolSignalProcessor {
             recent_window: DEFAULT_RECENT_WINDOW,
             tool_semantics: ToolSemantics::default(),
         }
+    }
+}
+
+impl ToolSignalProcessor {
+    pub(crate) fn for_user_turn(&self, request: &Request) -> ToolSignals {
+        extract_tool_signals_with_window_and_semantics(
+            request,
+            self.recent_window,
+            &self.tool_semantics,
+            true,
+        )
     }
 }
 
@@ -1032,6 +1045,7 @@ fn extract_tool_signals_with_window(request: &Request, recent_window: usize) -> 
         request,
         recent_window,
         &ToolSemantics::default(),
+        false,
     )
 }
 
@@ -1039,9 +1053,16 @@ fn extract_tool_signals_with_window_and_semantics(
     request: &Request,
     recent_window: usize,
     semantics: &ToolSemantics,
+    current_user_turn: bool,
 ) -> ToolSignals {
     // Read the decoded conversation, including preserved built-in tool outputs.
     let messages = &request.llm_request.messages;
+    let boundary = if current_user_turn {
+        messages.iter().rposition(is_user_turn)
+    } else {
+        None
+    };
+    let start = boundary.map_or(0, |index| index + 1);
     let namespaces = tool_namespaces(&request.llm_request.extensions);
     let mut tool_texts: Vec<(String, bool)> = Vec::new();
     let mut tool_calls: Vec<ObservedToolCall> = Vec::new();
@@ -1051,12 +1072,14 @@ fn extract_tool_signals_with_window_and_semantics(
     let mut tool_result_count = 0usize;
     let mut assistant_turn_count = 0usize;
 
-    for message in messages {
-        if message.role == Role::Assistant {
+    for (index, message) in messages.iter().enumerate() {
+        if index >= start && message.role == Role::Assistant {
             assistant_turn_count += 1;
         }
         for block in &message.content {
             match block {
+                // Only context-compaction markers carry across user turns.
+                _ if index < start && !matches!(block, ContentBlock::Text { .. }) => continue,
                 ContentBlock::ToolCall(call) => {
                     // Responses namespaced tools arrive as `<namespace>__<tool>`.
                     let bare_name = namespaces
@@ -1242,7 +1265,7 @@ fn extract_tool_signals_with_window_and_semantics(
     let mut signal = build_signal(
         tool_texts,
         tool_calls,
-        messages.len() as u32,
+        (messages.len() - boundary.unwrap_or(0)) as u32,
         recent_window,
         semantics,
     );
@@ -1784,6 +1807,17 @@ mod tests {
                 is_error: None,
             })],
         }
+    }
+
+    #[test]
+    fn user_turn_signals_exclude_old_errors_and_keep_user_role_tool_results() {
+        let mut user = Message::text(Role::User, "next");
+        user.content.extend(tr("out of memory").content);
+        let request = with_messages(vec![tr("out of memory"), user, tr("ok")]);
+        let signals = ToolSignalProcessor::default().for_user_turn(&request);
+        assert_eq!(signals.tool_result_count, 1);
+        assert_eq!(signals.severity, 0.0);
+        assert_eq!(signals.turn_depth, 2);
     }
 
     #[test]
@@ -2545,9 +2579,15 @@ mod tests {
                 Role::User,
                 "This session is being continued from a previous conversation that ran out of context.",
             ),
+            Message::text(Role::User, "Continue with the next task"),
             bash("ls"),
         ]);
         assert!(ToolSignals::from_request(&request, None).compacted);
+        assert!(
+            ToolSignalProcessor::default()
+                .for_user_turn(&request)
+                .compacted
+        );
     }
 
     #[test]

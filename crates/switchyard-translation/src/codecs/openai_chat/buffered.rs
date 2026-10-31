@@ -1105,6 +1105,11 @@ pub(crate) fn encode_openai_content(
         return Ok(Value::String(text_from_blocks(content, "\n")));
     }
     if role != Role::User {
+        for block in content {
+            if let ContentBlock::Unknown { provider, raw } = block {
+                reject_responses_builtin_tool_item(provider, raw, WireFormat::OpenAiChat)?;
+            }
+        }
         push_lossy(
             diagnostics,
             policy,

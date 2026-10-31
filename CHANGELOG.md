@@ -13,6 +13,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   cut to `max_results`) in SearXNG's own JSON shape, so SearXNG-capable clients
   such as Open WebUI can point at the gateway instead of the engine.
 
+- **Host aborts** - The C ABI accepts an `abort` reply, and the Go binding adds
+  `Abort(err)` to stop routing when the host refuses a model or decision call,
+  even if the algorithm recovers from ordinary call failures.
 - **VGR routing (planned for 0.4.0)** — adds `type = "vgr"` deployment routes
   and the `AlgorithmSpec::Vgr` variant. **Rust source-breaking change:** callers
   that match exhaustively on `AlgorithmSpec` must handle the new variant.

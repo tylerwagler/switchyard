@@ -158,6 +158,7 @@ impl CapturedSpan {
     }
 }
 
+/// Reconstructs the bounded response metadata forwarded to NeMo Relay.
 fn response_data(fields: &Json) -> Option<Json> {
     let mut output = Map::new();
     for (source, target) in [
@@ -183,6 +184,12 @@ fn response_data(fields: &Json) -> Option<Json> {
         if let Some(value) = fields.get(source) {
             usage.insert(target.into(), value.clone());
         }
+    }
+    if let Some(value) = fields.get("gen_ai.usage.cache_creation_1h.input_tokens") {
+        usage.insert(
+            "cache_creation".into(),
+            serde_json::json!({"ephemeral_1h_input_tokens": value}),
+        );
     }
     if let Some(input) = fields
         .get("gen_ai.usage.input_tokens")
@@ -318,6 +325,7 @@ fn relay_scope_type(name: &str) -> ScopeType {
     }
 }
 
+/// Returns whether a captured span field is safe to forward across the plugin boundary.
 fn is_safe_field(name: &str) -> bool {
     matches!(
         name,
@@ -341,6 +349,7 @@ fn is_safe_field(name: &str) -> bool {
             | "gen_ai.usage.output_tokens"
             | "gen_ai.usage.cache_read.input_tokens"
             | "gen_ai.usage.cache_creation.input_tokens"
+            | "gen_ai.usage.cache_creation_1h.input_tokens"
             | "gen_ai.usage.reasoning.output_tokens"
             | "model"
             | "wire_format"
@@ -444,6 +453,26 @@ mod tests {
         call.sanitize(&ProviderKeyRedactor::new(&["target/model".into()]));
         assert_eq!(call.fields["selected_model"], "[REDACTED]");
         assert_eq!(call.children[0].fields["model"], "[REDACTED]");
+    }
+
+    #[test]
+    fn response_preserves_one_hour_cache_creation_subset() {
+        let fields = serde_json::json!({
+            "gen_ai.response.model": "target/model",
+            "gen_ai.usage.input_tokens": 180,
+            "gen_ai.usage.output_tokens": 7,
+            "gen_ai.usage.cache_read.input_tokens": 30,
+            "gen_ai.usage.cache_creation.input_tokens": 50,
+            "gen_ai.usage.cache_creation_1h.input_tokens": 20,
+        });
+
+        let response = response_data(&fields).expect("response data");
+        assert_eq!(response["usage"]["input_tokens"], 100);
+        assert_eq!(response["usage"]["cache_creation_input_tokens"], 50);
+        assert_eq!(
+            response["usage"]["cache_creation"]["ephemeral_1h_input_tokens"],
+            20
+        );
     }
 
     #[tokio::test]
