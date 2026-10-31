@@ -122,6 +122,7 @@ pub struct Route {
     models: Arc<RuntimeModels>,
     display_name: Option<String>,
     description: Option<String>,
+    role: Option<String>,
     strip_attribution: bool,
     infra: Option<libsy::InfraPolicy>,
 }
@@ -156,19 +157,22 @@ impl Route {
             models: Arc::new(models),
             display_name: None,
             description: None,
+            role: None,
             strip_attribution: false,
             infra: None,
         }
     }
 
-    /// Sets the name and description `GET /v1/models` shows for this route.
+    /// Sets the name, description and role `GET /v1/models` shows for this route.
     pub fn with_listing(
         mut self,
         display_name: Option<String>,
         description: Option<String>,
+        role: Option<String>,
     ) -> Self {
         self.display_name = display_name;
         self.description = description;
+        self.role = role;
         self
     }
 
@@ -191,6 +195,11 @@ impl Route {
     /// The description `GET /v1/models` shows for this route, when configured.
     pub fn description(&self) -> Option<&str> {
         self.description.as_deref()
+    }
+
+    /// The role `GET /v1/models` shows for this route, when configured.
+    pub fn role(&self) -> Option<&str> {
+        self.role.as_deref()
     }
 
     /// Returns the configured libsy algorithm name.

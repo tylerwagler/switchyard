@@ -4819,6 +4819,7 @@ type = "passthrough"
 target = "shared"
 display_name = "Elytron Flash"
 description = "Main coding model"
+role = "main"
 
 [routes.plain]
 id = "plain"
@@ -4843,9 +4844,11 @@ target = "shared"
         entry("claude-elytron-flash")["description"],
         json!("Main coding model")
     );
+    assert_eq!(entry("claude-elytron-flash")["role"], json!("main"));
     // Unset: the name falls back to the id, and no description key is sent.
     assert_eq!(entry("plain")["display_name"], json!("plain"));
     assert!(entry("plain").get("description").is_none());
+    assert!(entry("plain").get("role").is_none());
     Ok(())
 }
 

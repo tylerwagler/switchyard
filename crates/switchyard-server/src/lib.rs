@@ -1987,6 +1987,9 @@ fn model_entry_json(model: &ModelInfo) -> Value {
     if let Some(description) = model.description {
         entry["description"] = json!(description);
     }
+    if let Some(role) = model.role {
+        entry["role"] = json!(role);
+    }
     entry
 }
 

@@ -592,6 +592,7 @@ pub(crate) struct RouteConfig {
     vision: Option<bool>,
     display_name: Option<String>,
     description: Option<String>,
+    role: Option<String>,
     strip_attribution: bool,
     algorithm: AlgorithmSpec,
     infra: Option<libsy::InfraPolicy>,
@@ -615,6 +616,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
         let vision = take_optional(&mut table, "vision")?;
         let display_name = take_optional(&mut table, "display_name")?;
         let description = take_optional(&mut table, "description")?;
+        let role = take_optional(&mut table, "role")?;
         let strip_attribution = take_optional(&mut table, "strip_attribution")?.unwrap_or(false);
         let infra = take_optional(&mut table, "infra")?;
         let algorithm = AlgorithmSpec::deserialize(toml::Value::Table(table))
@@ -627,6 +629,7 @@ impl<'de> Deserialize<'de> for RouteConfig {
             vision,
             display_name,
             description,
+            role,
             strip_attribution,
             algorithm,
             infra,
@@ -897,7 +900,11 @@ impl DeploymentConfig {
                 decision_targets,
                 models,
             )
-            .with_listing(config.display_name.clone(), config.description.clone())
+            .with_listing(
+                config.display_name.clone(),
+                config.description.clone(),
+                config.role.clone(),
+            )
             .with_attribution_strip(config.strip_attribution)
             .with_infra(config.infra.clone());
             routes.push((config.id.clone(), route));

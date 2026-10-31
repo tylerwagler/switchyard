@@ -51,6 +51,8 @@ pub struct ModelInfo<'a> {
     pub display_name: Option<&'a str>,
     /// Configured one-line description.
     pub description: Option<&'a str>,
+    /// Configured role, such as `main` or `small`, for clients that pick models by role.
+    pub role: Option<&'a str>,
     /// Base URLs of the upstreams serving this route, deduplicated.
     pub base_urls: Vec<&'a str>,
 }
@@ -261,6 +263,7 @@ impl Runner {
             capabilities: route.capabilities(),
             display_name: route.display_name(),
             description: route.description(),
+            role: route.role(),
             base_urls: {
                 let mut urls: Vec<&str> = route.base_urls().collect();
                 urls.sort_unstable();
