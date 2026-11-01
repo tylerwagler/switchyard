@@ -1112,7 +1112,8 @@ async fn handle_endpoint_inner(
 
     let response = match llm_json_body(body) {
         Ok(body) => {
-            handle_llm_request(
+            let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+            let handled = handle_llm_request(
                 state,
                 started,
                 metadata,
@@ -1120,7 +1121,12 @@ async fn handle_endpoint_inner(
                 wire_format,
                 routing_log_context,
             )
-            .await
+            .in_current_span();
+            if streaming {
+                sse::start_when_slow(handled, wire_format).await
+            } else {
+                handled.await
+            }
         }
         Err((status, message)) => invalid_body_error(status, message),
     };

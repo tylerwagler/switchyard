@@ -4,11 +4,15 @@
 //! SSE framing helpers for OpenAI, Anthropic, and Responses endpoints.
 
 use std::convert::Infallible;
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use axum::body::{Body, Bytes, to_bytes};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
+use axum::response::Response;
 use axum::response::sse::{Event, KeepAlive, KeepAliveStream, Sse};
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt};
 use serde_json::{Value, json};
 use switchyard_runner::stream_error_summary;
 use switchyard_translation::{LlmStreamError, RawEventStream, WireFormat};
@@ -25,6 +29,101 @@ pub(crate) type SseFrameStream =
 /// minutes. A long prefill can be silent that long, and a translated upstream's own
 /// keep-alives (pings or SSE comments) do not survive translation.
 const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// How long a streaming request may wait for its upstream before its response starts.
+///
+/// Cloudflare drops a request whose first byte takes 100 s. A queued upstream or the
+/// client's own retries can take that long before any upstream headers arrive.
+const START_DELAY: Duration = Duration::from_secs(10);
+
+/// Returns `response` unchanged when it is ready within [`START_DELAY`].
+///
+/// Otherwise starts an SSE response with status 200, sends keep-alive frames until
+/// `response` is ready, and then sends its SSE body. A late error response becomes
+/// an SSE error event, since its status can no longer be sent.
+pub(crate) async fn start_when_slow(
+    response: impl Future<Output = Response> + Send + 'static,
+    target_format: WireFormat,
+) -> Response {
+    start_after(response, target_format, START_DELAY, KEEP_ALIVE_INTERVAL).await
+}
+
+async fn start_after(
+    response: impl Future<Output = Response> + Send + 'static,
+    target_format: WireFormat,
+    delay: Duration,
+    interval: Duration,
+) -> Response {
+    let mut response = Box::pin(response);
+    tokio::select! {
+        response = &mut response => return response,
+        () = tokio::time::sleep(delay) => {}
+    }
+    let ping = Bytes::from_static(if target_format == WireFormat::AnthropicMessages {
+        b"event: ping\ndata: {\"type\":\"ping\"}\n\n"
+    } else {
+        b":\n\n"
+    });
+    let body = async_stream::stream! {
+        yield Ok::<_, axum::Error>(ping.clone());
+        let mut ticks = tokio::time::interval(interval);
+        ticks.tick().await;
+        let response = loop {
+            tokio::select! {
+                response = &mut response => break response,
+                _ = ticks.tick() => yield Ok(ping.clone()),
+            }
+        };
+        if response.status().is_success() {
+            let mut body = response.into_body().into_data_stream();
+            while let Some(chunk) = body.next().await {
+                yield chunk;
+            }
+        } else {
+            yield Ok(late_error_event(response, target_format).await);
+        }
+    };
+    Response::builder()
+        .header(CONTENT_TYPE, "text/event-stream")
+        .header(CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(body))
+        .unwrap_or_default()
+}
+
+/// Renders an error response that arrived after the SSE response started.
+async fn late_error_event(response: Response, target_format: WireFormat) -> Bytes {
+    let status = response.status();
+    tracing::warn!(
+        status = status.as_u16(),
+        "upstream failed after the stream started"
+    );
+    let response = crate::render_error_response(response, target_format);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap_or_default();
+    let mut value = serde_json::from_slice::<Value>(&body)
+        .ok()
+        .filter(|value| value["error"].is_object())
+        .unwrap_or_else(|| {
+            json!({"error": {
+                "type": crate::anthropic_error_type(status),
+                "message": String::from_utf8_lossy(&body),
+            }})
+        });
+    let frame = match target_format {
+        WireFormat::AnthropicMessages => {
+            value["type"] = json!("error");
+            // Claude Code retries an error event only when its type is `overloaded_error`.
+            if matches!(status.as_u16(), 429 | 503 | 529) {
+                value["error"]["type"] = json!("overloaded_error");
+            }
+            format!("event: error\ndata: {value}\n\n")
+        }
+        WireFormat::OpenAiResponses => format!("event: error\ndata: {value}\n\n"),
+        WireFormat::OpenAiChat => format!("data: {value}\n\n"),
+    };
+    Bytes::from(frame)
+}
 
 /// Converts translated JSON events into endpoint-specific SSE frames, and sends a
 /// keep-alive frame whenever the stream is silent for [`KEEP_ALIVE_INTERVAL`].
@@ -165,7 +264,8 @@ fn error_event(target_format: WireFormat, message: String, redactor: &Redactor) 
 mod tests {
     use std::error::Error;
 
-    use axum::{body::to_bytes, response::IntoResponse};
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
     use futures_util::stream;
     use switchyard_protocol::LlmClientError;
     use tracing_subscriber::layer::SubscriberExt;
@@ -331,6 +431,105 @@ mod tests {
             !events.iter().any(|event| event.contains(LEAKED)),
             "{events:?}"
         );
+        Ok(())
+    }
+
+    // An SSE response that is ready after `wait`.
+    async fn ready_after(wait: Duration, response: Response) -> Response {
+        tokio::time::sleep(wait).await;
+        response
+    }
+
+    fn sse_response(body: &'static str) -> Response {
+        Response::builder()
+            .header(CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    async fn started(response: Response) -> TestResult<(StatusCode, String, String)> {
+        let start = start_after(
+            ready_after(Duration::from_millis(150), response),
+            WireFormat::AnthropicMessages,
+            Duration::from_millis(20),
+            Duration::from_millis(30),
+        )
+        .await;
+        let status = start.status();
+        let content_type = start.headers()[CONTENT_TYPE].to_str()?.to_string();
+        let body = String::from_utf8(to_bytes(start.into_body(), usize::MAX).await?.to_vec())?;
+        Ok((status, content_type, body))
+    }
+
+    // A slow upstream gets pings at once, then its own events.
+    #[tokio::test]
+    async fn slow_stream_starts_with_pings() -> TestResult {
+        let (status, content_type, body) = started(sse_response(
+            "event: message_start\ndata: {\"type\":\"message_start\"}\n\n",
+        ))
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(content_type, "text/event-stream");
+        let pings = body.matches("event: ping\n").count();
+        assert!(pings >= 2, "{body}");
+        assert!(
+            body.ends_with("event: message_start\ndata: {\"type\":\"message_start\"}\n\n"),
+            "{body}"
+        );
+        Ok(())
+    }
+
+    fn error_data(body: &str) -> TestResult<Value> {
+        let data = body
+            .split("event: error\ndata: ")
+            .nth(1)
+            .ok_or("missing error event")?;
+        Ok(serde_json::from_str(data.trim_end())?)
+    }
+
+    // A slow upstream that fails with 503 ends with an `overloaded_error` event.
+    #[tokio::test]
+    async fn slow_unavailable_upstream_sends_overloaded_error_event() -> TestResult {
+        let (status, _, body) =
+            started(crate::client_error(&LlmClientError::TemporarilyUnavailable)).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert!(body.starts_with("event: ping\n"), "{body}");
+        let error = error_data(&body)?;
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["error"]["type"], "overloaded_error");
+        Ok(())
+    }
+
+    // A late context overflow keeps the token that starts Claude Code's compaction.
+    #[tokio::test]
+    async fn slow_context_overflow_keeps_prompt_too_long_token() -> TestResult {
+        let (_, _, body) = started(crate::client_error(
+            &LlmClientError::ContextWindowExceeded {
+                model: switchyard_protocol::ModelId::new("m"),
+                message: "too long".to_string(),
+            },
+        ))
+        .await?;
+        let error = error_data(&body)?;
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+        assert_eq!(
+            error["error"]["message"],
+            "capability_rejected: prompt_too_long: too long"
+        );
+        Ok(())
+    }
+
+    // An upstream error that arrives before the delay keeps its HTTP status.
+    #[tokio::test]
+    async fn fast_error_keeps_its_status() -> TestResult {
+        let response = start_after(
+            async { crate::client_error(&LlmClientError::TemporarilyUnavailable) },
+            WireFormat::AnthropicMessages,
+            Duration::from_millis(100),
+            Duration::from_millis(30),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
         Ok(())
     }
 
