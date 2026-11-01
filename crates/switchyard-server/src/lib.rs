@@ -1592,7 +1592,11 @@ fn upstream_error(status: StatusCode, body: &str) -> Response {
         .as_str()
         .filter(|code| !code.is_empty())
         .unwrap_or("upstream_error");
-    let mut response = error_response(status, message, "upstream_error", code);
+    let mut error = ApiError::new(status, message, "upstream_error", code);
+    if parsed["type"] == "error" && parsed["error"].is_object() {
+        error.anthropic_body = Some(parsed.clone());
+    }
+    let mut response = error.into_response(WireFormat::OpenAiChat);
     // Provider messages and codes can quote request content; log only fixed metadata.
     response
         .extensions_mut()
@@ -1607,6 +1611,9 @@ struct ApiError {
     message: String,
     error_type: &'static str,
     code: String,
+    /// An Anthropic upstream's error JSON, sent unchanged to Anthropic callers
+    /// because Claude Code's recovery matches its wording.
+    anthropic_body: Option<Value>,
 }
 
 impl ApiError {
@@ -1621,17 +1628,20 @@ impl ApiError {
             message: message.into(),
             error_type,
             code: code.into(),
+            anthropic_body: None,
         }
     }
 
     fn into_response(self, wire_format: WireFormat) -> Response {
         let body = match wire_format {
-            WireFormat::AnthropicMessages => json!({
-                "type": "error",
-                "error": {
-                    "type": anthropic_error_type(self.status),
-                    "message": self.message.clone(),
-                }
+            WireFormat::AnthropicMessages => self.anthropic_body.clone().unwrap_or_else(|| {
+                json!({
+                    "type": "error",
+                    "error": {
+                        "type": anthropic_error_type(self.status),
+                        "message": self.message.clone(),
+                    }
+                })
             }),
             WireFormat::OpenAiChat | WireFormat::OpenAiResponses => json!({
                 "error": {
@@ -2623,6 +2633,40 @@ targets = ["only"]
         // The upstream's own text still reaches the user.
         assert!(message.contains("configured context size"), "{message}");
         assert_eq!(body["error"]["code"], json!("context_length_exceeded"));
+    }
+
+    // Claude Code's recovery matches the upstream's error wording, so an Anthropic
+    // upstream's error JSON reaches an Anthropic caller unchanged.
+    #[tokio::test]
+    async fn anthropic_upstream_error_body_is_relayed_unchanged() {
+        let upstream = json!({
+            "type": "error",
+            "error": {
+                "type": "invalid_request_error",
+                "message": "output_config.effort: Extra inputs are not permitted"
+            },
+            "request_id": "req_1"
+        });
+        let error = LlmClientError::UpstreamHttp {
+            status: StatusCode::BAD_REQUEST,
+            body: upstream.to_string(),
+            headers: Box::new(HeaderMap::new()),
+        };
+        let body = |wire_format| {
+            let response = render_error_response(client_error(&error), wire_format);
+            async move {
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                    .await
+                    .expect("body");
+                serde_json::from_slice::<Value>(&body).expect("error json")
+            }
+        };
+        assert_eq!(body(WireFormat::AnthropicMessages).await, upstream);
+        // Other callers get their own format's envelope.
+        assert_eq!(
+            body(WireFormat::OpenAiChat).await["error"]["message"],
+            "output_config.effort: Extra inputs are not permitted"
+        );
     }
 
     // A failure must carry the upstream's retry and rate-limit hints, not just its
