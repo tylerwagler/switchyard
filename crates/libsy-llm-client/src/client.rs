@@ -1128,6 +1128,9 @@ fn forward_metadata_headers(
                 && !backend.is_provider_owned_header(name.as_str())
         } else {
             is_allowed_metadata_header(name.as_str())
+                || (matches!(backend, Backend::Anthropic(_))
+                    && is_anthropic_client_header(name.as_str())
+                    && !backend.is_provider_owned_header(name.as_str()))
         };
         if !is_allowed {
             continue;
@@ -1553,6 +1556,12 @@ fn is_allowed_metadata_header(name: &str) -> bool {
     ALLOWED_METADATA_HEADERS
         .iter()
         .any(|allowed| name.eq_ignore_ascii_case(allowed))
+}
+
+// Anthropic clients add new `anthropic-*` and `x-claude-code-*` headers over
+// releases, so an Anthropic target receives them as an open list.
+fn is_anthropic_client_header(name: &str) -> bool {
+    name.starts_with("anthropic-") || name.starts_with("x-claude-code-")
 }
 
 fn is_non_forwardable_header(name: &str, headers: &HeaderMap) -> bool {
@@ -2971,6 +2980,78 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("secret")
         );
+        Ok(())
+    }
+
+    // Claude Code's `anthropic-*` and `x-claude-code-*` headers reach an Anthropic
+    // target as an open list; caller credentials and other headers do not.
+    #[tokio::test]
+    async fn anthropic_requests_forward_client_headers()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+
+        let client = TranslatingLlmClient::new(&anthropic_map(&server.uri()))?;
+        let mut headers = http::HeaderMap::new();
+        for (name, value) in [
+            ("anthropic-workspace-id", "ws"),
+            ("anthropic-version", "2023-06-01"),
+            ("x-claude-code-session-id", "s1"),
+            ("x-claude-code-request-class", "main"),
+            ("x-api-key", "client-key"),
+            ("authorization", "Bearer client-key"),
+            ("x-other", "no"),
+        ] {
+            headers.insert(name, http::HeaderValue::from_static(value));
+        }
+        let raw = json!({
+            "model": "client-facing",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 7
+        });
+
+        client
+            .call_rewrite_model_raw(
+                raw,
+                Some(headers),
+                Some(&ModelId::from("claude")),
+                WireFormat::AnthropicMessages,
+            )
+            .await?;
+
+        let received = server
+            .received_requests()
+            .await
+            .ok_or("request recording should be enabled")?;
+        let received = received.first().ok_or("expected one upstream request")?;
+        let header = |name: &str| {
+            let values: Vec<_> = received
+                .headers
+                .get_all(name)
+                .iter()
+                .filter_map(|value| value.to_str().ok())
+                .collect();
+            values.join(",")
+        };
+        assert_eq!(header("anthropic-workspace-id"), "ws");
+        assert_eq!(header("anthropic-version"), "2023-06-01");
+        assert_eq!(header("x-claude-code-session-id"), "s1");
+        assert_eq!(header("x-claude-code-request-class"), "main");
+        assert_eq!(header("x-api-key"), "secret");
+        assert_eq!(header("authorization"), "");
+        assert_eq!(header("x-other"), "");
         Ok(())
     }
 
