@@ -533,6 +533,37 @@ mod tests {
         Ok(())
     }
 
+    // An Anthropic upstream that stops mid-message must not look finished: the
+    // client sees an error event and no `message_delta` or `message_stop`.
+    #[tokio::test]
+    async fn truncated_anthropic_upstream_ends_with_an_error_event() -> TestResult {
+        let upstream = concat!(
+            "event: message_start\ndata: {\"type\":\"message_start\",\"message\":{\"id\":\"msg_1\",\"type\":\"message\",\"role\":\"assistant\",\"model\":\"m\",\"content\":[],\"stop_reason\":null,\"usage\":{\"input_tokens\":1,\"output_tokens\":0}}}\n\n",
+            "event: content_block_start\ndata: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"partial\"}}\n\n",
+        );
+        let bytes = stream::iter(vec![Ok(upstream.as_bytes().to_vec())]);
+        let decoded = switchyard_translation::decode_stream(bytes, WireFormat::AnthropicMessages)?;
+        let events = switchyard_translation::encode_stream_with_extensions(
+            decoded,
+            WireFormat::AnthropicMessages,
+            None,
+            &Default::default(),
+        )?;
+        let response = frame_stream(
+            events,
+            WireFormat::AnthropicMessages,
+            Arc::new(Redactor::default()),
+        )
+        .into_response();
+        let body = String::from_utf8(to_bytes(response.into_body(), usize::MAX).await?.to_vec())?;
+        assert!(body.contains("partial"), "{body}");
+        assert!(body.contains("event: error\n"), "{body}");
+        assert!(!body.contains("message_delta"), "{body}");
+        assert!(!body.contains("message_stop"), "{body}");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn anthropic_stream_error_uses_api_error_type() -> TestResult {
         let failure = LlmClientError::General("boom".to_string());
