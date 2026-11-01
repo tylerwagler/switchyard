@@ -4867,3 +4867,34 @@ fn anthropic_reencode_keeps_system_blocks_separate() -> TestResult {
     );
     Ok(())
 }
+
+// Claude Code sends empty `system` entries that carry only a per-turn effort.
+// They have no text, so a Chat target gets no message for them.
+#[test]
+fn anthropic_empty_system_entries_are_dropped_for_chat() -> TestResult {
+    let body = json!({
+        "model": "m",
+        "max_tokens": 16,
+        "messages": [
+            {"role": "user", "content": "hi"},
+            {"role": "system", "content": [], "output_config": {"effort": "low"}},
+            {"role": "system", "content": ""},
+            {"role": "system", "content": "Note this."}
+        ]
+    });
+
+    let output = TranslationEngine::default()
+        .translate_request(
+            WireFormat::AnthropicMessages,
+            WireFormat::OpenAiChat,
+            &body,
+            &TranslationPolicy::default(),
+        )?
+        .body;
+
+    let messages = output["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 2, "{messages:?}");
+    assert_eq!(messages[0]["content"], "hi");
+    assert_eq!(messages[1]["content"], "Note this.");
+    Ok(())
+}

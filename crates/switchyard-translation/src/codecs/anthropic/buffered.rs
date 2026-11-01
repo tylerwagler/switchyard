@@ -130,6 +130,16 @@ impl FormatCodec for AnthropicMessagesCodec {
                     )?;
                     continue;
                 };
+                // Claude Code sends empty `system` entries that only set a per-turn
+                // effort. They carry no text, so they would become empty user turns.
+                if message.get("role").and_then(Value::as_str) == Some("system")
+                    && message.get("content").is_none_or(|content| {
+                        content.as_str() == Some("")
+                            || content.as_array().is_some_and(Vec::is_empty)
+                    })
+                {
+                    continue;
+                }
                 // Request decoding enforces the provider contract: an unknown
                 // role is rejected rather than coerced to `user`. Anthropic
                 // Messages only defines `user`/`assistant`, but other known
