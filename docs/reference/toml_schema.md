@@ -642,6 +642,28 @@ With it, every tool use in a reply is judged by one short request through `judge
 | `shadow_log` | No | unset | Path to a JSONL file. Turns on shadow mode: the server still answers that it does not run the check, runs the judge in the background, and appends its verdicts and Claude Code's own classifier exchanges to this file. |
 | `verdict_log` | No | unset | Path to a JSONL file. Records each verdict the server returns. It records nothing in shadow mode, because there the server returns no verdicts. The file holds tool names and inputs, never the conversation. |
 
+### `[safeguards.stage1]`
+
+Optional. A System 1 decision model asked before the judge: pulsar's `/v1/systemone` with the
+JEV adapter (the `noul` question, "would the user object to this action?"). The gate sends the
+state JEV was trained on: the latest user request (the user's own words, tool results and
+`<system-reminder>` text left out, at most 2000 characters), the working directory, the git
+remote (null) and the action (`tool`, `input`). A P(block) of at least `block_at` blocks without
+the judge; one below `allow_below` allows without it; anything between goes to the judge. A
+stage-1 timeout or error falls through to the judge, so a backend without `/v1/systemone`
+leaves the judge alone in charge. Read-only tools still skip both stages.
+
+| Key | Required | Default | Meaning |
+|---|:---:|---|---|
+| `url` | Yes | — | The full `/v1/systemone` URL. |
+| `block_at` | No | `0.9` | P(block) at or above which stage 1 blocks. |
+| `allow_below` | No | `0.25` | P(block) below which stage 1 allows; `0` sends every action stage 1 does not block to the judge. |
+| `timeout_ms` | No | `10000` | Time allowed for the stage-1 call. |
+
+The thresholds must satisfy 0 ≤ `allow_below` ≤ `block_at` ≤ 1. Verdict-log lines carry
+`stage1_p_block` when stage 1 answered, and `fast_path` `stage1_block` or `stage1_allow` when it
+decided alone.
+
 The verdict log is written by a background thread, so a slow or failing disk never
 delays or fails a reply. A write error is logged once until a write succeeds again.
 Each line is one JSON object. All lines carry `ts`, `kind`, `session_id` (from

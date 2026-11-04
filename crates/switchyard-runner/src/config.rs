@@ -189,6 +189,37 @@ struct SafeguardsConfig {
     shadow_log: Option<std::path::PathBuf>,
     #[serde(default)]
     verdict_log: Option<std::path::PathBuf>,
+    #[serde(default)]
+    stage1: Option<SafeguardsStage1Config>,
+}
+
+/// `[safeguards.stage1]`: a decision model asked before the judge (a System 1
+/// head such as pulsar's `/v1/systemone`). Its P(block) at or above `block_at`
+/// blocks, below `allow_below` allows, and anything between, or a stage 1 that
+/// fails or times out, goes to the judge as before.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SafeguardsStage1Config {
+    url: String,
+    #[serde(default)]
+    block_at: Option<f64>,
+    #[serde(default)]
+    allow_below: Option<f64>,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+/// The decision model asked before the judge (`[safeguards.stage1]`).
+#[derive(Debug, Clone)]
+pub struct SafeguardsStage1 {
+    /// The `/v1/systemone` endpoint.
+    pub url: String,
+    /// P(block) at or above this blocks without the judge.
+    pub block_at: f64,
+    /// P(block) below this allows without the judge.
+    pub allow_below: f64,
+    /// Time allowed for one stage 1 answer.
+    pub timeout: std::time::Duration,
 }
 
 /// The judge for Claude Code's server-side auto mode check.
@@ -202,6 +233,8 @@ pub struct SafeguardsJudge {
     pub shadow_log: Option<std::path::PathBuf>,
     /// JSONL file for the verdicts the server returns. Unused in shadow mode.
     pub verdict_log: Option<std::path::PathBuf>,
+    /// The decision model asked before the judge, when configured.
+    pub stage1: Option<SafeguardsStage1>,
 }
 
 /// Opt-in hosted web search: serves Claude Code's server-side `web_search` tool
@@ -421,6 +454,12 @@ const fn default_web_search_timeout_ms() -> u64 {
 // A verdict gates a tool call the user is waiting on; Claude Code's own
 // classifier deadline is of the same order.
 const DEFAULT_SAFEGUARDS_TIMEOUT_MS: u64 = 60_000;
+/// `[safeguards.stage1]` defaults: a P(block) this sure blocks without the judge (the highest on an
+/// allow-labelled case of the JEV grade was 0.63), below `allow_below` the action is allowed (the JEV judge's
+/// fitted threshold), and a stage 1 answer may take this long before the judge is asked instead.
+const DEFAULT_STAGE1_BLOCK_AT: f64 = 0.9;
+const DEFAULT_STAGE1_ALLOW_BELOW: f64 = 0.25;
+const DEFAULT_STAGE1_TIMEOUT_MS: u64 = 10_000;
 
 const fn default_search_max_results() -> usize {
     20
@@ -968,6 +1007,29 @@ impl DeploymentConfig {
                         config.judge_route
                     ))
                 })?;
+                let stage1 = match config.stage1 {
+                    None => None,
+                    Some(stage1) => {
+                        let block_at = stage1.block_at.unwrap_or(DEFAULT_STAGE1_BLOCK_AT);
+                        let allow_below = stage1.allow_below.unwrap_or(DEFAULT_STAGE1_ALLOW_BELOW);
+                        if !(0.0..=1.0).contains(&allow_below)
+                            || !(0.0..=1.0).contains(&block_at)
+                            || allow_below > block_at
+                        {
+                            return Err(RunnerError::configuration(format!(
+                                "safeguards.stage1 wants 0 <= allow_below ({allow_below}) <= block_at ({block_at}) <= 1"
+                            )));
+                        }
+                        Some(SafeguardsStage1 {
+                            url: stage1.url,
+                            block_at,
+                            allow_below,
+                            timeout: std::time::Duration::from_millis(
+                                stage1.timeout_ms.unwrap_or(DEFAULT_STAGE1_TIMEOUT_MS),
+                            ),
+                        })
+                    }
+                };
                 Some(SafeguardsJudge {
                     model: route.id.clone(),
                     timeout: std::time::Duration::from_millis(
@@ -975,6 +1037,7 @@ impl DeploymentConfig {
                     ),
                     shadow_log: config.shadow_log,
                     verdict_log: config.verdict_log,
+                    stage1,
                 })
             }
         };
@@ -3556,6 +3619,47 @@ target = "t"
         );
         let toml = format!("{BASE}\n[safeguards]\njudge_route = \"r\"\nverdict_logs = \"v\"\n");
         assert!(error_message(&toml).contains("verdict_logs"));
+    }
+
+    #[test]
+    fn safeguards_stage1_resolves_with_defaults_and_checks_its_thresholds() {
+        let toml = format!("{BASE}\n[safeguards]\njudge_route = \"r\"\n");
+        let runner = runner_from_toml(&toml).expect("safeguards resolves");
+        assert!(runner.safeguards().expect("safeguards").stage1.is_none());
+        let toml = format!(
+            "{BASE}\n[safeguards]\njudge_route = \"r\"\n\n[safeguards.stage1]\nurl = \"http://g:8000/v1/systemone\"\n"
+        );
+        let runner = runner_from_toml(&toml).expect("stage1 resolves");
+        let stage1 = runner
+            .safeguards()
+            .expect("safeguards")
+            .stage1
+            .clone()
+            .expect("stage1");
+        assert_eq!(stage1.url, "http://g:8000/v1/systemone");
+        assert_eq!(stage1.block_at, 0.9);
+        assert_eq!(stage1.allow_below, 0.25);
+        assert_eq!(stage1.timeout, std::time::Duration::from_millis(10_000));
+        let toml = format!(
+            "{BASE}\n[safeguards]\njudge_route = \"r\"\n\n[safeguards.stage1]\nurl = \"u\"\nblock_at = 0.95\nallow_below = 0.0\ntimeout_ms = 3000\n"
+        );
+        let runner = runner_from_toml(&toml).expect("stage1 overrides resolve");
+        let stage1 = runner
+            .safeguards()
+            .expect("safeguards")
+            .stage1
+            .clone()
+            .expect("stage1");
+        assert_eq!((stage1.block_at, stage1.allow_below), (0.95, 0.0));
+        assert_eq!(stage1.timeout, std::time::Duration::from_millis(3000));
+        let toml = format!(
+            "{BASE}\n[safeguards]\njudge_route = \"r\"\n\n[safeguards.stage1]\nurl = \"u\"\nblock_at = 0.2\n"
+        );
+        assert!(error_message(&toml).contains("allow_below"));
+        let toml = format!(
+            "{BASE}\n[safeguards]\njudge_route = \"r\"\n\n[safeguards.stage1]\nurl = \"u\"\nblock = 0.9\n"
+        );
+        assert!(error_message(&toml).contains("block"));
     }
 
     #[test]

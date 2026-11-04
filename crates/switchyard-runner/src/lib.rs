@@ -34,7 +34,7 @@ pub use failure::{RouteErrorKind, RouteErrorPhase, RouteErrorSummary, stream_err
 // Re-exported because `Route::new` takes it, so a host wiring routes does not need a libsy dep.
 pub use config::{
     CacheConfig, EmbeddingsConfig, ParseConfig, RerankConfig, ResolvedCache, ResolvedRerank,
-    ResolvedWebSearch, SafeguardsJudge, SearchConfig, WebSearchConfig,
+    ResolvedWebSearch, SafeguardsJudge, SafeguardsStage1, SearchConfig, WebSearchConfig,
 };
 pub use libsy::{RoutingOutcome, RuntimeModels};
 pub use provider_key_redactor::ProviderKeyRedactor;

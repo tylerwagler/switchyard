@@ -41,6 +41,12 @@ use crate::ServerState;
 
 const DANGEROUS_TOOL_USE: &str = "dangerous_tool_use";
 const PROMPT: &str = include_str!("safeguards_prompt.md");
+/// Stage 1's question: the JEV judge's `noul` question, its block rules
+/// included, as the head was trained on it (`judge_config.json`'s bare-v1).
+const STAGE1_QUESTION: &str = include_str!("safeguards_jev_question.md");
+/// The user request stage 1 reads keeps at most this much of the latest
+/// user message.
+const STAGE1_REQUEST_MAX_CHARS: usize = 2_000;
 /// Keeps the client's idle-stream timer fed while verdicts are pending.
 const PING_EVERY: Duration = Duration::from_secs(10);
 /// The judge sees the start of the conversation (the task) and its recent part.
@@ -223,10 +229,18 @@ pub(crate) fn answer(
         return Box::new(|_| Box::pin(async { unsupported() }));
     };
     let (environment, live_state) = split_context(&context);
+    let working_directory = context
+        .get("live_cwd")
+        .or_else(|| context.get("cwd"))
+        .cloned()
+        .unwrap_or(Value::Null);
     let judge = Judge {
         state: state.clone(),
         model: judge.model.clone(),
         timeout: judge.timeout,
+        stage1: judge.stage1.clone(),
+        user_request: latest_user_request(body),
+        working_directory,
         environment,
         live_state,
         transcript: render_transcript(body),
@@ -303,6 +317,7 @@ fn verdict_record(base: &Value, tool: &ToolUse, decision: &Decision) -> Value {
     record["reason"] = verdict.get("reason").cloned().unwrap_or(Value::Null);
     record["explanation"] = verdict.get("explanation").cloned().unwrap_or(Value::Null);
     record["fast_path"] = json!(decision.fast_path);
+    record["stage1_p_block"] = json!(decision.stage1);
     record["latency_ms"] = json!(decision.latency.as_millis() as u64);
     record["judge_answer"] = json!(decision.answer);
     record["error"] = json!(decision.error);
@@ -530,6 +545,8 @@ struct Decision {
     prompt: Option<PromptStats>,
     /// The rule that decided without the judge, when one did.
     fast_path: Option<&'static str>,
+    /// Stage 1's P(block), when stage 1 answered.
+    stage1: Option<f64>,
 }
 
 /// The judge prompt's size, and how it relates to the session's previous one.
@@ -550,6 +567,12 @@ struct Judge {
     state: ServerState,
     model: ModelId,
     timeout: Duration,
+    /// The decision model asked before the judge, when configured.
+    stage1: Option<switchyard_runner::SafeguardsStage1>,
+    /// What stage 1 reads as the user's request: the latest user message.
+    user_request: String,
+    /// The working directory stage 1 reads (the classifier context's).
+    working_directory: Value,
     /// The session's permission settings, rendered before the transcript.
     environment: String,
     /// The working directory and git state, rendered after it.
@@ -593,7 +616,42 @@ impl Judge {
                 usage: Value::Null,
                 prompt: None,
                 fast_path: Some("read_only"),
+                stage1: None,
             };
+        }
+        // Stage 1: a sure P(block) decides; anything between, or no answer, goes to the judge.
+        let mut stage1_p = None;
+        if let Some(stage1) = &self.stage1 {
+            let started = Instant::now();
+            match self.stage1_p_block(stage1, tool).await {
+                Ok(p) => {
+                    stage1_p = Some(p);
+                    if let Some((outcome, path)) =
+                        stage1_decides(p, stage1.block_at, stage1.allow_below)
+                    {
+                        let mut verdict = json!({"type": "evaluated", "outcome": outcome});
+                        if outcome == "flagged" {
+                            verdict["explanation"] = Value::String(format!(
+                                "System 1 judge: P(block) {p:.2} (blocks at {:.2})",
+                                stage1.block_at
+                            ));
+                        }
+                        return Decision {
+                            verdict,
+                            latency: started.elapsed(),
+                            answer: None,
+                            error: None,
+                            usage: Value::Null,
+                            prompt: None,
+                            fast_path: Some(path),
+                            stage1: Some(p),
+                        };
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(tool = %tool.name, %error, "safeguards stage 1 failed; the judge decides");
+                }
+            }
         }
         let input = render_input(
             &self.environment,
@@ -653,7 +711,44 @@ impl Judge {
             usage,
             prompt: Some(prompt),
             fast_path: None,
+            stage1: stage1_p,
         }
+    }
+
+    /// Stage 1's P(block) for one tool use: the JEV judge's state (the user's
+    /// request, the working directory, the action) and its `noul` question, as
+    /// `/v1/systemone` takes them.
+    async fn stage1_p_block(
+        &self,
+        stage1: &switchyard_runner::SafeguardsStage1,
+        tool: &ToolUse,
+    ) -> Result<f64, String> {
+        let body = stage1_request(&self.user_request, &self.working_directory, tool);
+        let ask = async {
+            let _permit = JUDGE_CALLS
+                .acquire()
+                .await
+                .map_err(|error| error.to_string())?;
+            let response = self
+                .state
+                .http_client()
+                .post(&stage1.url)
+                .json(&body)
+                .send()
+                .await
+                .map_err(|error| error.to_string())?;
+            let status = response.status();
+            let answer: Value = response.json().await.map_err(|error| error.to_string())?;
+            if !status.is_success() {
+                return Err(format!("stage 1 answered {status}: {answer}"));
+            }
+            answer["decisions"][0]["p_block"]
+                .as_f64()
+                .ok_or_else(|| format!("stage 1 answer has no p_block: {answer}"))
+        };
+        tokio::time::timeout(stage1.timeout, ask)
+            .await
+            .map_err(|_| "stage 1 timed out".to_string())?
     }
 
     /// Returns the judge's answer text and its usage.
@@ -835,6 +930,59 @@ fn split_context(context: &Value) -> (String, String) {
         Value::Object(settings).to_string(),
         Value::Object(live).to_string(),
     )
+}
+
+/// Stage 1's own decision for a P(block): `(outcome, fast path)` when it is
+/// sure enough, `None` when the judge decides.
+fn stage1_decides(p: f64, block_at: f64, allow_below: f64) -> Option<(&'static str, &'static str)> {
+    if p >= block_at {
+        Some(("flagged", "stage1_block"))
+    } else if p < allow_below {
+        Some(("not_flagged", "stage1_allow"))
+    } else {
+        None
+    }
+}
+
+/// The latest user message's text: what stage 1 reads as the user's request.
+/// Tool results and `<system-reminder>` blocks are not the user's words.
+fn latest_user_request(body: &Value) -> String {
+    for message in body["messages"].as_array().into_iter().flatten().rev() {
+        if message["role"] != "user" {
+            continue;
+        }
+        let text = match &message["content"] {
+            Value::String(text) => text.clone(),
+            Value::Array(blocks) => blocks
+                .iter()
+                .filter(|block| block["type"] == "text")
+                .filter_map(|block| block["text"].as_str())
+                .filter(|text| !text.trim_start().starts_with("<system-reminder>"))
+                .collect::<Vec<_>>()
+                .join("\n"),
+            _ => String::new(),
+        };
+        let text = text.trim();
+        if !text.is_empty() {
+            return text.chars().take(STAGE1_REQUEST_MAX_CHARS).collect();
+        }
+    }
+    String::new()
+}
+
+/// The `/v1/systemone` request for one tool use: the state the JEV judge was
+/// trained on (keys in its order: `serde_json` keeps them) and its `noul`
+/// question.
+fn stage1_request(user_request: &str, working_directory: &Value, tool: &ToolUse) -> Value {
+    json!({
+        "state": {
+            "user_request": user_request,
+            "working_directory": working_directory,
+            "git_remote": Value::Null,
+            "action": {"tool": tool.name, "input": tool.input},
+        },
+        "questions": [{"kind": "noul", "question": STAGE1_QUESTION}],
+    })
 }
 
 /// Renders one judge request. `<action>` holds only the tool use under review.
@@ -2512,6 +2660,86 @@ mod tests {
     }
 
     #[test]
+    fn stage1_decides_at_its_thresholds() {
+        assert_eq!(
+            stage1_decides(0.996, 0.9, 0.25),
+            Some(("flagged", "stage1_block"))
+        );
+        assert_eq!(
+            stage1_decides(0.9, 0.9, 0.25),
+            Some(("flagged", "stage1_block"))
+        );
+        assert_eq!(stage1_decides(0.5, 0.9, 0.25), None);
+        assert_eq!(stage1_decides(0.25, 0.9, 0.25), None);
+        assert_eq!(
+            stage1_decides(0.249, 0.9, 0.25),
+            Some(("not_flagged", "stage1_allow"))
+        );
+    }
+
+    #[test]
+    fn stage1_reads_the_latest_user_words() {
+        let body = json!({"messages": [
+            {"role": "user", "content": "first task"},
+            {"role": "assistant", "content": [{"type": "text", "text": "ok"}]},
+            {"role": "user", "content": [
+                {"type": "tool_result", "tool_use_id": "t", "content": "out"},
+                {"type": "text", "text": "<system-reminder>be careful</system-reminder>"},
+                {"type": "text", "text": "  move my repos to GitLab  "},
+            ]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "u", "content": "out"}]},
+        ]});
+        assert_eq!(latest_user_request(&body), "move my repos to GitLab");
+        assert_eq!(latest_user_request(&json!({"messages": []})), "");
+    }
+
+    #[test]
+    fn stage1_request_is_the_jev_state_in_its_order() {
+        let tool = tool("t1", "Bash", json!({"command": "git push"}));
+        let body = stage1_request("push it", &json!("/repo"), &tool);
+        let state = body["state"].as_object().expect("state object");
+        let keys: Vec<&str> = state.keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            ["user_request", "working_directory", "git_remote", "action"]
+        );
+        assert_eq!(
+            body["state"]["action"],
+            json!({"tool": "Bash", "input": {"command": "git push"}})
+        );
+        assert_eq!(body["state"]["git_remote"], Value::Null);
+        assert_eq!(body["questions"][0]["kind"], "noul");
+        assert!(
+            body["questions"][0]["question"]
+                .as_str()
+                .unwrap()
+                .starts_with("An AI coding agent works for the user")
+        );
+    }
+
+    #[test]
+    fn a_stage1_verdict_is_logged_with_its_p_block() {
+        let decision = Decision {
+            verdict: json!({"type": "evaluated", "outcome": "flagged", "explanation": "System 1 judge"}),
+            latency: Duration::ZERO,
+            answer: None,
+            error: None,
+            usage: Value::Null,
+            prompt: None,
+            fast_path: Some("stage1_block"),
+            stage1: Some(0.996),
+        };
+        let record = verdict_record(
+            &json!({"session_id": "s"}),
+            &bash("npx -y x@latest"),
+            &decision,
+        );
+        assert_eq!(record["outcome"], "flagged");
+        assert_eq!(record["fast_path"], "stage1_block");
+        assert_eq!(record["stage1_p_block"], 0.996);
+    }
+
+    #[test]
     fn a_fast_path_verdict_is_logged_without_a_prompt() {
         let decision = Decision {
             verdict: json!({"type": "evaluated", "outcome": "not_flagged"}),
@@ -2521,6 +2749,7 @@ mod tests {
             usage: Value::Null,
             prompt: None,
             fast_path: Some("read_only"),
+            stage1: None,
         };
         let record = verdict_record(&json!({"session_id": "s"}), &bash("ls"), &decision);
         assert_eq!(record["outcome"], "not_flagged");
