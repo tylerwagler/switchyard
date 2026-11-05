@@ -70,6 +70,7 @@ impl MockUpstream {
             )
             .route("/v1/responses/compact", post(upstream_responses_auxiliary))
             .route("/future/provider/endpoint", post(upstream_fallback))
+            .route("/v1/systemone", post(upstream_systemone))
             .layer(DefaultBodyLimit::disable())
             .with_state(Arc::clone(&calls));
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -122,6 +123,16 @@ fn has_system_prompt(call: &Value, expected: &str) -> bool {
 async fn upstream_props(State(calls): State<Arc<Mutex<Vec<Value>>>>) -> Json<Value> {
     calls.lock().await.push(json!({"path": "/props"}));
     Json(json!({"default_generation_settings": {"n_ctx": 98_304}}))
+}
+
+/// A decision model: P(block) 0.97 for an action that runs `rm -rf`, else 0.12.
+async fn upstream_systemone(
+    State(calls): State<Arc<Mutex<Vec<Value>>>>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    calls.lock().await.push(body.clone());
+    let risky = body["state"]["action"].to_string().contains("rm -rf");
+    Json(json!({"decisions": [{"p_block": if risky { 0.97 } else { 0.12 }}]}))
 }
 
 async fn upstream_chat(
@@ -1205,6 +1216,132 @@ async fn safeguards_are_answered_here_and_never_reach_the_backend() -> TestResul
         assert_eq!(calls[1], calls[0], "safeguards changed the upstream body");
         calls.clear();
     }
+    Ok(())
+}
+
+/// A request of Claude Code's native auto-mode classifier: the security-monitor
+/// system prompt and a JSON-lines transcript ending in the action.
+fn native_classifier_body(command: &str, stage1: bool) -> Value {
+    let mut body = json!({
+        "model": "claude-sonnet-5-elytron",
+        "max_tokens": if stage1 { 64 } else { 8192 },
+        "system": [{"type": "text", "text": "You are a security monitor for autonomous AI coding agents."}],
+        "messages": [{"role": "user", "content": [
+            {"type": "text", "text": "<transcript>\n"},
+            {"type": "text", "text": "{\"user\":\"clean the build\"}\n"},
+            {"type": "text", "text": format!("{{\"Bash\":{}}}\n", json!(command))},
+            {"type": "text", "text": "</transcript>\n"},
+            {"type": "text", "text": "Respond with <severity>N</severity> ONLY."}
+        ]}],
+    });
+    if stage1 {
+        body["stop_sequences"] = json!(["</severity>"]);
+    }
+    body
+}
+
+#[tokio::test]
+async fn native_classifier_stage1_is_the_decision_model_and_stage2_the_judge() -> TestResult {
+    let upstream = MockUpstream::start().await?;
+    let config = |stage1_url: &str| {
+        format!(
+            r#"
+schema_version = 1
+[llm_clients.mock]
+format = "openai_chat"
+base_url = "{base_url}"
+max_retries = 0
+failure_cooldown_ms = 0
+[targets.main]
+id = "model/a"
+llm_client = "mock"
+[targets.judge]
+id = "model/judge"
+llm_client = "mock"
+[routes.main]
+id = "{ROUTE_MODEL}"
+type = "passthrough"
+target = "main"
+[routes.judge]
+id = "switchyard/safeguards-judge"
+type = "passthrough"
+target = "judge"
+[safeguards]
+judge_route = "judge"
+native_model = "claude-sonnet-5-elytron"
+[safeguards.stage1]
+url = "{stage1_url}"
+timeout_ms = 2000
+"#,
+            base_url = upstream.base_url,
+        )
+    };
+    let app = build_switchyard_router(load_test_config(&config(&format!(
+        "{}/systemone",
+        upstream.base_url
+    )))?);
+
+    // Stage 1: answered here as round(100 P(block)), stopped where the client asked.
+    for (command, severity) in [("rm -rf build", "97"), ("ls build", "12")] {
+        let response = send(
+            &app,
+            "POST",
+            "/v1/messages",
+            Some(native_classifier_body(command, true)),
+        )
+        .await?;
+        assert_eq!(response.status, StatusCode::OK, "{command}");
+        let message = response.json()?;
+        assert_eq!(
+            message["content"][0]["text"],
+            format!("<severity>{severity}"),
+            "{message}"
+        );
+        assert_eq!(message["stop_reason"], "stop_sequence");
+        assert_eq!(message["stop_sequence"], "</severity>");
+        assert_eq!(message["model"], "claude-sonnet-5-elytron");
+    }
+    let calls = upstream.calls.lock().await.clone();
+    assert_eq!(calls.len(), 2, "stage 1 reached a model: {calls:?}");
+    assert_eq!(
+        calls[0]["state"],
+        json!({"user_request": "clean the build", "working_directory": null, "git_remote": null,
+            "action": {"tool": "Bash", "input": {"command": "rm -rf build"}}})
+    );
+    assert_eq!(calls[0]["questions"][0]["kind"], "noul");
+
+    // Stage 2: the judge route, with Claude Code's own prompt.
+    let response = send(
+        &app,
+        "POST",
+        "/v1/messages",
+        Some(native_classifier_body("rm -rf build", false)),
+    )
+    .await?;
+    assert_eq!(response.status, StatusCode::OK);
+    assert_eq!(upstream.models().await, ["model/judge"]);
+    let calls = upstream.calls.lock().await.clone();
+    let judge_call = calls.last().ok_or("no judge call")?;
+    assert_eq!(judge_call["messages"][0]["role"], "system");
+    assert!(
+        judge_call["messages"][0]["content"]
+            .as_str()
+            .is_some_and(|text| text.starts_with("You are a security monitor")),
+        "{judge_call}"
+    );
+
+    // A decision model that does not answer: stage 1 escalates (severity 50), so the judge decides.
+    let app = build_switchyard_router(load_test_config(&config(
+        "http://127.0.0.1:9/v1/systemone",
+    ))?);
+    let response = send(
+        &app,
+        "POST",
+        "/v1/messages",
+        Some(native_classifier_body("ls", true)),
+    )
+    .await?;
+    assert_eq!(response.json()?["content"][0]["text"], "<severity>50");
     Ok(())
 }
 

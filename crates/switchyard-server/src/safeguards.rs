@@ -724,31 +724,7 @@ impl Judge {
         tool: &ToolUse,
     ) -> Result<f64, String> {
         let body = stage1_request(&self.user_request, &self.working_directory, tool);
-        let ask = async {
-            let _permit = JUDGE_CALLS
-                .acquire()
-                .await
-                .map_err(|error| error.to_string())?;
-            let response = self
-                .state
-                .http_client()
-                .post(&stage1.url)
-                .json(&body)
-                .send()
-                .await
-                .map_err(|error| error.to_string())?;
-            let status = response.status();
-            let answer: Value = response.json().await.map_err(|error| error.to_string())?;
-            if !status.is_success() {
-                return Err(format!("stage 1 answered {status}: {answer}"));
-            }
-            answer["decisions"][0]["p_block"]
-                .as_f64()
-                .ok_or_else(|| format!("stage 1 answer has no p_block: {answer}"))
-        };
-        tokio::time::timeout(stage1.timeout, ask)
-            .await
-            .map_err(|_| "stage 1 timed out".to_string())?
+        ask_stage1(&self.state, stage1, &body).await
     }
 
     /// Returns the judge's answer text and its usage.
@@ -934,6 +910,39 @@ fn split_context(context: &Value) -> (String, String) {
 
 /// Stage 1's own decision for a P(block): `(outcome, fast path)` when it is
 /// sure enough, `None` when the judge decides.
+/// One `/v1/systemone` answer's P(block), within `stage1`'s time and the judge
+/// calls' concurrency.
+async fn ask_stage1(
+    state: &ServerState,
+    stage1: &switchyard_runner::SafeguardsStage1,
+    body: &Value,
+) -> Result<f64, String> {
+    let ask = async {
+        let _permit = JUDGE_CALLS
+            .acquire()
+            .await
+            .map_err(|error| error.to_string())?;
+        let response = state
+            .http_client()
+            .post(&stage1.url)
+            .json(body)
+            .send()
+            .await
+            .map_err(|error| error.to_string())?;
+        let status = response.status();
+        let answer: Value = response.json().await.map_err(|error| error.to_string())?;
+        if !status.is_success() {
+            return Err(format!("stage 1 answered {status}: {answer}"));
+        }
+        answer["decisions"][0]["p_block"]
+            .as_f64()
+            .ok_or_else(|| format!("stage 1 answer has no p_block: {answer}"))
+    };
+    tokio::time::timeout(stage1.timeout, ask)
+        .await
+        .map_err(|_| "stage 1 timed out".to_string())?
+}
+
 fn stage1_decides(p: f64, block_at: f64, allow_below: f64) -> Option<(&'static str, &'static str)> {
     if p >= block_at {
         Some(("flagged", "stage1_block"))
@@ -2076,6 +2085,215 @@ fn git_config_reads(args: &[String]) -> bool {
     reads || matches!(names.as_slice(), [name] if name.contains('.'))
 }
 
+/* ---- Claude Code's native two-stage auto-mode classifier -------------------------------------------------- */
+// With `CLAUDE_CODE_AUTO_MODE_SERVER=0` Claude Code classifies each auto-mode tool use itself, as two plain
+// `/v1/messages` calls to `CLAUDE_CODE_AUTO_MODE_MODEL` (request class `auxiliary`, no tools, not streamed). An
+// id containing `claude-sonnet-5` keeps it on its severity protocol: stage 1 (`max_tokens` 64, stop
+// `</severity>`) answers `<severity>N`, N in 0..=100, and the client escalates at 26; stage 2 (no stop) reasons
+// in `<thinking>` and answers `<severity>N</severity>` (+ `<category>`), the client blocking at 36. Both carry
+// the client's own ~140 k-char security-monitor prompt and a compact JSON-lines `<transcript>` whose last line
+// is the action under review (measured on Claude Code 2.1.318).
+
+/// The stop sequence that marks a native stage-1 request.
+const NATIVE_STAGE1_STOP: &str = "</severity>";
+/// Stage 1's answer when the decision model gives none: above the client's escalation line (26), so stage 2,
+/// the judge, decides.
+const NATIVE_STAGE1_FALLBACK_SEVERITY: u32 = 50;
+
+/// Which stage of Claude Code's native classifier a request is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NativeStage {
+    /// The fast severity score, answered here from `[safeguards.stage1]`.
+    One,
+    /// The careful pass (and stage 1 with no decision model, or streamed), served on the judge route.
+    Two,
+}
+
+/// The native classifier stage of `body`, when its model is `[safeguards] native_model`.
+pub(crate) fn native_stage(state: &ServerState, body: &Value) -> Option<NativeStage> {
+    let judge = state.runner.safeguards()?;
+    let native = judge.native_model.as_deref()?;
+    if body.get("model").and_then(Value::as_str) != Some(native) {
+        return None;
+    }
+    Some(native_stage_of(body, judge.stage1.is_some()))
+}
+
+/// The stage of a native classifier request: stage 1 by its `</severity>` stop, answered here only when a
+/// decision model is configured and the reply is not streamed.
+fn native_stage_of(body: &Value, has_stage1: bool) -> NativeStage {
+    let stage1 = body["stop_sequences"]
+        .as_array()
+        .is_some_and(|stops| stops.iter().any(|stop| stop == NATIVE_STAGE1_STOP));
+    let streaming = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    if stage1 && has_stage1 && !streaming {
+        NativeStage::One
+    } else {
+        NativeStage::Two
+    }
+}
+
+/// Points a native classifier request at the judge route: the judge reads Claude Code's own prompt and answers
+/// in its format.
+pub(crate) fn native_to_judge(state: &ServerState, body: &mut Value) {
+    if let Some(judge) = state.runner.safeguards() {
+        body["model"] = Value::String(judge.model.as_str().to_string());
+    }
+}
+
+/// Claude Code's severity for a P(block): round(100 P).
+fn native_severity(p: f64) -> u32 {
+    (p.clamp(0.0, 1.0) * 100.0).round() as u32
+}
+
+/// Native stage 1: the decision model's P(block) for the transcript's action as `<severity>N`, stopped at
+/// `</severity>` as the client asked. No answer (no action, a failed or slow decision model) is
+/// `NATIVE_STAGE1_FALLBACK_SEVERITY`: stage 2 decides.
+pub(crate) async fn native_stage1(
+    state: &ServerState,
+    body: &Value,
+    session_id: Option<String>,
+) -> Value {
+    let started = Instant::now();
+    let model = body
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let stage1 = state
+        .runner
+        .safeguards()
+        .and_then(|judge| judge.stage1.clone());
+    let action = native_transcript_action(body);
+    let (severity, p_block, error) = match (&stage1, &action) {
+        (Some(stage1), Some((user_request, tool))) => {
+            let request = stage1_request(user_request, &Value::Null, tool);
+            match ask_stage1(state, stage1, &request).await {
+                Ok(p) => (native_severity(p), Some(p), None),
+                Err(error) => (NATIVE_STAGE1_FALLBACK_SEVERITY, None, Some(error)),
+            }
+        }
+        (None, _) => (
+            NATIVE_STAGE1_FALLBACK_SEVERITY,
+            None,
+            Some("no [safeguards.stage1]".to_string()),
+        ),
+        (_, None) => (
+            NATIVE_STAGE1_FALLBACK_SEVERITY,
+            None,
+            Some("no action in the transcript".to_string()),
+        ),
+    };
+    if let Some(error) = &error {
+        tracing::warn!(%error, severity, "native classifier stage 1 answered the fallback severity");
+    }
+    if let Some(log) = state.safeguards_verdicts.clone() {
+        log.append(json!({
+            "kind": "native_stage1",
+            "session_id": session_id,
+            "tool": action.as_ref().map(|(_, tool)| tool.name.clone()),
+            "p_block": p_block,
+            "severity": severity,
+            "error": error,
+            "ms": started.elapsed().as_millis() as u64,
+        }));
+    }
+    let nanos = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos())
+        .unwrap_or_default();
+    json!({
+        "id": format!("msg_native_{nanos:x}"),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": [{"type": "text", "text": format!("<severity>{severity}")}],
+        "stop_reason": "stop_sequence",
+        "stop_sequence": NATIVE_STAGE1_STOP,
+        "usage": {"input_tokens": 0, "output_tokens": 0},
+    })
+}
+
+/// The user's latest request and the action under review from a native classifier request's `<transcript>`:
+/// compact JSON lines, `{"user": ...}` and `{"<Tool>": <input>}`, the last tool line after the latest user line
+/// the action. Bash's input is its command string, given to the decision model as `{"command": ...}` (the shape
+/// it was trained on); other tools' compact inputs pass as they are.
+fn native_transcript_action(body: &Value) -> Option<(String, ToolUse)> {
+    let message = body["messages"].as_array()?.last()?;
+    let text: String = match &message["content"] {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect(),
+        _ => return None,
+    };
+    let start = text.find("<transcript>")? + "<transcript>".len();
+    let end = start + text[start..].find("</transcript>")?;
+    let mut user_request = String::new();
+    let mut action: Option<(String, Value)> = None;
+    for line in text[start..end].lines() {
+        let Ok(Value::Object(entry)) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        let Some((key, value)) = entry.into_iter().next() else {
+            continue;
+        };
+        if key == "user" {
+            user_request = match value {
+                Value::String(text) => text,
+                other => other.to_string(),
+            };
+            action = None;
+        } else {
+            action = Some((key, value));
+        }
+    }
+    let (name, value) = action?;
+    let input = match value {
+        Value::String(command) if name == "Bash" => json!({"command": command}),
+        other => other,
+    };
+    Some((
+        user_request
+            .chars()
+            .take(STAGE1_REQUEST_MAX_CHARS)
+            .collect(),
+        ToolUse {
+            id: "native".to_string(),
+            name,
+            input,
+        },
+    ))
+}
+
+/// The text inside the last `<name>...</name>` of `text` (an unclosed last tag runs to the end).
+fn last_tag<'a>(text: &'a str, name: &str) -> Option<&'a str> {
+    let open = format!("<{name}>");
+    let from = text.rfind(&open)? + open.len();
+    let rest = &text[from..];
+    let to = rest.find(&format!("</{name}>")).unwrap_or(rest.len());
+    Some(rest[..to].trim())
+}
+
+/// Logs native stage 2's verdict (the judge's `<severity>` and `<category>`) to the verdict log.
+pub(crate) fn native_stage2_tap(
+    state: &ServerState,
+    session_id: Option<String>,
+) -> Option<TextTap> {
+    let log = state.safeguards_verdicts.clone()?;
+    let started = Instant::now();
+    Some(Box::new(move |reply: String| {
+        log.append(json!({
+            "kind": "native_stage2",
+            "session_id": session_id,
+            "severity": last_tag(&reply, "severity").and_then(|n| n.parse::<u32>().ok()),
+            "category": last_tag(&reply, "category"),
+            "ms": started.elapsed().as_millis() as u64,
+        }));
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use futures_util::stream;
@@ -2117,6 +2335,78 @@ mod tests {
         let mut body = json!({"model": "m"});
         assert_eq!(take_request(&mut body), None);
         assert_eq!(body, json!({"model": "m"}));
+    }
+
+    #[test]
+    fn native_stage_is_one_only_for_an_unstreamed_severity_stop_with_a_decision_model() {
+        let stage1 = json!({"stop_sequences": ["</severity>"]});
+        assert_eq!(native_stage_of(&stage1, true), NativeStage::One);
+        assert_eq!(native_stage_of(&stage1, false), NativeStage::Two);
+        let streamed = json!({"stop_sequences": ["</severity>"], "stream": true});
+        assert_eq!(native_stage_of(&streamed, true), NativeStage::Two);
+        assert_eq!(
+            native_stage_of(&json!({"max_tokens": 8192}), true),
+            NativeStage::Two
+        );
+    }
+
+    #[test]
+    fn native_severity_is_round_100_p() {
+        assert_eq!(native_severity(0.0), 0);
+        assert_eq!(native_severity(0.25), 25);
+        assert_eq!(native_severity(0.255), 26);
+        assert_eq!(native_severity(1.0), 100);
+        assert_eq!(native_severity(1.7), 100);
+        assert_eq!(native_severity(-0.2), 0);
+    }
+
+    fn transcript(lines: &[&str]) -> Value {
+        let mut blocks = vec![json!({"type": "text", "text": "<transcript>\n"})];
+        blocks.extend(
+            lines
+                .iter()
+                .map(|line| json!({"type": "text", "text": format!("{line}\n")})),
+        );
+        blocks.push(json!({"type": "text", "text": "</transcript>\nStage 1 instruction"}));
+        json!({"messages": [{"role": "user", "content": "CLAUDE.md"}, {"role": "user", "content": blocks}]})
+    }
+
+    #[test]
+    fn native_action_is_the_last_tool_line_after_the_latest_user_line() {
+        let (user, tool) = native_transcript_action(&transcript(&[
+            r#"{"user":"first"}"#,
+            r#"{"Bash":"ls"}"#,
+            r#"{"user":"fetch the data"}"#,
+            "not json",
+            r#"{"WebFetch":"https://example.com/data: summarize"}"#,
+        ]))
+        .expect("an action");
+        assert_eq!(user, "fetch the data");
+        assert_eq!(tool.name, "WebFetch");
+        assert_eq!(tool.input, json!("https://example.com/data: summarize"));
+        let (_, bash) =
+            native_transcript_action(&transcript(&[r#"{"user":"x"}"#, r#"{"Bash":"git push"}"#]))
+                .expect("an action");
+        assert_eq!(bash.input, json!({"command": "git push"}));
+        assert!(
+            native_transcript_action(&transcript(&[r#"{"Bash":"ls"}"#, r#"{"user":"thanks"}"#]))
+                .is_none()
+        );
+        assert!(
+            native_transcript_action(
+                &json!({"messages": [{"role": "user", "content": "no transcript"}]})
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn last_tag_reads_the_judges_severity_and_category() {
+        let reply = "<thinking>a <severity>9</severity> in thought</thinking><severity>80</severity><category>Data Exfiltration</category>";
+        assert_eq!(last_tag(reply, "severity"), Some("80"));
+        assert_eq!(last_tag(reply, "category"), Some("Data Exfiltration"));
+        assert_eq!(last_tag("<severity>12", "severity"), Some("12"));
+        assert_eq!(last_tag("none", "severity"), None);
     }
 
     #[tokio::test]

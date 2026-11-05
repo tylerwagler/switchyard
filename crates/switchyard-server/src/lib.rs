@@ -1237,6 +1237,16 @@ async fn handle_llm_request(
     wire_format: WireFormat,
     routing_log_context: Option<routing_log::RoutingLogContext>,
 ) -> Response {
+    // Claude Code's native two-stage auto-mode classifier (`[safeguards] native_model`): stage 2 goes to the
+    // judge route, decided here so the attribution strip below follows that route.
+    let native = if wire_format == WireFormat::AnthropicMessages {
+        safeguards::native_stage(&state, &body)
+    } else {
+        None
+    };
+    if native == Some(safeguards::NativeStage::Two) {
+        safeguards::native_to_judge(&state, &mut body);
+    }
     // Claude Code's attribution block: metered first, then removed when the
     // route forwards to backends that would only see it as prompt text.
     if wire_format == WireFormat::AnthropicMessages {
@@ -1252,6 +1262,11 @@ async fn handle_llm_request(
             attribution::strip(&mut body);
         }
     }
+    // Native stage 1 is answered here, from the decision model.
+    if native == Some(safeguards::NativeStage::One) {
+        let session_id = metadata.session_id.clone();
+        return Json(safeguards::native_stage1(&state, &body, session_id).await).into_response();
+    }
     let (mut safeguards, classifier_tap) = if wire_format == WireFormat::AnthropicMessages {
         let session_id = metadata.session_id.clone();
         (
@@ -1264,7 +1279,11 @@ async fn handle_llm_request(
                     metadata.correlation_id.clone(),
                 )
             }),
-            safeguards::client_classifier_tap(&state, &body, session_id),
+            if native == Some(safeguards::NativeStage::Two) {
+                safeguards::native_stage2_tap(&state, session_id)
+            } else {
+                safeguards::client_classifier_tap(&state, &body, session_id)
+            },
         )
     } else {
         (None, None)

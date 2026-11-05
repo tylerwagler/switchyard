@@ -191,6 +191,8 @@ struct SafeguardsConfig {
     verdict_log: Option<std::path::PathBuf>,
     #[serde(default)]
     stage1: Option<SafeguardsStage1Config>,
+    #[serde(default)]
+    native_model: Option<String>,
 }
 
 /// `[safeguards.stage1]`: a decision model asked before the judge (a System 1
@@ -235,6 +237,11 @@ pub struct SafeguardsJudge {
     pub verdict_log: Option<std::path::PathBuf>,
     /// The decision model asked before the judge, when configured.
     pub stage1: Option<SafeguardsStage1>,
+    /// The model id this gate answers as Claude Code's native two-stage auto-mode classifier
+    /// (`CLAUDE_CODE_AUTO_MODE_SERVER=0`, `CLAUDE_CODE_AUTO_MODE_MODEL` = this id): stage 1 from
+    /// `stage1` as `<severity>N`, stage 2 on the judge route. An id containing `claude-sonnet-5`
+    /// keeps Claude Code on its severity protocol.
+    pub native_model: Option<String>,
 }
 
 /// Opt-in hosted web search: serves Claude Code's server-side `web_search` tool
@@ -1038,6 +1045,7 @@ impl DeploymentConfig {
                     shadow_log: config.shadow_log,
                     verdict_log: config.verdict_log,
                     stage1,
+                    native_model: config.native_model,
                 })
             }
         };
