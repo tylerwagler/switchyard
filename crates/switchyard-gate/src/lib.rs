@@ -159,13 +159,62 @@ async fn check(State(gate): State<Arc<Gate>>, mut request: Request, next: Next) 
         request.extensions_mut().insert(sink);
     }
 
-    if path == "/v1/models" {
+    let models = path == "/v1/models";
+    if models {
         // Callers only see the chat models they can use right now: no search, embeddings
         // or rerank backends, and nothing whose upstream is down.
         *request.uri_mut() = http::Uri::from_static("/v1/models?available=true");
     }
     strip_caller_headers(request.headers_mut());
-    next.run(request).await
+    let response = next.run(request).await;
+    if models {
+        return unlist_internal_models(response).await;
+    }
+    response
+}
+
+/// Roles that serve machines, not people: bots (Teams) and the safeguards judge. Their
+/// routes still answer when called by id; they are only left out of `/v1/models`.
+const UNLISTED_ROLES: [&str; 2] = ["bot", "judge"];
+
+/// Largest `/v1/models` body the gate will rewrite; anything bigger passes through as is.
+const MODELS_BODY_LIMIT: usize = 1 << 20;
+
+/// Drops models whose `role` is in [`UNLISTED_ROLES`] from a successful JSON model list.
+/// Any other response, or one that does not parse, is passed through unchanged.
+async fn unlist_internal_models(response: Response) -> Response {
+    if response.status() != StatusCode::OK {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    let Ok(bytes) = axum::body::to_bytes(body, MODELS_BODY_LIMIT).await else {
+        tracing::warn!("gate could not read the /v1/models body; returning it empty");
+        return refuse_body(parts);
+    };
+    let Some(filtered) = filter_model_list(&bytes) else {
+        return Response::from_parts(parts, Body::from(bytes));
+    };
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, Body::from(filtered))
+}
+
+fn refuse_body(mut parts: http::response::Parts) -> Response {
+    parts.status = StatusCode::BAD_GATEWAY;
+    parts.headers.remove(header::CONTENT_LENGTH);
+    Response::from_parts(parts, Body::empty())
+}
+
+/// The model list without unlisted roles, or `None` when `bytes` is not a model list.
+fn filter_model_list(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut list: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let data = list.get_mut("data")?.as_array_mut()?;
+    data.retain(|model| {
+        !model
+            .get("role")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|role| UNLISTED_ROLES.contains(&role))
+    });
+    serde_json::to_vec(&list).ok()
 }
 
 /// Monitoring endpoints a dashboard in the same container (pulsar-gui) may read without a key.
@@ -406,6 +455,45 @@ mod tests {
             complete,
             client: None,
         }
+    }
+
+    #[test]
+    fn model_list_leaves_out_bot_and_judge_roles() {
+        let list = json!({"object": "list", "data": [
+            {"id": "qwen", "role": "main"},
+            {"id": "gemma", "role": "small"},
+            {"id": "safeguards-judge", "role": "judge"},
+            {"id": "ferret", "role": "bot"},
+            {"id": "no-role"},
+        ]});
+        let out = filter_model_list(&serde_json::to_vec(&list).unwrap()).unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let ids: Vec<&str> = out["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["qwen", "gemma", "no-role"]);
+        assert_eq!(out["object"], "list");
+    }
+
+    #[test]
+    fn model_list_filter_ignores_other_bodies() {
+        assert!(filter_model_list(b"not json").is_none());
+        assert!(filter_model_list(br#"{"error": "x"}"#).is_none());
+    }
+
+    #[tokio::test]
+    async fn unlisting_passes_non_ok_responses_through() {
+        let response = Response::builder()
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+            .body(Body::from("down"))
+            .unwrap();
+        let out = unlist_internal_models(response).await;
+        assert_eq!(out.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(out.into_body(), 1024).await.unwrap();
+        assert_eq!(&body[..], b"down");
     }
 
     #[test]
