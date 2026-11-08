@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
+use switchyard_gate::access::AccessRules;
 use switchyard_gate::keys::KeyStore;
 use switchyard_gate::{Gate, layer};
 use switchyard_server::config::load_server_state;
@@ -50,6 +51,11 @@ struct Args {
     /// Valkey URL for quota counters and the usage stream.
     #[arg(long, env = "GATE_VALKEY_URL", hide_env_values = true)]
     valkey_url: String,
+
+    /// TOML file of per-route access rules (which portal users or roles may call a route).
+    /// Without it every route is open to every active key.
+    #[arg(long, env = "GATE_ACCESS_FILE", value_name = "PATH")]
+    access: Option<PathBuf>,
 }
 
 #[tokio::main(flavor = "multi_thread")]
@@ -71,6 +77,17 @@ async fn main() -> ExitCode {
 
 async fn run(args: Args) -> Result<(), String> {
     let state = load_server_state(&args.config).map_err(|e| e.to_string())?;
+    let access = match &args.access {
+        Some(path) => AccessRules::load(path)?,
+        None => AccessRules::default(),
+    };
+    access.validate(
+        &state.route_upstreams(),
+        state.default_route_id().as_deref(),
+    )?;
+    if !access.is_empty() {
+        eprintln!("access OK: {} restricted route(s)", access.len());
+    }
     let options = ServerRunOptions {
         addr: SocketAddr::new(args.host, args.port),
         backlog: DEFAULT_LISTEN_BACKLOG,
@@ -91,6 +108,7 @@ async fn run(args: Args) -> Result<(), String> {
     let gate = Arc::new(Gate {
         keys: KeyStore::new(args.database_url),
         valkey,
+        access,
     });
     run_server_with(state, options, |router| layer(router, gate))
         .await

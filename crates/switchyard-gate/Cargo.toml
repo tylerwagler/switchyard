@@ -17,12 +17,14 @@ http.workspace = true
 humantime = "2.4"
 parking_lot.workspace = true
 redis = { version = "1.7", default-features = false, features = ["tokio-comp", "connection-manager"] }
+serde.workspace = true
 serde_json.workspace = true
 sha2 = "0.11"
 switchyard-protocol.workspace = true
 switchyard-server.workspace = true
 tokio.workspace = true
 tokio-postgres = "0.7"
+toml = "1.1"
 tracing.workspace = true
 
 [dev-dependencies]

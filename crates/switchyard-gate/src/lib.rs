@@ -9,6 +9,7 @@
 //! against the user's quotas and carry a [`UsageSink`] that records their tokens once
 //! the response ends. Caller credentials are removed before the router sees the request.
 
+pub mod access;
 pub mod keys;
 pub mod quota;
 
@@ -25,6 +26,7 @@ use redis::aio::ConnectionManager;
 use serde_json::json;
 use switchyard_server::{UsageReport, UsageSink};
 
+use crate::access::AccessRules;
 use crate::keys::{Identity, KeyStore};
 use crate::quota::UsageEvent;
 
@@ -38,6 +40,25 @@ const BYTES_PER_TOKEN: u64 = 4;
 pub struct Gate {
     pub keys: KeyStore,
     pub valkey: ConnectionManager,
+    /// Per-route access rules; empty means every route is open to every active key.
+    pub access: AccessRules,
+}
+
+/// Largest request body the gate buffers to read the requested model when routes are
+/// restricted. Larger bodies are refused rather than passed through unchecked.
+const REQUEST_BODY_LIMIT: usize = 64 << 20;
+
+/// Whether a request path names its model in a JSON body (`model`), so access rules apply.
+fn names_model_in_body(path: &str) -> bool {
+    ["/v1/messages", "/v1/chat/completions", "/v1/responses"]
+        .iter()
+        .any(|prefix| path == *prefix || path.starts_with(&format!("{prefix}/")))
+}
+
+/// The `model` field of a JSON request body, if it has one.
+fn requested_model(body: &[u8]) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_slice(body).ok()?;
+    value.get("model")?.as_str().map(str::to_string)
 }
 
 /// Wraps `router` so every request passes through the gate.
@@ -91,6 +112,8 @@ async fn check(State(gate): State<Arc<Gate>>, mut request: Request, next: Next) 
             );
         }
     };
+    // The caller's own key, before a forwarder (Open WebUI) is swapped for its user.
+    let forwarder = identity.trusted_forwarder;
     let (identity, via) = match forwarded_email(request.headers(), &identity) {
         None => (identity, "key"),
         Some(email) => match gate.keys.by_email(&email).await {
@@ -127,6 +150,35 @@ async fn check(State(gate): State<Arc<Gate>>, mut request: Request, next: Next) 
             Kind::Permission,
             "admin access required",
         );
+    }
+
+    // Restricted routes: read the requested model and refuse callers the rules don't name,
+    // before any quota is spent or the request reaches the route's upstream. The check uses
+    // the forwarded user for Open WebUI, not the forwarder's own key.
+    if !gate.access.is_empty() && names_model_in_body(&path) {
+        let (parts, body) = request.into_parts();
+        let Ok(bytes) = axum::body::to_bytes(body, REQUEST_BODY_LIMIT).await else {
+            return refuse(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                Kind::Permission,
+                "request body too large",
+            );
+        };
+        if let Some(model) = requested_model(&bytes)
+            && !gate.access.allows(&identity, &model)
+        {
+            tracing::info!(
+                model,
+                user = identity.user_id,
+                "gate refused a restricted route"
+            );
+            return refuse(
+                StatusCode::FORBIDDEN,
+                Kind::Permission,
+                "this model is restricted",
+            );
+        }
+        request = Request::from_parts(parts, Body::from(bytes));
     }
 
     if access == Access::Metered {
@@ -168,7 +220,11 @@ async fn check(State(gate): State<Arc<Gate>>, mut request: Request, next: Next) 
     strip_caller_headers(request.headers_mut());
     let response = next.run(request).await;
     if models {
-        return present_model_list(response).await;
+        // A trusted forwarder (Open WebUI) sees restricted routes too: it caches one model
+        // list for all its users and hides models per user itself, and every call it makes
+        // is still checked against the forwarded user above.
+        let visible = |model: &str| forwarder || gate.access.allows(&identity, model);
+        return present_model_list(response, visible).await;
     }
     response
 }
@@ -182,7 +238,7 @@ const MODELS_BODY_LIMIT: usize = 1 << 20;
 
 /// Shapes a successful JSON model list for people's clients (see [`shape_model_list`]).
 /// Any other response, or one that does not parse, is passed through unchanged.
-async fn present_model_list(response: Response) -> Response {
+async fn present_model_list(response: Response, visible: impl Fn(&str) -> bool) -> Response {
     if response.status() != StatusCode::OK {
         return response;
     }
@@ -191,7 +247,7 @@ async fn present_model_list(response: Response) -> Response {
         tracing::warn!("gate could not read the /v1/models body; returning it empty");
         return refuse_body(parts);
     };
-    let Some(filtered) = shape_model_list(&bytes) else {
+    let Some(filtered) = shape_model_list(&bytes, visible) else {
         return Response::from_parts(parts, Body::from(bytes));
     };
     parts.headers.remove(header::CONTENT_LENGTH);
@@ -204,18 +260,23 @@ fn refuse_body(mut parts: http::response::Parts) -> Response {
     Response::from_parts(parts, Body::empty())
 }
 
-/// The model list without unlisted roles, with each model's `display_name` also sent as
-/// `name` (the field OpenAI-style clients such as Open WebUI show; they ignore
-/// `display_name`) unless the model already has a `name`. `None` when `bytes` is not a
-/// model list.
-fn shape_model_list(bytes: &[u8]) -> Option<Vec<u8>> {
+/// The model list without unlisted roles or models `visible` rejects for this caller, with
+/// each model's `display_name` also sent as `name` (the field OpenAI-style clients such as
+/// Open WebUI show; they ignore `display_name`) unless the model already has a `name`.
+/// `None` when `bytes` is not a model list.
+fn shape_model_list(bytes: &[u8], visible: impl Fn(&str) -> bool) -> Option<Vec<u8>> {
     let mut list: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     let data = list.get_mut("data")?.as_array_mut()?;
     data.retain(|model| {
-        !model
+        let unlisted_role = model
             .get("role")
             .and_then(serde_json::Value::as_str)
-            .is_some_and(|role| UNLISTED_ROLES.contains(&role))
+            .is_some_and(|role| UNLISTED_ROLES.contains(&role));
+        let hidden = model
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| !visible(id));
+        !unlisted_role && !hidden
     });
     for model in data.iter_mut() {
         let Some(model) = model.as_object_mut() else {
@@ -484,7 +545,7 @@ mod tests {
             {"id": "ferret", "role": "bot"},
             {"id": "no-role"},
         ]});
-        let out = shape_model_list(&serde_json::to_vec(&list).unwrap()).unwrap();
+        let out = shape_model_list(&serde_json::to_vec(&list).unwrap(), |_| true).unwrap();
         let out: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let ids: Vec<&str> = out["data"]
             .as_array()
@@ -498,8 +559,8 @@ mod tests {
 
     #[test]
     fn model_list_filter_ignores_other_bodies() {
-        assert!(shape_model_list(b"not json").is_none());
-        assert!(shape_model_list(br#"{"error": "x"}"#).is_none());
+        assert!(shape_model_list(b"not json", |_| true).is_none());
+        assert!(shape_model_list(br#"{"error": "x"}"#, |_| true).is_none());
     }
 
     #[test]
@@ -509,7 +570,7 @@ mod tests {
             {"id": "named", "display_name": "Pretty", "name": "Already named"},
             {"id": "plain"},
         ]});
-        let out = shape_model_list(&serde_json::to_vec(&list).unwrap()).unwrap();
+        let out = shape_model_list(&serde_json::to_vec(&list).unwrap(), |_| true).unwrap();
         let out: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(out["data"][0]["name"], "Qwen 3.8 Flash-Next");
         assert_eq!(out["data"][0]["display_name"], "Qwen 3.8 Flash-Next");
@@ -523,10 +584,49 @@ mod tests {
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .body(Body::from("down"))
             .unwrap();
-        let out = present_model_list(response).await;
+        let out = present_model_list(response, |_| true).await;
         assert_eq!(out.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = axum::body::to_bytes(out.into_body(), 1024).await.unwrap();
         assert_eq!(&body[..], b"down");
+    }
+
+    #[test]
+    fn model_list_hides_routes_the_caller_may_not_use() {
+        let list = json!({"object": "list", "data": [
+            {"id": "qwen", "role": "main"},
+            {"id": "deepseek", "role": "personal"},
+        ]});
+        let bytes = serde_json::to_vec(&list).unwrap();
+        let out = shape_model_list(&bytes, |id| id != "deepseek").unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let ids: Vec<&str> = out["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["qwen"]);
+    }
+
+    #[test]
+    fn model_carrying_paths_are_recognised() {
+        assert!(names_model_in_body("/v1/messages"));
+        assert!(names_model_in_body("/v1/messages/count_tokens"));
+        assert!(names_model_in_body("/v1/chat/completions"));
+        assert!(names_model_in_body("/v1/responses"));
+        assert!(!names_model_in_body("/v1/models"));
+        assert!(!names_model_in_body("/v1/messagesX"));
+        assert!(!names_model_in_body("/v1/embeddings"));
+    }
+
+    #[test]
+    fn requested_model_reads_the_body() {
+        assert_eq!(
+            requested_model(br#"{"model": "deepseek", "messages": []}"#).as_deref(),
+            Some("deepseek")
+        );
+        assert_eq!(requested_model(br#"{"messages": []}"#), None);
+        assert_eq!(requested_model(b"not json"), None);
     }
 
     #[test]

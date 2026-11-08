@@ -267,6 +267,27 @@ impl SharedRoutingLog {
 }
 
 impl ServerState {
+    /// Every configured route id with the upstream base URLs that serve it, for front ends
+    /// (such as switchyard-gate) that check their own rules against the configured routes.
+    pub fn route_upstreams(&self) -> Vec<(String, Vec<String>)> {
+        self.runner
+            .models()
+            .map(|model| {
+                (
+                    model.id.as_str().to_string(),
+                    model.base_urls.iter().map(|url| url.to_string()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    /// The configured default route id, which answers models no route names.
+    pub fn default_route_id(&self) -> Option<String> {
+        self.runner
+            .default_route()
+            .map(|id| id.as_str().to_string())
+    }
+
     /// Creates HTTP-server state around an already configured runner.
     pub fn from_runner(runner: Runner) -> ServerResult<Self> {
         let metrics = metrics::registry().map_err(ServerError::new)?;
