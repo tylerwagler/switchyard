@@ -2847,6 +2847,7 @@ dependencies = [
  "serde_json",
  "shlex",
  "switchyard-protocol",
+ "switchyard-translation",
  "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
@@ -2908,6 +2909,7 @@ name = "switchyard-node"
 version = "0.3.0"
 dependencies = [
  "futures",
+ "http",
  "napi",
  "napi-build",
  "napi-derive",
@@ -2916,6 +2918,9 @@ dependencies = [
  "serde_json",
  "switchyard-libsy",
  "switchyard-protocol",
+ "switchyard-runner",
+ "switchyard-translation",
+ "tokio",
 ]
 
 [[package]]
@@ -2981,6 +2986,7 @@ version = "0.3.0"
 dependencies = [
  "async-trait",
  "futures-util",
+ "parking_lot",
  "prefill-router",
  "reqwest",
  "serde",
@@ -3069,6 +3075,7 @@ dependencies = [
  "async-stream",
  "base64",
  "futures",
+ "http",
  "pretty_assertions",
  "serde",
  "serde_json",

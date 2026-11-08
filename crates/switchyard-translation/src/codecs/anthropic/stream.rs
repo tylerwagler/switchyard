@@ -21,6 +21,31 @@ impl StreamCodec for AnthropicMessagesStreamCodec {
         WireFormat::AnthropicMessages.into()
     }
 
+    fn is_terminal_event(&self, event: &Value) -> bool {
+        match event.get("type").and_then(Value::as_str) {
+            Some("message_stop") => true,
+            // A body that stops after a `message_delta` carrying a stop_reason is
+            // complete too: the reader keeps that stop_reason and treats the
+            // response as finished, so a missing `message_stop` is not a truncation.
+            // A later usage-only delta with a null stop_reason does not clear it,
+            // because the engine ORs terminal observations across the stream.
+            Some("message_delta") => event
+                .pointer("/delta/stop_reason")
+                .is_some_and(|reason| !reason.is_null()),
+            _ => false,
+        }
+    }
+
+    fn sse_done_is_terminal(&self) -> bool {
+        false
+    }
+
+    fn stamp_streamed_response_model(&self, event: &mut Value, served_model: &str) {
+        if let Some(message) = event.get_mut("message").and_then(Value::as_object_mut) {
+            message.insert("model".to_string(), Value::String(served_model.to_string()));
+        }
+    }
+
     fn decode_event(
         &self,
         state: &mut StreamTranslationState,
@@ -748,5 +773,55 @@ fn tool_input_delta(value: &Value) -> Option<String> {
         Value::String(text) if !text.is_empty() => Some(text.clone()),
         Value::Object(object) if !object.is_empty() => serde_json::to_string(value).ok(),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_stream_completion() {
+        let codec = AnthropicMessagesStreamCodec;
+        assert!(!codec.sse_done_is_terminal());
+        assert!(codec.is_terminal_event(&json!({"type": "message_stop"})));
+        assert!(!codec.is_terminal_event(&json!({"type": "message_delta"})));
+        // A body that ends after a stop_reason-carrying message_delta is complete,
+        // even with no message_stop: a truncation ends earlier than this.
+        assert!(codec.is_terminal_event(
+            &json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}})
+        ));
+        // A usage-only delta carries no stop_reason, so it does not complete one.
+        assert!(
+            !codec.is_terminal_event(
+                &json!({"type": "message_delta", "delta": {"stop_reason": null}})
+            )
+        );
+        assert!(
+            !codec.is_terminal_event(
+                &json!({"type": "message_delta", "usage": {"output_tokens": 3}})
+            )
+        );
+        // Content events never complete a stream.
+        assert!(!codec.is_terminal_event(
+            &json!({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "x"}})
+        ));
+    }
+
+    #[test]
+    fn anthropic_replay_stamps_the_served_model_inside_message() {
+        let mut event = json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_1",
+                "model": "provider/model",
+                "provider_extension": true,
+            },
+        });
+
+        AnthropicMessagesStreamCodec.stamp_streamed_response_model(&mut event, "served/model");
+
+        assert_eq!(event["message"]["model"], "served/model");
+        assert_eq!(event["message"]["provider_extension"], true);
     }
 }

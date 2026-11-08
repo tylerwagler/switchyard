@@ -3,10 +3,16 @@
 
 //! Provider-agnostic helpers shared by wire-format codecs.
 
+use std::borrow::Cow;
+
 use serde_json::{Map, Value};
 
+use crate::diagnostic::TranslationDiagnostic;
 use crate::error::{Result, TranslationError};
+use crate::format::WireFormat;
 use crate::llm::{ContentBlock, LlmRequest, Tool, ToolChoice};
+use crate::policy::TranslationPolicy;
+use crate::util::push_lossy;
 
 // Internal provenance survives mutations that invalidate exact request replay.
 pub(crate) const ANTHROPIC_REQUEST_KEY: &str = "switchyard_anthropic_request";
@@ -14,6 +20,43 @@ pub(crate) const ANTHROPIC_REQUEST_KEY: &str = "switchyard_anthropic_request";
 /// Returns true when the request was decoded from an Anthropic Messages body.
 pub(crate) fn is_anthropic_request(request: &LlmRequest) -> bool {
     request.extensions.fields.get(ANTHROPIC_REQUEST_KEY) == Some(&Value::Bool(true))
+}
+
+/// Leaves Anthropic server tools out of a request encoded for another format.
+///
+/// Server tools (a `type` other than `custom`, such as `advisor_20260301` or
+/// `web_search_20250305`) are run by the Anthropic provider, not the model's client, and
+/// decode as [`Tool::Provider`] so an Anthropic re-encode keeps them. A translated request
+/// must not offer the model a tool nobody runs, so the other formats drop them: a lossy
+/// conversion that is reported, and rejected under `LossyConversionPolicy::Reject`.
+pub(crate) fn without_anthropic_server_tools<'a>(
+    tools: &'a [Tool],
+    diagnostics: &mut Vec<TranslationDiagnostic>,
+    policy: &TranslationPolicy,
+) -> Result<Cow<'a, [Tool]>> {
+    let is_server_tool = |tool: &Tool| {
+        matches!(tool, Tool::Provider { provider, .. }
+            if provider.as_str() == WireFormat::AnthropicMessages.as_str())
+    };
+    if !tools.iter().any(is_server_tool) {
+        return Ok(Cow::Borrowed(tools));
+    }
+    let mut kept = Vec::with_capacity(tools.len());
+    for tool in tools {
+        if let Tool::Provider { raw, .. } = tool
+            && is_server_tool(tool)
+        {
+            let kind = raw.get("type").and_then(Value::as_str).unwrap_or("unknown");
+            push_lossy(
+                diagnostics,
+                policy,
+                format!("dropped Anthropic server tool {kind}; only Anthropic targets run it"),
+            )?;
+        } else {
+            kept.push(tool.clone());
+        }
+    }
+    Ok(Cow::Owned(kept))
 }
 
 /// Converts an OpenAI allowed-tools policy to a restricted function list and mode.

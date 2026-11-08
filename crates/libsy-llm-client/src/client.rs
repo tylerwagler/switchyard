@@ -63,6 +63,7 @@ const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
     model_name: ModelId,
+    provider_model: Option<ModelId>,
     default_backend: Backend,
     other_backends: Option<Vec<Backend>>,
     responses_reasoning: crate::ResponsesReasoningPolicy,
@@ -78,6 +79,7 @@ impl ModelConfig {
     ) -> Self {
         Self {
             model_name: model_name.into(),
+            provider_model: None,
             default_backend,
             other_backends,
             responses_reasoning: crate::ResponsesReasoningPolicy::default(),
@@ -88,6 +90,14 @@ impl ModelConfig {
     #[must_use]
     pub fn with_responses_reasoning(mut self, policy: crate::ResponsesReasoningPolicy) -> Self {
         self.responses_reasoning = policy;
+        self
+    }
+
+    /// Sends `provider_model` upstream in place of `model_name`. The client is still
+    /// called with `model_name`, so several entries can serve one provider model with
+    /// different backend settings.
+    pub fn with_provider_model(mut self, provider_model: impl Into<ModelId>) -> Self {
+        self.provider_model = Some(provider_model.into());
         self
     }
 }
@@ -213,6 +223,15 @@ impl TranslatingLlmClient {
         })
     }
 
+    /// The model id sent upstream for `model`: its provider model when one is set,
+    /// otherwise `model` itself.
+    pub fn provider_model<'a>(&'a self, model: &'a ModelId) -> &'a ModelId {
+        self.model_to_config
+            .get(model)
+            .and_then(|config| config.provider_model.as_ref())
+            .unwrap_or(model)
+    }
+
     /// Whether `model` has a backend for `operation`.
     pub fn supports_auxiliary(&self, model: &ModelId, operation: AuxiliaryOperation) -> bool {
         self.backend_for(model, operation.wire_format()).is_some()
@@ -289,7 +308,7 @@ impl TranslatingLlmClient {
             metadata,
             ..
         } = request;
-        llm_request.model = Some(model.to_string());
+        llm_request.model = Some(self.provider_model(model).to_string());
         let http_response = self
             .send_encoded(
                 backend,
@@ -348,8 +367,9 @@ impl TranslatingLlmClient {
             .map_err(|error| LlmClientError::RequestEncoding(error.to_string()))?;
         // `encode_request` round-trips a preserved same-format body verbatim,
         // which keeps the caller's original `model`; force the resolved model so
-        // the upstream always sees the target id.
-        set_json_model(&mut body, model);
+        // the upstream always sees the provider model.
+        let upstream_model = self.provider_model(model);
+        set_json_model(&mut body, upstream_model);
         if matches!(backend, Backend::OpenAiResponses(_)) {
             sanitize_openai_responses_provider_body(&mut body);
         }
@@ -366,11 +386,14 @@ impl TranslatingLlmClient {
                 .get(model)
                 .map(|config| config.responses_reasoning)
                 .unwrap_or_default()
-                .normalize(&mut body);
+                .normalize(&mut body, backend.base_url(), model);
         }
         // After the merge on purpose: the effort override must win over both the caller's
-        // value and any `reasoning` default a target set through `extra_body`.
-        apply_reasoning_effort(&mut body, backend);
+        // value and any `reasoning` default a target set through `extra_body`. Token counting
+        // does not depend on effort, and Anthropic's count endpoint may reject the field.
+        if matches!(endpoint, UpstreamEndpoint::Completion) {
+            apply_reasoning_effort(&mut body, backend);
+        }
         if matches!(backend, Backend::OpenAiResponses(_)) {
             normalize_codex_string_input(&backend.url(), &mut body);
         }
@@ -378,7 +401,18 @@ impl TranslatingLlmClient {
             if nvidia_inference_api_backend(backend) {
                 strip_anthropic_tool_strict(&mut body);
             }
-            enable_anthropic_prompt_caching(&mut body);
+            enable_anthropic_prompt_caching(&mut body, llm_request.temporary_note_count);
+        }
+        if matches!(
+            backend,
+            Backend::OpenAiChat(_) | Backend::OpenAiResponses(_)
+        ) {
+            enable_openai_guidance_caching(
+                &mut body,
+                wire_format,
+                upstream_model,
+                llm_request.temporary_note_count,
+            );
         }
         if matches!(backend, Backend::OpenAiChat(_)) {
             ensure_openai_stream_usage(&mut body);
@@ -386,7 +420,7 @@ impl TranslatingLlmClient {
         let streaming = endpoint.allows_streaming()
             && body.get("stream").and_then(Value::as_bool).unwrap_or(false);
         let url = endpoint.url(backend);
-        record_gen_ai_request(&url, model, streaming);
+        record_gen_ai_request(&url, upstream_model, streaming);
 
         let result = self
             .send_with_retries(&url, backend, &body, metadata, model, streaming)
@@ -556,7 +590,15 @@ impl TranslatingLlmClient {
         let builder = apply_extra_headers(builder, backend);
         let builder = backend.apply_auth(builder, metadata);
 
-        let response = match builder.send().await {
+        let response = match async {
+            let request = builder.build()?;
+            if let Some(body) = request.body().and_then(reqwest::Body::as_bytes) {
+                crate::payload_capture::record("request", || String::from_utf8_lossy(body));
+            }
+            client.execute(request).await
+        }
+        .await
+        {
             Ok(response) => response,
             Err(error) => {
                 metrics::record_upstream_attempt(self.upstream_name.as_deref(), None);
@@ -606,6 +648,7 @@ impl TranslatingLlmClient {
                 }
             };
             metrics::record_upstream_attempt(self.upstream_name.as_deref(), Some(status.as_u16()));
+            crate::payload_capture::record("response", || String::from_utf8_lossy(&body));
             return Ok(EncodedResponse::Buffered {
                 status: status.as_u16(),
                 body: body.to_vec(),
@@ -655,8 +698,8 @@ impl TranslatingLlmClient {
     /// backend), and returns the neutral response.
     ///
     /// Resolution: `model_name` wins over `request.llm_request.model`; the
-    /// resolved name is both the outer map key and the model id written into the
-    /// request before translation. Missing models are invalid requests; unknown
+    /// resolved name is the outer map key, and its provider model is the model id
+    /// written into the request before translation. Missing models are invalid requests; unknown
     /// models or wire formats are configuration errors.
     pub async fn call_rewrite_model(
         &self,
@@ -675,7 +718,7 @@ impl TranslatingLlmClient {
             .ok_or_else(|| LlmClientError::InvalidRequest {
                 message: "no model given".to_string(),
             })?;
-        llm_request.model = Some(model_id.to_string());
+        llm_request.model = Some(self.provider_model(&model_id).to_string());
 
         let orig_format = metadata.as_ref().and_then(|m| m.wire_format);
         let wire_format = orig_format.unwrap_or(
@@ -786,8 +829,9 @@ impl TranslatingLlmClient {
         // one, else the request's own model. Mirrors `call_rewrite_model`'s own
         // resolution so the response names whoever answered.
         let served_model = model
-            .map(ModelId::to_string)
-            .or_else(|| llm_request.model.clone());
+            .cloned()
+            .or_else(|| llm_request.model.clone().map(ModelId::from))
+            .map(|model| self.provider_model(&model).to_string());
 
         let request = Request {
             llm_request,
@@ -833,6 +877,10 @@ impl TranslatingLlmClient {
 impl RoutedLlmClient for TranslatingLlmClient {
     fn upstream_name(&self) -> Option<&str> {
         self.upstream_name.as_deref()
+    }
+
+    fn provider_model<'a>(&'a self, target: &'a ModelId) -> &'a ModelId {
+        TranslatingLlmClient::provider_model(self, target)
     }
 
     async fn call(&self, request: Request) -> Result<Response> {
@@ -1340,6 +1388,16 @@ fn ensure_responses_function_tool_description(object: &mut Map<String, Value>) {
 fn strip_anthropic_incompatible_fields(body: &mut Value) {
     if let Value::Object(object) = body {
         object.remove("reasoning_effort");
+        // `strict: false` is the default, and Bedrock rejects the field outright.
+        if let Some(Value::Array(tools)) = object.get_mut("tools") {
+            for tool in tools {
+                if let Value::Object(tool) = tool
+                    && tool.get("strict") == Some(&Value::Bool(false))
+                {
+                    tool.remove("strict");
+                }
+            }
+        }
     }
 }
 
@@ -1425,20 +1483,9 @@ fn apply_reasoning_effort(body: &mut Value, backend: &Backend) {
         return;
     };
     match backend {
-        Backend::OpenAiResponses(_) => {
-            // Responses nests effort under `reasoning` next to fields the caller may have set
-            // (`summary`, for example), so only the `effort` key is replaced. A `reasoning`
-            // value that is not an object is malformed and is replaced whole.
-            let reasoning = object
-                .entry("reasoning".to_string())
-                .or_insert_with(|| Value::Object(serde_json::Map::new()));
-            if !reasoning.is_object() {
-                *reasoning = Value::Object(serde_json::Map::new());
-            }
-            if let Value::Object(reasoning) = reasoning {
-                reasoning.insert("effort".to_string(), Value::String(effort.to_string()));
-            }
-        }
+        // Responses nests effort under `reasoning`, Anthropic under `output_config`.
+        Backend::OpenAiResponses(_) => set_nested_effort(object, "reasoning", effort),
+        Backend::Anthropic(_) => set_nested_effort(object, "output_config", effort),
         Backend::OpenAiChat(_) => {
             // Chat Completions takes effort as a top-level field.
             object.insert(
@@ -1446,9 +1493,20 @@ fn apply_reasoning_effort(body: &mut Value, backend: &Backend) {
                 Value::String(effort.to_string()),
             );
         }
-        // Anthropic has no effort field (thinking is a token budget); the runner rejects the
-        // setting on Anthropic clients at load time, so this arm is unreachable in practice.
-        Backend::Anthropic(_) => {}
+    }
+}
+
+// Replaces only `effort` inside `key`, keeping fields the caller set next to it (`summary` or
+// `format`, for example). A non-object value there is malformed and is replaced whole.
+fn set_nested_effort(object: &mut serde_json::Map<String, Value>, key: &str, effort: &str) {
+    let container = object
+        .entry(key.to_string())
+        .or_insert_with(|| Value::Object(serde_json::Map::new()));
+    if !container.is_object() {
+        *container = Value::Object(serde_json::Map::new());
+    }
+    if let Value::Object(container) = container {
+        container.insert("effort".to_string(), Value::String(effort.to_string()));
     }
 }
 
@@ -1488,44 +1546,135 @@ fn count_cache_control_blocks(value: &Value) -> usize {
     }
 }
 
-// Marks the final message content block as the Anthropic prompt-cache breakpoint.
-fn enable_anthropic_prompt_caching(body: &mut Value) {
-    // Top-level cache control manages the final breakpoint and its TTL.
-    if body.get("cache_control").is_some() {
-        return;
-    }
-    // Abstain once the caller has spent the budget itself. Adding a fifth marker
-    // turns a request that was valid on arrival into an upstream HTTP 400, and a
-    // caller that placed four breakpoints deliberately needs them more than we
-    // need a fifth. When the final block is already marked this returns early
-    // and changes nothing, which is what the insert below would have done.
+// This helper marks the final caller content block before any temporary notes, if policy permits.
+fn enable_anthropic_prompt_caching(body: &mut Value, temporary_note_count: usize) {
+    // Anthropic rejects a fifth cache marker with HTTP 400.
+    // This check preserves the caller's markers when the request has reached that limit.
     if count_cache_control_blocks(body) >= MAX_CACHE_CONTROL_BLOCKS {
         return;
     }
-    let Some(content) = body
-        .get_mut("messages")
-        .and_then(Value::as_array_mut)
-        .and_then(|messages| messages.last_mut())
-        .and_then(|message| message.get_mut("content"))
-    else {
+    // Requests with only a top-level `1h` policy can return HTTP 400.
+    // New block markers match the caller's TTL on turns with or without notes.
+    let marker = body
+        .get("cache_control")
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({"type":"ephemeral"}));
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
         return;
     };
-    match content {
-        Value::String(text) => {
-            *content = serde_json::json!([{
-                "type": "text",
-                "text": std::mem::take(text),
-                "cache_control": {"type": "ephemeral"}
-            }]);
-        }
-        Value::Array(blocks) => {
-            if let Some(block) = blocks.last_mut().and_then(Value::as_object_mut) {
-                block
-                    .entry("cache_control".to_string())
-                    .or_insert_with(|| serde_json::json!({"type": "ephemeral"}));
+    let mut remaining = temporary_note_count;
+    // Temporary guidance is absent next turn, so the breakpoint must precede it.
+    for message in messages.iter_mut().rev() {
+        match message.get_mut("content") {
+            Some(content @ Value::String(_)) if remaining == 0 => {
+                let text = std::mem::take(content);
+                *content = serde_json::json!([{
+                    "type": "text", "text": text, "cache_control": marker
+                }]);
+                return;
             }
+            Some(Value::String(_)) => remaining = remaining.saturating_sub(1),
+            Some(Value::Array(blocks)) => {
+                if remaining >= blocks.len() {
+                    remaining -= blocks.len();
+                    continue;
+                }
+                let index = blocks.len() - remaining - 1;
+                if let Some(block) = blocks[index].as_object_mut() {
+                    block.entry("cache_control".to_string()).or_insert(marker);
+                }
+                return;
+            }
+            _ => {}
         }
-        _ => {}
+    }
+}
+
+// GPT-5.6 and GPT-6 cache writes end at selected message or content boundaries.
+// A temporary suffix needs a separate cache entry before it so the next request can reuse the prefix.
+fn enable_openai_guidance_caching(
+    body: &mut Value,
+    format: WireFormat,
+    model: &ModelId,
+    suffix: usize,
+) {
+    let name = model.as_str().rsplit('/').next().unwrap_or_default();
+    let supported = name == "gpt-5.6"
+        || name.starts_with("gpt-5.6-")
+        || name == "gpt-6"
+        || name.starts_with("gpt-6-")
+        || name.starts_with("gpt-6.");
+    // Explicit-only callers choose their write locations.
+    // This helper adds markers only for names recognized by its model-name check.
+    if suffix == 0
+        || !supported
+        || body
+            .pointer("/prompt_cache_options/mode")
+            .and_then(Value::as_str)
+            == Some("explicit")
+    {
+        return;
+    }
+    let key = if format == WireFormat::OpenAiResponses {
+        "input"
+    } else {
+        "messages"
+    };
+    let Some(items) = body.get_mut(key).and_then(Value::as_array_mut) else {
+        return;
+    };
+    let marker_count = items
+        .iter()
+        .map(|item| {
+            ["content", "output"]
+                .iter()
+                .filter_map(|key| item.get(key).and_then(Value::as_array))
+                .flatten()
+                .filter(|block| block.get("prompt_cache_breakpoint").is_some())
+                .count()
+        })
+        .sum::<usize>();
+    // Implicit mode reserves one of the four write slots for the provider's final breakpoint.
+    if marker_count >= 3 {
+        return;
+    }
+    let Some(prefix_len) = items.len().checked_sub(suffix) else {
+        return;
+    };
+    for item in items[..prefix_len].iter_mut().rev() {
+        let field = if item.get("type").and_then(Value::as_str) == Some("function_call_output") {
+            "output"
+        } else if matches!(
+            item.get("role").and_then(Value::as_str),
+            Some("user" | "tool" | "developer" | "system")
+        ) {
+            "content"
+        } else {
+            continue;
+        };
+        let Some(content) = item.get_mut(field) else {
+            continue;
+        };
+        if let Value::String(text) = content {
+            let text = std::mem::take(text);
+            let kind = if format == WireFormat::OpenAiResponses {
+                "input_text"
+            } else {
+                "text"
+            };
+            *content = serde_json::json!([{"type":kind,"text":text}]);
+        }
+        // Empty content arrays have no block to mark, so the search continues through earlier items.
+        if let Some(block) = content
+            .as_array_mut()
+            .and_then(|blocks| blocks.last_mut())
+            .and_then(Value::as_object_mut)
+        {
+            block
+                .entry("prompt_cache_breakpoint".to_string())
+                .or_insert_with(|| serde_json::json!({"mode":"explicit"}));
+            return;
+        }
     }
 }
 
@@ -1769,13 +1918,6 @@ mod tests {
         )]
     }
 
-    fn responses_map_with_drop_policy(base_url: &str) -> Vec<ModelConfig> {
-        vec![
-            ModelConfig::new("gpt", Backend::OpenAiResponses(config(base_url)), None)
-                .with_responses_reasoning(crate::ResponsesReasoningPolicy::Drop),
-        ]
-    }
-
     #[tokio::test]
     async fn model_properties_uses_configured_auth_and_backend_path()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
@@ -1906,6 +2048,14 @@ mod tests {
         assert!(!convert_reqwest_error(error).to_string().contains("CANARY"));
     }
 
+    #[tokio::test]
+    async fn captured_request_build_failure_remains_a_configuration_error() {
+        let client = TranslatingLlmClient::new(&chat_map("://invalid")).unwrap();
+        let result =
+            crate::with_payload_capture(client.call(request_for(Some("gpt"), false))).await;
+        assert!(matches!(result, Err(LlmClientError::Configuration { .. })));
+    }
+
     #[test]
     fn nvidia_anthropic_tools_drop_unsupported_strict_field() {
         let backend = Backend::Anthropic(config("https://inference-api.nvidia.com"));
@@ -1925,14 +2075,21 @@ mod tests {
             "messages": [{"role": "user", "content": "hello"}]
         });
         let mut body = caller_managed.clone();
-        enable_anthropic_prompt_caching(&mut body);
-        assert_eq!(body, caller_managed);
+        enable_anthropic_prompt_caching(&mut body, 0);
+        assert_eq!(body["cache_control"], caller_managed["cache_control"]);
+        assert_eq!(
+            body["messages"][0]["content"],
+            json!([{
+                "type": "text", "text": "hello",
+                "cache_control": {"type": "ephemeral", "ttl": "1h"}
+            }])
+        );
 
         let mut body = json!({
             "messages": [{"role": "user", "content": "hello"}]
         });
 
-        enable_anthropic_prompt_caching(&mut body);
+        enable_anthropic_prompt_caching(&mut body, 0);
 
         assert_eq!(
             body["messages"][0]["content"][0]["cache_control"],
@@ -1972,7 +2129,7 @@ mod tests {
         let mut body = body_at_the_cache_control_limit();
         assert_eq!(cache_control_blocks(&body), 4);
 
-        enable_anthropic_prompt_caching(&mut body);
+        enable_anthropic_prompt_caching(&mut body, 0);
 
         // Anthropic and Bedrock both reject a fifth marker with HTTP 400, which
         // would fail a request that was valid before it reached us.
@@ -1991,7 +2148,7 @@ mod tests {
         body["system"].as_array_mut().unwrap().pop();
         assert_eq!(cache_control_blocks(&body), 3);
 
-        enable_anthropic_prompt_caching(&mut body);
+        enable_anthropic_prompt_caching(&mut body, 0);
 
         assert_eq!(cache_control_blocks(&body), 4);
         assert_eq!(
@@ -2404,6 +2561,69 @@ mod tests {
         Ok(())
     }
 
+    // Covers both a translated request and an Anthropic caller's body sent as is.
+    #[tokio::test]
+    async fn anthropic_requests_drop_tool_strict_false()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(2)
+            .mount(&server)
+            .await;
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "claude",
+            Backend::Anthropic(config(&server.uri())),
+            None,
+        )])?;
+        let schema = json!({"type": "object"});
+        let requests = [
+            (
+                WireFormat::OpenAiChat,
+                json!({
+                    "model": "client-facing",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [
+                        {"type": "function", "function": {"name": "loose", "parameters": schema, "strict": false}},
+                        {"type": "function", "function": {"name": "exact", "parameters": schema, "strict": true}}
+                    ]
+                }),
+            ),
+            (
+                WireFormat::AnthropicMessages,
+                json!({
+                    "model": "client-facing",
+                    "max_tokens": 8,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "tools": [
+                        {"name": "loose", "input_schema": schema, "strict": false},
+                        {"name": "exact", "input_schema": schema, "strict": true}
+                    ]
+                }),
+            ),
+        ];
+        for (format, request) in requests {
+            client
+                .call_rewrite_model_raw(request, None, Some(&ModelId::from("claude")), format)
+                .await?;
+        }
+        for received in server.received_requests().await.unwrap_or_default() {
+            let body: Value = serde_json::from_slice(&received.body)?;
+            assert!(body["tools"][0].get("strict").is_none(), "{body}");
+            assert_eq!(body["tools"][1]["strict"], true, "{body}");
+        }
+        Ok(())
+    }
+
     #[tokio::test]
     async fn template_rejection_retries_once_without_changing_other_fields()
     -> std::result::Result<(), Box<dyn Error + Sync + Send>> {
@@ -2560,6 +2780,91 @@ mod tests {
                 assert_eq!(serde_json::from_slice::<Value>(&calls[0].body)?, expected);
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn token_counting_does_not_send_the_effort_override()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages/count_tokens"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"input_tokens": 3})))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut backend = config(&server.uri());
+        backend.reasoning_effort = Some("max".to_string());
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "claude",
+            Backend::Anthropic(backend),
+            None,
+        )])?;
+        let llm_request = switchyard_translation::decode_request(
+            WireFormat::AnthropicMessages,
+            &json!({"model": "claude", "messages": [{"role": "user", "content": "hi"}]}),
+        )?;
+        let request = Request {
+            llm_request,
+            raw_request: None,
+            metadata: None,
+        };
+        client
+            .call_auxiliary(
+                &ModelId::from("claude"),
+                request,
+                AuxiliaryOperation::AnthropicCountTokens,
+            )
+            .await?;
+        let received = server.received_requests().await.unwrap_or_default();
+        let body: Value = serde_json::from_slice(&received[0].body)?;
+        assert!(body.get("output_config").is_none(), "{body}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reasoning_effort_override_sets_anthropic_output_config_effort()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        let format = json!({"type": "json_schema", "schema": {"type": "object"}});
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .and(wiremock::matchers::body_partial_json(json!({
+                "model": "claude",
+                "output_config": {"effort": "max", "format": format}
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut backend = config(&server.uri());
+        backend.reasoning_effort = Some("max".to_string());
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "claude",
+            Backend::Anthropic(backend),
+            None,
+        )])?;
+        client
+            .call_rewrite_model_raw(
+                json!({
+                    "model": "client-facing",
+                    "max_tokens": 7,
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "output_config": {"effort": "high", "format": format}
+                }),
+                None,
+                Some(&ModelId::from("claude")),
+                WireFormat::AnthropicMessages,
+            )
+            .await?;
         Ok(())
     }
 
@@ -2733,18 +3038,32 @@ mod tests {
     #[tokio::test]
     async fn responses_reasoning_policy_preserves_replay_history()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        use crate::ResponsesReasoningPolicy::{Auto, Drop, PreserveEncrypted, PreservePlaintext};
+        let summary = json!([{"type": "summary_text", "text": "Check the parser."}]);
         let history = json!([
             {"type": "message", "role": "user", "content": "continue"},
             {"type": "reasoning", "encrypted_content": "opaque", "content": [{"type": "reasoning_text", "text": "private"}]},
             {"type": "reasoning", "id": "rs_stored", "status": "completed", "summary": []},
-            {"type": "reasoning", "encrypted_content": null},
-            {"type": "reasoning", "encrypted_content": ""},
+            // GLM's plaintext forms, as Codex replays them.
+            {"type": "reasoning", "id": "rs_glm", "summary": summary, "encrypted_content": null},
+            {"type": "reasoning", "content": [{"type": "reasoning_text", "text": "Run the tests."}], "encrypted_content": ""},
             {"type": "reasoning"},
             {"type": "function_call", "call_id": "call_1", "name": "shell", "arguments": "{}"},
             {"type": "function_call_output", "call_id": "call_1", "output": "ok"}
         ]);
+        // An explicit policy wins over the target. `Auto` follows the target.
+        let cases = [
+            (Auto, "openai/gpt-5", PreserveEncrypted),
+            (Auto, "nvidia/zai-org/glm-5.3-flash", PreservePlaintext),
+            (
+                PreserveEncrypted,
+                "nvidia/zai-org/glm-5.3-flash",
+                PreserveEncrypted,
+            ),
+            (Drop, "openai/gpt-5", Drop),
+        ];
         for store in [Some(true), Some(false), None] {
-            for is_drop in [false, true] {
+            for (policy, model, behavior) in cases {
                 for has_input_override in [false, true] {
                     let server = MockServer::start().await;
                     Mock::given(method("POST"))
@@ -2757,24 +3076,20 @@ mod tests {
                         .expect(1)
                         .mount(&server)
                         .await;
-                    let base_url = format!("{}/v1", server.uri());
-                    let mut models = if is_drop {
-                        responses_map_with_drop_policy(&base_url)
-                    } else {
-                        responses_map(&base_url)
-                    };
+                    let mut backend = config(&format!("{}/v1", server.uri()));
                     if has_input_override {
-                        let Backend::OpenAiResponses(backend) = &mut models[0].default_backend
-                        else {
-                            return Err("expected Responses backend".into());
-                        };
                         backend.omit_body_fields.insert("input".to_string());
                         backend
                             .extra_body
                             .insert("input".to_string(), history.clone());
                     }
-                    let client = TranslatingLlmClient::new(&models)?;
-                    let mut request = json!({"model": "gpt", "input": history});
+                    let client = TranslatingLlmClient::new(&[ModelConfig::new(
+                        model,
+                        Backend::OpenAiResponses(backend),
+                        None,
+                    )
+                    .with_responses_reasoning(policy)])?;
+                    let mut request = json!({"model": "switchyard", "input": history});
                     if let Some(store) = store {
                         request["store"] = json!(store);
                     }
@@ -2782,28 +3097,43 @@ mod tests {
                         .call_rewrite_model_raw(
                             request,
                             None,
-                            Some(&ModelId::from("gpt")),
+                            Some(&ModelId::from(model)),
                             WireFormat::OpenAiResponses,
                         )
                         .await?;
                     let requests = server.received_requests().await.ok_or("missing requests")?;
                     let body: Value = serde_json::from_slice(&requests[0].body)?;
+                    let stored = store != Some(false);
                     let mut expected = vec![history[0].clone()];
-                    if !is_drop {
-                        let mut encrypted = history[1].clone();
-                        encrypted["content"] = json!([]);
-                        expected.push(encrypted);
-                        if store != Some(false) {
-                            let mut stored = history[2].clone();
-                            stored["content"] = json!([]);
-                            expected.push(stored);
+                    match behavior {
+                        // OpenAI reads its own payload and stored IDs, but rejects plaintext.
+                        PreserveEncrypted => {
+                            let indexes: &[usize] = if stored { &[1, 2, 3] } else { &[1] };
+                            for &index in indexes {
+                                let mut item = history[index].clone();
+                                item["content"] = json!([]);
+                                expected.push(item);
+                            }
                         }
+                        // Other targets keep plaintext and lose payloads of unknown origin.
+                        PreservePlaintext => {
+                            let mut item = history[1].clone();
+                            item.as_object_mut()
+                                .ok_or("object")?
+                                .remove("encrypted_content");
+                            expected.push(item);
+                            if stored {
+                                expected.push(history[2].clone());
+                            }
+                            expected.extend([history[3].clone(), history[4].clone()]);
+                        }
+                        _ => {}
                     }
                     expected.extend([history[6].clone(), history[7].clone()]);
                     assert_eq!(
                         body["input"],
                         json!(expected),
-                        "store={store:?}, drop={is_drop}, replace={has_input_override}"
+                        "store={store:?}, policy={policy:?}, model={model}, replace={has_input_override}"
                     );
                 }
             }
@@ -4181,6 +4511,7 @@ mod tests {
     // kinds: items with an ID but no `encrypted_content` when the request sets `store: false`,
     // and items whose `encrypted_content` holds Anthropic thinking that Switchyard packed for
     // the client. The Responses leg must drop both and keep GPT's own encrypted reasoning.
+    // A non-OpenAI target instead keeps the plaintext and drops both payloads.
     #[tokio::test]
     async fn openai_responses_backend_drops_reasoning_the_provider_cannot_read()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
@@ -4261,25 +4592,22 @@ mod tests {
             empty_reasoning
         ]);
 
-        for has_input_override in [false, true] {
-            let mut models = responses_map(&format!("{}/v1", server.uri()));
-            if has_input_override {
-                let Backend::OpenAiResponses(backend) = &mut models[0].default_backend else {
-                    return Err("expected Responses backend".into());
-                };
-                backend.omit_body_fields.insert("input".to_string());
-                backend
-                    .extra_body
-                    .insert("input".to_string(), input.clone());
-            }
-            let client = TranslatingLlmClient::new(&models)?;
+        let models = ["openai/gpt-5", "nvidia/zai-org/glm-5.3-flash"].map(|model| {
+            ModelConfig::new(
+                model,
+                Backend::OpenAiResponses(config(&format!("{}/v1", server.uri()))),
+                None,
+            )
+        });
+        let client = TranslatingLlmClient::new(&models)?;
+        for model in ["openai/gpt-5", "nvidia/zai-org/glm-5.3-flash"] {
             for store in [json!(false), json!(true)] {
                 let raw = json!({"model": "client-facing", "store": store, "input": input.clone()});
                 client
                     .call_rewrite_model_raw(
                         raw,
                         None,
-                        Some(&ModelId::from("gpt")),
+                        Some(&ModelId::from(model)),
                         WireFormat::OpenAiResponses,
                     )
                     .await?;
@@ -4307,6 +4635,29 @@ mod tests {
                 "provider cannot read translated Anthropic reasoning"
             );
         }
+
+        // GLM keeps the plaintext beside the Anthropic envelope and drops GPT's payload.
+        let mut switchyard_plaintext = switchyard_reasoning.clone();
+        switchyard_plaintext
+            .as_object_mut()
+            .ok_or("object")?
+            .remove("encrypted_content");
+        assert_eq!(
+            sent[2]["input"],
+            json!([user, claude_reasoning, switchyard_plaintext, call, output])
+        );
+        assert_eq!(
+            sent[3]["input"],
+            json!([
+                user,
+                claude_reasoning,
+                switchyard_plaintext,
+                call,
+                output,
+                empty_reasoning
+            ])
+        );
+
         for item in [
             &mut claude_reasoning,
             &mut gpt_reasoning,
@@ -4314,26 +4665,21 @@ mod tests {
         ] {
             item["content"] = json!([]);
         }
-        for requests in sent.as_chunks::<2>().0 {
-            // With `store: false`, only GPT's own encrypted reasoning survives.
-            assert_eq!(
-                requests[0]["input"],
-                json!([user, call, output, gpt_reasoning])
-            );
-            // With `store: true`, IDs can refer to stored reasoning, but OpenAI still cannot
-            // decrypt the Switchyard item.
-            assert_eq!(
-                requests[1]["input"],
-                json!([
-                    user,
-                    claude_reasoning,
-                    call,
-                    output,
-                    gpt_reasoning,
-                    empty_reasoning
-                ])
-            );
-        }
+        // With `store: false`, only GPT's own encrypted reasoning survives.
+        assert_eq!(sent[0]["input"], json!([user, call, output, gpt_reasoning]));
+        // With `store: true`, IDs can refer to stored reasoning, but OpenAI still cannot
+        // decrypt the Switchyard item.
+        assert_eq!(
+            sent[1]["input"],
+            json!([
+                user,
+                claude_reasoning,
+                call,
+                output,
+                gpt_reasoning,
+                empty_reasoning
+            ])
+        );
         Ok(())
     }
 

@@ -29,7 +29,7 @@ use crate::util::{
     sanitize_anthropic_tool_use_id,
 };
 use crate::util::{
-    json_string, push_lossy, reject_responses_builtin_tool_item, stable_id, string_value,
+    json_string, push_lossy, reject_responses_native_input_item, stable_id, string_value,
     validate_request_capabilities,
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD};
@@ -166,13 +166,10 @@ impl FormatCodec for AnthropicMessagesCodec {
                     &mut diagnostics,
                     policy,
                 )?;
-                request.messages.push(Message { role, content });
+                request.messages.push(Message::new(role, content));
             }
         }
-        request.tools = decode_anthropic_tools(body.get("tools"))
-            .into_iter()
-            .map(Tool::from)
-            .collect();
+        request.tools = decode_anthropic_tools(body.get("tools"));
         request.tool_choice = body.get("tool_choice").map(decode_anthropic_tool_choice);
         request.extensions.fields = provider_extensions(
             body,
@@ -243,6 +240,13 @@ impl FormatCodec for AnthropicMessagesCodec {
             .instructions
             .iter()
             .flat_map(|instruction| instruction.content.iter())
+            .chain(
+                request
+                    .messages
+                    .iter()
+                    .filter(|message| matches!(message.role, Role::System | Role::Developer))
+                    .flat_map(|message| message.content.iter()),
+            )
             .filter_map(|block| match block {
                 ContentBlock::Text { text } | ContentBlock::Refusal { text } => Some(text.as_str()),
                 _ => None,
@@ -267,6 +271,34 @@ impl FormatCodec for AnthropicMessagesCodec {
                 "system".to_string(),
                 Value::String(system_parts.join("\n\n")),
             );
+        }
+        // Anthropic `system` is a text field, so other instruction content is dropped.
+        let instructions = request
+            .instructions
+            .iter()
+            .enumerate()
+            .map(|(index, block)| (block.role, &block.content, "instruction", index));
+        let inline = request
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|(_, message)| matches!(message.role, Role::System | Role::Developer))
+            .map(|(index, message)| (message.role, &message.content, "message", index));
+        for (role, content, kind, index) in instructions.chain(inline) {
+            for block in content {
+                if !matches!(
+                    block,
+                    ContentBlock::Text { .. } | ContentBlock::Refusal { .. }
+                ) {
+                    push_lossy(
+                        &mut diagnostics,
+                        policy,
+                        format!(
+                            "Anthropic system prompt accepts only text; dropped non-text content from {role} {kind} {index}"
+                        ),
+                    )?;
+                }
+            }
         }
 
         body.insert(
@@ -829,33 +861,41 @@ fn decode_anthropic_file_source(block: &Map<String, Value>) -> FileSource {
 
 // Decodes Anthropic tool definitions into normalized tool definitions.
 // Server tools (a `type` other than `custom`, such as `advisor_20260301` or
-// `web_search_20250305`) are run by the provider, not the model's client. They
-// are not functions, so they are left out here: a translated request must not
-// offer the model a tool nobody runs. Same-format replay keeps them in the body.
-fn decode_anthropic_tools(value: Option<&Value>) -> Vec<ToolDefinition> {
+// `web_search_20250305`) are run by the provider, not the model's client. They are
+// kept whole as provider tools so an Anthropic re-encode sends them unchanged; the
+// other formats leave them out (`without_anthropic_server_tools`), because a
+// translated request must not offer the model a tool nobody runs.
+fn decode_anthropic_tools(value: Option<&Value>) -> Vec<Tool> {
     value
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_object)
-        .filter(|tool| {
-            tool.get("type")
-                .and_then(Value::as_str)
-                .is_none_or(|kind| kind == "custom")
-        })
         .filter_map(|tool| {
+            if tool
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|kind| kind != "custom")
+            {
+                return Some(Tool::Provider {
+                    provider: WireFormat::AnthropicMessages.into(),
+                    raw: Value::Object(tool.clone()),
+                });
+            }
             let name = tool.get("name").and_then(Value::as_str)?.to_string();
-            (!name.is_empty()).then(|| ToolDefinition {
-                name,
-                description: tool
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .map(ToOwned::to_owned),
-                parameters: tool
-                    .get("input_schema")
-                    .cloned()
-                    .unwrap_or_else(|| json!({})),
-                strict: tool.get("strict").and_then(Value::as_bool),
+            (!name.is_empty()).then(|| {
+                Tool::Function(ToolDefinition {
+                    name,
+                    description: tool
+                        .get("description")
+                        .and_then(Value::as_str)
+                        .map(ToOwned::to_owned),
+                    parameters: tool
+                        .get("input_schema")
+                        .cloned()
+                        .unwrap_or_else(|| json!({})),
+                    strict: tool.get("strict").and_then(Value::as_bool),
+                })
             })
         })
         .collect()
@@ -925,6 +965,11 @@ fn encode_anthropic_messages(
     let mut index = 0;
 
     while let Some(message) = messages.get(index) {
+        // Inline instructions are emitted in the top-level system field.
+        if matches!(message.role, Role::System | Role::Developer) {
+            index += 1;
+            continue;
+        }
         if !message_is_tool_result_only(message) {
             encoded.push(encode_anthropic_message(message, diagnostics, policy)?);
             index += 1;
@@ -933,6 +978,10 @@ fn encode_anthropic_messages(
 
         let mut content = Vec::new();
         while let Some(tool_message) = messages.get(index) {
+            if matches!(tool_message.role, Role::System | Role::Developer) {
+                index += 1;
+                continue;
+            }
             if !message_is_tool_result_only(tool_message) {
                 break;
             }
@@ -979,7 +1028,7 @@ fn encode_anthropic_content_with_policy(
         crate::codecs::openai_media::validate_media(block, WireFormat::AnthropicMessages)?;
         match block {
             ContentBlock::Unknown { provider, raw } => {
-                reject_responses_builtin_tool_item(provider, raw, WireFormat::AnthropicMessages)?;
+                reject_responses_native_input_item(provider, raw, WireFormat::AnthropicMessages)?;
                 push_lossy(
                     diagnostics,
                     policy,
@@ -1265,6 +1314,11 @@ fn encode_anthropic_tools(tools: &[Tool]) -> Result<Value> {
         tools
             .iter()
             .map(|tool| {
+                if let Tool::Provider { provider, raw } = tool
+                    && provider.as_str() == WireFormat::AnthropicMessages.as_str()
+                {
+                    return Ok(raw.clone());
+                }
                 let tool = tool.function().ok_or_else(|| {
                     TranslationError::LossyConversion(
                         "MCP and provider tool encoding is not implemented".into(),

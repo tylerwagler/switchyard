@@ -9,8 +9,6 @@
 
 use serde_json::Value;
 
-use crate::WireFormat;
-
 /// Boxed, thread-safe error carried by a streamed item.
 pub(crate) type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -24,9 +22,8 @@ pub(crate) enum SseFrame {
 /// The optional terminal SSE marker accepted for all supported wire formats.
 /// Native Anthropic streams can end at `message_stop`, while compatible
 /// providers may additionally send `[DONE]`.
-#[inline]
-pub(crate) fn done_marker(_format: WireFormat) -> Option<&'static str> {
-    Some("[DONE]")
+pub(crate) const fn done_marker() -> &'static str {
+    "[DONE]"
 }
 
 /// Value of a `data` field line; the space after the colon is optional framing.
@@ -39,45 +36,7 @@ fn data_field_value(line: &str) -> Option<String> {
     Some(value.strip_prefix(' ').unwrap_or(value).to_string())
 }
 
-/// Returns whether a provider event explicitly completes its wire-format stream.
-pub(crate) fn is_terminal_event(format: WireFormat, event: &Value) -> bool {
-    match format {
-        WireFormat::OpenAiChat => event
-            .get("choices")
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .any(|choice| {
-                choice
-                    .get("finish_reason")
-                    .and_then(Value::as_str)
-                    .is_some()
-            }),
-        WireFormat::AnthropicMessages => match event.get("type").and_then(Value::as_str) {
-            Some("message_stop") => true,
-            // A body that stops after a `message_delta` carrying a stop_reason is
-            // complete too: the reader keeps that stop_reason and treats the
-            // response as finished, so a missing `message_stop` is not a truncation.
-            // A later usage-only delta with a null stop_reason does not clear it.
-            Some("message_delta") => event
-                .pointer("/delta/stop_reason")
-                .is_some_and(|reason| !reason.is_null()),
-            _ => false,
-        },
-        WireFormat::OpenAiResponses => matches!(
-            event
-                .get("type")
-                .or_else(|| event.get("event"))
-                .and_then(Value::as_str),
-            Some("response.completed" | "response.incomplete" | "response.failed")
-        ),
-    }
-}
-
-pub(crate) fn parse_json_sse_frame(
-    frame: &str,
-    done_marker: Option<&str>,
-) -> Result<SseFrame, BoxError> {
+pub(crate) fn parse_json_sse_frame(frame: &str, done_marker: &str) -> Result<SseFrame, BoxError> {
     let data = frame
         .lines()
         .filter(|line| !line.is_empty() && !line.starts_with(':'))
@@ -93,7 +52,7 @@ pub(crate) fn parse_json_sse_frame(
     if data.is_empty() {
         return Ok(SseFrame::Empty);
     }
-    if done_marker.is_some_and(|marker| data == marker) {
+    if data == done_marker {
         return Ok(SseFrame::Done);
     }
     let value = serde_json::from_str::<Value>(data)?;
@@ -106,7 +65,7 @@ mod tests {
 
     use super::*;
 
-    const DONE: Option<&str> = Some("[DONE]");
+    const DONE: &str = done_marker();
 
     #[test]
     fn parses_a_data_line_as_json() -> Result<(), BoxError> {
@@ -179,73 +138,7 @@ mod tests {
     }
 
     #[test]
-    fn marker_is_only_terminal_when_configured() {
-        // Without a configured marker, `[DONE]` is treated as (invalid) JSON data.
-        assert!(parse_json_sse_frame("data: [DONE]\n", None).is_err());
-    }
-
-    #[test]
     fn invalid_json_is_an_error() {
         assert!(parse_json_sse_frame("data: {not json}\n", DONE).is_err());
-    }
-
-    #[test]
-    fn openai_formats_terminate_on_done() {
-        assert_eq!(done_marker(WireFormat::OpenAiChat), Some("[DONE]"));
-        assert_eq!(done_marker(WireFormat::OpenAiResponses), Some("[DONE]"));
-    }
-
-    #[test]
-    fn anthropic_accepts_optional_done_marker() {
-        assert_eq!(done_marker(WireFormat::AnthropicMessages), Some("[DONE]"));
-    }
-
-    #[test]
-    fn recognizes_provider_terminal_events() {
-        // Each source format requires its own protocol-specific terminal event.
-        assert!(is_terminal_event(
-            WireFormat::OpenAiChat,
-            &json!({"choices": [{"finish_reason": "stop"}]})
-        ));
-        assert!(is_terminal_event(
-            WireFormat::AnthropicMessages,
-            &json!({"type": "message_stop"})
-        ));
-        // A body that ends after a stop_reason-carrying message_delta is complete,
-        // even with no message_stop: a truncation ends earlier than this.
-        assert!(is_terminal_event(
-            WireFormat::AnthropicMessages,
-            &json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}})
-        ));
-        // A usage-only delta carries no stop_reason, so it does not complete one.
-        assert!(!is_terminal_event(
-            WireFormat::AnthropicMessages,
-            &json!({"type": "message_delta", "delta": {"stop_reason": null}})
-        ));
-        assert!(!is_terminal_event(
-            WireFormat::AnthropicMessages,
-            &json!({"type": "message_delta", "usage": {"output_tokens": 3}})
-        ));
-        // Content events never complete a stream.
-        assert!(!is_terminal_event(
-            WireFormat::AnthropicMessages,
-            &json!({"type": "content_block_delta", "delta": {"type": "text_delta", "text": "x"}})
-        ));
-        assert!(is_terminal_event(
-            WireFormat::OpenAiResponses,
-            &json!({"type": "response.completed"})
-        ));
-        assert!(is_terminal_event(
-            WireFormat::OpenAiResponses,
-            &json!({"type": "response.incomplete"})
-        ));
-        assert!(is_terminal_event(
-            WireFormat::OpenAiResponses,
-            &json!({"type": "response.failed"})
-        ));
-        assert!(!is_terminal_event(
-            WireFormat::OpenAiChat,
-            &json!({"choices": [{"finish_reason": null}]})
-        ));
     }
 }

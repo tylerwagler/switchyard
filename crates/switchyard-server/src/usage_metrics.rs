@@ -85,9 +85,12 @@ impl Drop for StreamMeter {
 }
 
 /// Observes a routed response without changing its aggregate or streaming contents.
+/// `model` is the served target; stats retain both target and provider aggregates.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn observe(
     response: Response,
     model: &str,
+    provider_model: &str,
     started: Instant,
     stats: StatsAccumulator,
     cache_eligible: f64,
@@ -100,12 +103,13 @@ pub(crate) fn observe(
         upstream_headers,
     } = response;
     let model = model.to_string();
+    let provider_model = provider_model.to_string();
 
     let llm_response = match llm_response {
         LlmResponse::Agg(agg) => {
             record_terminal(&stats, &agg.usage, &model, started, cache_eligible);
             if let Some((log, context)) = routing_log {
-                log.append(context, &model, None, &agg.usage);
+                log.append(context, &model, &provider_model, None, &agg.usage);
             }
             if let Some(sink) = sink {
                 sink.0(UsageReport {
@@ -163,7 +167,7 @@ pub(crate) fn observe(
                     }
                     if failed && !recorded
                         && let Some((log, context)) = routing_log.as_ref() {
-                        log.append(context.clone(), &model, None, &Usage::default());
+                        log.append(context.clone(), &model, &provider_model, None, &Usage::default());
                     }
                     if failed {
                         record_stream_error(&stats, &model);
@@ -175,7 +179,7 @@ pub(crate) fn observe(
                     {
                         record_terminal(&stats, usage, &model, started, cache_eligible);
                         if let Some((log, context)) = routing_log.as_ref() {
-                            log.append(context.clone(), &model, None, usage);
+                            log.append(context.clone(), &model, &provider_model, None, usage);
                         }
                         recorded = true;
                         meter.finish(true);
@@ -189,7 +193,7 @@ pub(crate) fn observe(
                     let usage = latest_usage.unwrap_or_default();
                     record_terminal(&stats, &usage, &model, started, cache_eligible);
                     if let Some((log, context)) = routing_log {
-                        log.append(context, &model, None, &usage);
+                        log.append(context, &model, &provider_model, None, &usage);
                     }
                 }
                 meter.finish(true);
@@ -236,8 +240,9 @@ fn record_terminal(
     cache_eligible: f64,
 ) {
     let total_latency = started.elapsed();
-    record_usage(usage, model);
-    record_latency(model, total_latency);
+    let provider_model = stats.provider_model(&model.into());
+    record_usage(usage, &provider_model);
+    record_latency(&provider_model, total_latency);
     let mut token_usage = token_usage(usage);
     token_usage.cacheable_prompt_tokens =
         (token_usage.prompt_tokens as f64 * cache_eligible).round() as u64;
@@ -318,6 +323,7 @@ mod tests {
         let observed = observe(
             response,
             "model/worker",
+            "model/worker",
             Instant::now(),
             stats.clone(),
             0.0,
@@ -377,6 +383,7 @@ mod tests {
     fn observe_with(response: Response, sink: UsageSink) -> Response {
         observe(
             response,
+            "model/worker",
             "model/worker",
             Instant::now(),
             StatsAccumulator::default(),
