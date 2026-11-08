@@ -168,7 +168,7 @@ async fn check(State(gate): State<Arc<Gate>>, mut request: Request, next: Next) 
     strip_caller_headers(request.headers_mut());
     let response = next.run(request).await;
     if models {
-        return unlist_internal_models(response).await;
+        return present_model_list(response).await;
     }
     response
 }
@@ -180,9 +180,9 @@ const UNLISTED_ROLES: [&str; 2] = ["bot", "judge"];
 /// Largest `/v1/models` body the gate will rewrite; anything bigger passes through as is.
 const MODELS_BODY_LIMIT: usize = 1 << 20;
 
-/// Drops models whose `role` is in [`UNLISTED_ROLES`] from a successful JSON model list.
+/// Shapes a successful JSON model list for people's clients (see [`shape_model_list`]).
 /// Any other response, or one that does not parse, is passed through unchanged.
-async fn unlist_internal_models(response: Response) -> Response {
+async fn present_model_list(response: Response) -> Response {
     if response.status() != StatusCode::OK {
         return response;
     }
@@ -191,7 +191,7 @@ async fn unlist_internal_models(response: Response) -> Response {
         tracing::warn!("gate could not read the /v1/models body; returning it empty");
         return refuse_body(parts);
     };
-    let Some(filtered) = filter_model_list(&bytes) else {
+    let Some(filtered) = shape_model_list(&bytes) else {
         return Response::from_parts(parts, Body::from(bytes));
     };
     parts.headers.remove(header::CONTENT_LENGTH);
@@ -204,8 +204,11 @@ fn refuse_body(mut parts: http::response::Parts) -> Response {
     Response::from_parts(parts, Body::empty())
 }
 
-/// The model list without unlisted roles, or `None` when `bytes` is not a model list.
-fn filter_model_list(bytes: &[u8]) -> Option<Vec<u8>> {
+/// The model list without unlisted roles, with each model's `display_name` also sent as
+/// `name` (the field OpenAI-style clients such as Open WebUI show; they ignore
+/// `display_name`) unless the model already has a `name`. `None` when `bytes` is not a
+/// model list.
+fn shape_model_list(bytes: &[u8]) -> Option<Vec<u8>> {
     let mut list: serde_json::Value = serde_json::from_slice(bytes).ok()?;
     let data = list.get_mut("data")?.as_array_mut()?;
     data.retain(|model| {
@@ -214,6 +217,21 @@ fn filter_model_list(bytes: &[u8]) -> Option<Vec<u8>> {
             .and_then(serde_json::Value::as_str)
             .is_some_and(|role| UNLISTED_ROLES.contains(&role))
     });
+    for model in data.iter_mut() {
+        let Some(model) = model.as_object_mut() else {
+            continue;
+        };
+        if model.contains_key("name") {
+            continue;
+        }
+        if let Some(display) = model
+            .get("display_name")
+            .and_then(serde_json::Value::as_str)
+        {
+            let display = display.to_string();
+            model.insert("name".to_string(), serde_json::Value::String(display));
+        }
+    }
     serde_json::to_vec(&list).ok()
 }
 
@@ -466,7 +484,7 @@ mod tests {
             {"id": "ferret", "role": "bot"},
             {"id": "no-role"},
         ]});
-        let out = filter_model_list(&serde_json::to_vec(&list).unwrap()).unwrap();
+        let out = shape_model_list(&serde_json::to_vec(&list).unwrap()).unwrap();
         let out: serde_json::Value = serde_json::from_slice(&out).unwrap();
         let ids: Vec<&str> = out["data"]
             .as_array()
@@ -480,8 +498,23 @@ mod tests {
 
     #[test]
     fn model_list_filter_ignores_other_bodies() {
-        assert!(filter_model_list(b"not json").is_none());
-        assert!(filter_model_list(br#"{"error": "x"}"#).is_none());
+        assert!(shape_model_list(b"not json").is_none());
+        assert!(shape_model_list(br#"{"error": "x"}"#).is_none());
+    }
+
+    #[test]
+    fn model_list_sends_display_name_as_name() {
+        let list = json!({"object": "list", "data": [
+            {"id": "qwen", "role": "main", "display_name": "Qwen 3.8 Flash-Next"},
+            {"id": "named", "display_name": "Pretty", "name": "Already named"},
+            {"id": "plain"},
+        ]});
+        let out = shape_model_list(&serde_json::to_vec(&list).unwrap()).unwrap();
+        let out: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(out["data"][0]["name"], "Qwen 3.8 Flash-Next");
+        assert_eq!(out["data"][0]["display_name"], "Qwen 3.8 Flash-Next");
+        assert_eq!(out["data"][1]["name"], "Already named");
+        assert!(out["data"][2].get("name").is_none());
     }
 
     #[tokio::test]
@@ -490,7 +523,7 @@ mod tests {
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .body(Body::from("down"))
             .unwrap();
-        let out = unlist_internal_models(response).await;
+        let out = present_model_list(response).await;
         assert_eq!(out.status(), StatusCode::SERVICE_UNAVAILABLE);
         let body = axum::body::to_bytes(out.into_body(), 1024).await.unwrap();
         assert_eq!(&body[..], b"down");
