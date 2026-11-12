@@ -647,8 +647,37 @@ fn strip_anthropic_unsupported_constraints(value: &mut Value) -> bool {
             for key in ["minimum", "maximum", "minLength", "maxLength"] {
                 removed |= object.remove(key).is_some();
             }
-            for value in object.values_mut() {
-                removed |= strip_anthropic_unsupported_constraints(value);
+            // Property/definition names and literal values are not schema keywords.
+            for (key, value) in object.iter_mut() {
+                match key.as_str() {
+                    "properties" | "patternProperties" | "$defs" | "definitions"
+                    | "dependentSchemas" | "dependencies" => {
+                        if let Value::Object(schemas) = value {
+                            for schema in schemas.values_mut() {
+                                removed |= strip_anthropic_unsupported_constraints(schema);
+                            }
+                        }
+                    }
+                    "items"
+                    | "additionalItems"
+                    | "prefixItems"
+                    | "contains"
+                    | "additionalProperties"
+                    | "unevaluatedItems"
+                    | "unevaluatedProperties"
+                    | "propertyNames"
+                    | "allOf"
+                    | "anyOf"
+                    | "oneOf"
+                    | "not"
+                    | "if"
+                    | "then"
+                    | "else"
+                    | "contentSchema" => {
+                        removed |= strip_anthropic_unsupported_constraints(value);
+                    }
+                    _ => {}
+                }
             }
             removed
         }
@@ -1310,6 +1339,7 @@ fn ensure_anthropic_tool_input_object(arguments: Value) -> Value {
 
 // Encodes normalized tool definitions into Anthropic tool JSON.
 fn encode_anthropic_tools(tools: &[Tool]) -> Result<Value> {
+    let mut names = std::collections::HashSet::new();
     Ok(Value::Array(
         tools
             .iter()
@@ -1324,6 +1354,12 @@ fn encode_anthropic_tools(tools: &[Tool]) -> Result<Value> {
                         "MCP and provider tool encoding is not implemented".into(),
                     )
                 })?;
+                if !names.insert(tool.name.as_str()) {
+                    return Err(TranslationError::InvalidValue {
+                        path: "$.tools".to_string(),
+                        message: format!("duplicate tool name: {:?}", tool.name),
+                    });
+                }
                 let mut item = json!({
                     "name": tool.name,
                     "description": tool.description.clone().unwrap_or_default(),

@@ -324,6 +324,7 @@ async fn serve(
 }
 
 /// Try candidates in order until one succeeds or a failure stops fallback.
+#[allow(clippy::too_many_arguments)]
 async fn call_first_available<'a>(
     clients: &ClientRouter,
     algorithm: &str,
@@ -474,23 +475,27 @@ async fn call_one(
     let started = Instant::now();
     let mut routing_usage = None;
     let result = async {
-        let mut response = client?.call(request).await?;
+        let response = async { client?.call(request).await }
+            .await
+            .map_err(|source| LibsyError::client_call(model_id.clone(), source));
+        // Observe dispatch and live I/O once; buffering must not re-observe replay.
+        let mut response = observability::observe_client_call(response)?;
         if is_routing && let LlmResponse::Stream(chunks) = response.llm_response {
-            let (chunks, usage) = buffer_routing_stream(chunks).await?;
+            let (chunks, usage) = buffer_routing_stream(chunks)
+                .await
+                .map_err(|source| LibsyError::client_call(model_id.clone(), source))?;
             routing_usage = usage;
             response.llm_response = LlmResponse::Stream(chunks);
         }
         Ok(response)
     }
-    .await
-    .map_err(|source| LibsyError::client_call(model_id.clone(), source));
+    .await;
     let duration = started.elapsed();
 
     let result = result.map(|mut response| {
         response.set_served_model(model_id);
         response
     });
-    let result = observability::observe_client_call(result);
     if let Some(ttfb) = ttfb_of(&result, duration) {
         metrics::record_ttfb(
             algorithm,

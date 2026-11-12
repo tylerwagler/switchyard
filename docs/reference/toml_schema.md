@@ -65,7 +65,7 @@ route reaches no upstream. A file without a `[targets]` table is rejected with
 | `context_discovery` | No | unset | Set to `"llama_cpp"` to enable `/props` context discovery for VGR efficient targets. Disabled when unset. An explicit route `context_window` takes precedence. |
 | `api_key_env` | No | unset | Name of the environment variable holding the key. Omit to send no authentication. |
 | `forward_auth` | No | `false` | Forward the caller's provider credential and application headers. A route's forwarding clients must use one credential family unless they all use the same scheme, host, and port, such as one LLM gateway. |
-| `extra_headers` | No | `{}` | Custom HTTP headers sent to the model server. Set credentials with `api_key_env` or `forward_auth`; the server rejects headers owned by the selected auth mode. Header names are case-insensitive. |
+| `extra_headers` | No | `{}` | Custom HTTP headers sent to the model server. Set credentials with `api_key_env` or `forward_auth`; the server rejects headers owned by the selected auth mode. Header names are case-insensitive. Configured values replace caller values for the same name. |
 | `responses_reasoning` | No | `"auto"` | Responses reasoning replay: `"auto"`, `"preserve_encrypted"`, `"preserve_plaintext"`, or `"drop"`. Only valid for `openai_responses`. |
 | `fallback_on_rate_limit` | No | `true` | Try another completion candidate after an upstream HTTP 429 exhausts retries. Set to `false` to return the 429 instead. |
 | `max_retries` | No | `2` | Retry budget, `0`–`10`. |
@@ -518,6 +518,7 @@ the signals work and for tuning.
 | `capable_system_prompt` | No | unset | System prompt prepended for capable requests. |
 | `efficient_system_prompt` | No | unset | System prompt prepended for efficient requests. |
 | `recent_turn_window` | No | `3` | Trailing tool results the signals are computed over. |
+| `compaction_override` | No | `true` | Context compaction forces capable. Set `false` to use the other signals and picker normally. |
 | `capable_hold_turns` | No | `2` | Requests kept on capable after a switch. Signal-driven capable decisions also start finite holds. Active holds skip signal processing and classification; `0` disables; `-1` pins after a switch. |
 | `efficient_hold_turns` | No | `0` | Requests kept on efficient after a switch, even when errors appear. `0` disables; `-1` pins after a switch. |
 | `tool_semantics.observe` | No | `[]` | Exact ASCII case-insensitive domain tool names that count as read-only investigation. |
@@ -633,6 +634,7 @@ confidence threshold. Tool signals still drive escalation and recovery. See
 | `stage.efficient_first_threshold` | No | `0.4` | Signal confidence required after an Efficient classification. In `[0, 1]`. Also accepts `confidence_threshold`. |
 | `stage.capable_first_threshold` | No | `0.0` | Signal confidence required after a Capable classification. In `[0, 1]`. |
 | `stage.recent_turn_window` | No | `3` | Trailing tool results the signals are computed over. |
+| `stage.compaction_override` | No | `true` | Same compaction override as `stage_router`. Can also be set per `efficient` or `capable` profile. |
 | `stage.capable_hold_turns` | No | CF: `0`, EF: `2` | Same capable hold as `stage_router`: `0` disables; `-1` pins after a switch. |
 | `stage.efficient_hold_turns` | No | CF: `-1`; EF: `0` | Defaults to pinning efficient after a switch when the classifier selected capable-first. Explicit `0` disables; positive values hold that many requests. |
 | `stage.tool_semantics.observe` | No | `[]` | Additional exact ASCII case-insensitive tool names that count as observation. |

@@ -36,6 +36,10 @@ impl StreamCodec for AnthropicMessagesStreamCodec {
         }
     }
 
+    fn stops_at_terminal_event(&self) -> bool {
+        true
+    }
+
     fn sse_done_is_terminal(&self) -> bool {
         false
     }
