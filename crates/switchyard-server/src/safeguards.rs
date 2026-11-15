@@ -821,33 +821,56 @@ fn render_transcript(body: &Value) -> String {
 }
 
 /// Keeps the first `TRANSCRIPT_HEAD_CHARS` and at most `TRANSCRIPT_TAIL_CHARS`
-/// of the rest. The removed middle grows in whole `TRANSCRIPT_CUT_STEP_CHARS`
-/// steps and ends at a line break, so the kept text only changes at its end
-/// until the conversation outgrows the next step.
+/// of the rest, with `TRANSCRIPT_CUT_MARK` in place of the middle.
 fn shorten_transcript(out: String) -> String {
-    let chars = out.chars().count();
-    let Some(overflow) = chars.checked_sub(TRANSCRIPT_HEAD_CHARS + TRANSCRIPT_TAIL_CHARS) else {
-        return out;
-    };
-    if overflow == 0 {
-        return out;
+    match transcript_cut(&out) {
+        Some(cut) => format!(
+            "{}{TRANSCRIPT_CUT_MARK}{}",
+            &out[..cut.start],
+            &out[cut.end..]
+        ),
+        None => out,
     }
+}
+
+/// Stands in for the middle that `transcript_cut` removes.
+const TRANSCRIPT_CUT_MARK: &str = "\n[... earlier conversation removed ...]\n";
+
+/// The byte range of `text` to remove so it keeps its first
+/// `TRANSCRIPT_HEAD_CHARS` and at most `TRANSCRIPT_TAIL_CHARS` of the rest, or
+/// `None` when it fits. The removed middle grows in whole
+/// `TRANSCRIPT_CUT_STEP_CHARS` steps, so the kept text only changes at its end
+/// until the conversation outgrows the next step. The head ends at its last
+/// line break (when text comes before it) and the tail starts at a line, so
+/// only a first line longer than the head is cut. The last line is always kept
+/// whole: in a native classifier transcript it is the action under review.
+fn transcript_cut(text: &str) -> Option<std::ops::Range<usize>> {
+    let overflow = text
+        .chars()
+        .count()
+        .checked_sub(TRANSCRIPT_HEAD_CHARS + TRANSCRIPT_TAIL_CHARS)
+        .filter(|&overflow| overflow > 0)?;
     let removed = overflow.div_ceil(TRANSCRIPT_CUT_STEP_CHARS) * TRANSCRIPT_CUT_STEP_CHARS;
     let byte_at = |char_index: usize| {
-        out.char_indices()
+        text.char_indices()
             .nth(char_index)
-            .map_or(out.len(), |(byte, _)| byte)
+            .map_or(text.len(), |(byte, _)| byte)
     };
     let head_end = byte_at(TRANSCRIPT_HEAD_CHARS);
+    let head_end = text[..head_end]
+        .rfind('\n')
+        .filter(|&line_end| !text[..line_end].trim().is_empty())
+        .unwrap_or(head_end);
     let cut = byte_at(TRANSCRIPT_HEAD_CHARS + removed);
-    let tail_start = out[cut..]
+    let tail_start = text[cut..]
         .find('\n')
         .map_or(cut, |line_end| cut + line_end + 1);
-    format!(
-        "{}\n[... earlier conversation removed ...]\n{}",
-        &out[..head_end],
-        &out[tail_start..]
-    )
+    let last_line = text
+        .trim_end_matches('\n')
+        .rfind('\n')
+        .map_or(0, |line_end| line_end + 1);
+    let tail_start = tail_start.min(last_line);
+    (head_end < tail_start).then_some(head_end..tail_start)
 }
 
 /// Keeps the start and the end of every string in a tool input that is longer
@@ -2134,11 +2157,84 @@ fn native_stage_of(body: &Value, has_stage1: bool) -> NativeStage {
 }
 
 /// Points a native classifier request at the judge route: the judge reads Claude Code's own prompt and answers
-/// in its format.
-pub(crate) fn native_to_judge(state: &ServerState, body: &mut Value) {
+/// in its format. A long `<transcript>` is windowed like the gate's own judge transcript (`transcript_cut`);
+/// returns its length in characters before and after, when the request has one.
+pub(crate) fn native_to_judge(state: &ServerState, body: &mut Value) -> Option<(usize, usize)> {
     if let Some(judge) = state.runner.safeguards() {
         body["model"] = Value::String(judge.model.as_str().to_string());
     }
+    window_native_transcript(body)
+}
+
+/// Removes `transcript_cut`'s middle from the `<transcript>` of the last message, a string or text blocks (the
+/// transcript may span several), putting `TRANSCRIPT_CUT_MARK` in its place. Everything else is left as it is.
+/// Returns the transcript's length in characters before and after.
+fn window_native_transcript(body: &mut Value) -> Option<(usize, usize)> {
+    let content = body
+        .get_mut("messages")?
+        .as_array_mut()?
+        .last_mut()?
+        .get_mut("content")?;
+    let texts: Vec<&str> = match &*content {
+        Value::String(text) => vec![text.as_str()],
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter_map(|block| block["text"].as_str())
+            .collect(),
+        _ => return None,
+    };
+    let text = texts.concat();
+    let start = text.find("<transcript>")? + "<transcript>".len();
+    let end = start + text[start..].find("</transcript>")?;
+    let transcript = &text[start..end];
+    let chars = transcript.chars().count();
+    let Some(cut) = transcript_cut(transcript) else {
+        return Some((chars, chars));
+    };
+    let windowed =
+        chars - transcript[cut.clone()].chars().count() + TRANSCRIPT_CUT_MARK.chars().count();
+    let (cut_start, cut_end) = (start + cut.start, start + cut.end);
+    // Each text's part outside the cut, the mark going into the text where the cut starts.
+    let mut offset = 0;
+    let mut windowed_texts = Vec::with_capacity(texts.len());
+    for piece in &texts {
+        let piece_end = offset + piece.len();
+        let mut kept = String::new();
+        if offset < cut_start {
+            kept.push_str(&piece[..cut_start.min(piece_end) - offset]);
+        }
+        if (offset..piece_end).contains(&cut_start) {
+            kept.push_str(TRANSCRIPT_CUT_MARK);
+        }
+        if piece_end > cut_end {
+            kept.push_str(&piece[cut_end.max(offset) - offset..]);
+        }
+        windowed_texts.push(kept);
+        offset = piece_end;
+    }
+    match content {
+        Value::String(text) => *text = windowed_texts.concat(),
+        Value::Array(blocks) => {
+            let mut windowed_texts = windowed_texts.into_iter();
+            blocks.retain_mut(|block| {
+                let Some(original) = block["text"].as_str() else {
+                    return true;
+                };
+                let text = windowed_texts.next().unwrap_or_default();
+                if text == original {
+                    return true;
+                }
+                // A text block wholly inside the cut goes: an empty text block is an invalid request.
+                if text.is_empty() {
+                    return false;
+                }
+                block["text"] = Value::String(text);
+                true
+            });
+        }
+        _ => {}
+    }
+    Some((chars, windowed))
 }
 
 /// Claude Code's severity for a P(block): round(100 P).
@@ -2277,9 +2373,11 @@ fn last_tag<'a>(text: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// Logs native stage 2's verdict (the judge's `<severity>` and `<category>`) to the verdict log.
+/// `transcript` is the `<transcript>`'s length in characters before and after `native_to_judge` windowed it.
 pub(crate) fn native_stage2_tap(
     state: &ServerState,
     session_id: Option<String>,
+    transcript: Option<(usize, usize)>,
 ) -> Option<TextTap> {
     let log = state.safeguards_verdicts.clone()?;
     let started = Instant::now();
@@ -2287,6 +2385,8 @@ pub(crate) fn native_stage2_tap(
         log.append(json!({
             "kind": "native_stage2",
             "session_id": session_id,
+            "transcript_chars": transcript.map(|(_, windowed)| windowed),
+            "transcript_original_chars": transcript.map(|(original, _)| original),
             "severity": last_tag(&reply, "severity").and_then(|n| n.parse::<u32>().ok()),
             "category": last_tag(&reply, "category"),
             "ms": started.elapsed().as_millis() as u64,
@@ -2398,6 +2498,180 @@ mod tests {
             )
             .is_none()
         );
+    }
+
+    /// The text between the last message's transcript tags.
+    fn native_transcript_text(body: &Value) -> String {
+        let text: String = match &body["messages"][1]["content"] {
+            Value::String(text) => text.clone(),
+            Value::Array(blocks) => blocks
+                .iter()
+                .filter_map(|block| block["text"].as_str())
+                .collect(),
+            _ => String::new(),
+        };
+        let start = text.find("<transcript>").unwrap() + "<transcript>".len();
+        let end = text.find("</transcript>").unwrap();
+        text[start..end].to_string()
+    }
+
+    /// A session of `turns` Bash lines of about 500 characters after the task, the last line the action.
+    fn native_session(turns: usize, action: &str) -> Vec<String> {
+        let mut lines = vec![format!(r#"{{"user":"TASK {}"}}"#, "t".repeat(300))];
+        lines.extend(
+            (0..turns).map(|turn| format!(r#"{{"Bash":"echo {turn} {}"}}"#, "x".repeat(490))),
+        );
+        lines.push(action.to_string());
+        lines
+    }
+
+    #[test]
+    fn a_short_native_transcript_is_unchanged() {
+        let lines = native_session(20, r#"{"Bash":"git push"}"#);
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut body = transcript(&lines);
+        let original = body.clone();
+        let chars = native_transcript_text(&body).chars().count();
+        assert_eq!(window_native_transcript(&mut body), Some((chars, chars)));
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn a_long_native_transcript_keeps_the_task_and_the_whole_action() {
+        let big_action = format!(r#"{{"Write":"{} END"}}"#, "w".repeat(70_000));
+        for action in [r#"{"Bash":"git push --force"}"#.to_string(), big_action] {
+            let lines = native_session(300, &action);
+            let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+            let blocks = transcript(&lines);
+            let string = json!({"messages": [
+                blocks["messages"][0].clone(),
+                {"role": "user", "content": format!(
+                    "<transcript>\n{}\n</transcript>\nStage 2 instruction", lines.join("\n")
+                )},
+            ]});
+            for mut body in [blocks, string] {
+                let before = native_transcript_action(&body).expect("an action");
+                let original_chars = native_transcript_text(&body).chars().count();
+                let (original, windowed) =
+                    window_native_transcript(&mut body).expect("a transcript");
+                let text = native_transcript_text(&body);
+                assert_eq!(original, original_chars);
+                assert_eq!(windowed, text.chars().count());
+                assert!(windowed < original);
+                assert!(text.starts_with(&format!("\n{}\n", lines[0])));
+                let (_, tail) = text.split_once(TRANSCRIPT_CUT_MARK).expect("a cut");
+                // The tail starts at a line: a Bash line, or the action when it alone outgrows the tail.
+                assert!(
+                    tail.starts_with(r#"{"Bash":"echo "#) || tail.starts_with(action.as_str()),
+                    "{}",
+                    &tail[..40]
+                );
+                assert!(text.trim_end().ends_with(action.as_str()));
+                if action.len() < TRANSCRIPT_TAIL_CHARS {
+                    assert!(
+                        windowed
+                            <= TRANSCRIPT_HEAD_CHARS
+                                + TRANSCRIPT_CUT_MARK.len()
+                                + TRANSCRIPT_TAIL_CHARS
+                    );
+                }
+                // Stage 1 reads the same task and action from the windowed transcript.
+                let after = native_transcript_action(&body).expect("an action");
+                assert_eq!(before.0, after.0);
+                assert_eq!(
+                    (before.1.name, before.1.input),
+                    (after.1.name, after.1.input)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_growing_native_transcript_keeps_its_window_between_cut_steps() {
+        let mut previous: Option<(usize, String)> = None;
+        let mut moved = 0;
+        for turns in 80..400 {
+            let lines = native_session(
+                turns,
+                &format!(r#"{{"Bash":"echo {turns} {}"}}"#, "x".repeat(490)),
+            );
+            let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+            let mut body = transcript(&lines);
+            let (original, _) = window_native_transcript(&mut body).expect("a transcript");
+            let text = native_transcript_text(&body);
+            let step = original
+                .saturating_sub(TRANSCRIPT_HEAD_CHARS + TRANSCRIPT_TAIL_CHARS)
+                .div_ceil(TRANSCRIPT_CUT_STEP_CHARS);
+            if let Some((previous_step, previous_text)) = previous.replace((step, text.clone())) {
+                if step == previous_step {
+                    assert!(
+                        text.starts_with(&previous_text),
+                        "{turns} lines: the window moved within a step"
+                    );
+                } else {
+                    moved += 1;
+                }
+            }
+        }
+        // ~160k characters of growth: about ten steps.
+        assert!((8..=12).contains(&moved), "{moved}");
+    }
+
+    #[test]
+    fn a_body_without_a_native_transcript_is_untouched() {
+        let long = "x".repeat(100_000);
+        for mut body in [
+            json!({"model": "m"}),
+            json!({"messages": []}),
+            json!({"messages": [{"role": "user", "content": long.clone()}]}),
+            json!({"messages": [{"role": "user", "content": [{"type": "text", "text": format!("<transcript>{long}")}]}]}),
+            json!({"messages": [{"role": "user", "content": {"text": long}}]}),
+        ] {
+            let original = body.clone();
+            assert_eq!(window_native_transcript(&mut body), None);
+            assert_eq!(body, original);
+        }
+    }
+
+    #[test]
+    fn native_windowing_changes_only_the_transcript() {
+        let lines = native_session(300, r#"{"Bash":"git push"}"#);
+        let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut body = transcript(&lines);
+        body["model"] = json!("auto-mode");
+        body["max_tokens"] = json!(10240);
+        body["system"] = json!([{"type": "text", "text": "You are a security monitor"}]);
+        body["metadata"] = json!({"user_id": "u"});
+        let content = body["messages"][1]["content"].as_array_mut().unwrap();
+        content.insert(0, json!({"type": "image", "source": {"data": "x"}}));
+        content.last_mut().unwrap()["cache_control"] = json!({"type": "ephemeral"});
+        let original = body.clone();
+        window_native_transcript(&mut body).expect("a transcript");
+        let without_messages = |body: &Value| {
+            let mut body = body.clone();
+            body.as_object_mut().unwrap().remove("messages");
+            body
+        };
+        assert_eq!(without_messages(&body), without_messages(&original));
+        assert_eq!(body["messages"][0], original["messages"][0]);
+        let (kept, was) = (
+            body["messages"][1]["content"].as_array().unwrap(),
+            original["messages"][1]["content"].as_array().unwrap(),
+        );
+        assert!(kept.len() < was.len());
+        // The image, the opening tag and the task, and the closing tag with the instruction are as they were.
+        assert_eq!(kept[..3], was[..3]);
+        assert_eq!(kept.last(), was.last());
+        // Each kept block is one of the request's own; only the block the cut starts in carries the mark.
+        let marked: Vec<&Value> = kept.iter().filter(|block| !was.contains(block)).collect();
+        assert_eq!(marked.len(), 1);
+        assert!(
+            marked[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(TRANSCRIPT_CUT_MARK)
+        );
+        assert!(kept.iter().all(|block| block["text"] != ""));
     }
 
     #[test]
