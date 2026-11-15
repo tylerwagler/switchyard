@@ -32,4 +32,4 @@ USER 1000:1000
 EXPOSE 4000
 
 # To run the gate instead: docker run ... --entrypoint switchyard-gate IMAGE --config ...
-ENTRYPOINT ["switchyard-server"]
+ENTRYPOINT ["switchyard-server", "--host", "0.0.0.0"]

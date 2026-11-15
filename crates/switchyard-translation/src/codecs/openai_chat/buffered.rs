@@ -4,10 +4,12 @@
 //! Buffered codec for OpenAI Chat Completions request and response JSON.
 
 use serde_json::{Map, Value, json};
+use switchyard_protocol::MAX_IR_TEMPERATURE;
 
+use super::MAX_TEMPERATURE;
 use crate::codecs::common::{
     first_nonempty_string, is_known_role_name, provider_extensions, reasoning_text_from_blocks,
-    reasoning_text_from_details, text_from_blocks,
+    reasoning_text_from_details, scale_temperature, text_from_blocks,
 };
 use crate::codecs::openai_media::{
     ImagePayload, file_payload, file_source_text, image_payload, image_source_text,
@@ -50,7 +52,10 @@ impl FormatCodec for OpenAiChatCodec {
                 .map(ToOwned::to_owned),
             stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
             sampling: SamplingParams {
-                temperature: body.get("temperature").and_then(Value::as_f64),
+                temperature: body
+                    .get("temperature")
+                    .and_then(Value::as_f64)
+                    .map(|value| scale_temperature(value, MAX_TEMPERATURE, MAX_IR_TEMPERATURE)),
                 top_p: body.get("top_p").and_then(Value::as_f64),
                 top_k: None,
             },
@@ -145,15 +150,14 @@ impl FormatCodec for OpenAiChatCodec {
                     ));
                     continue;
                 }
-                match role {
-                    Role::System | Role::Developer => {
-                        request
-                            .instructions
-                            .push(InstructionBlock { role, content });
-                    }
-                    Role::User | Role::Assistant | Role::Tool => {
-                        request.messages.push(Message::new(role, content));
-                    }
+                // Leading system and developer messages are top-level instructions.
+                // Later ones stay in place as messages.
+                if matches!(role, Role::System | Role::Developer) && request.messages.is_empty() {
+                    request
+                        .instructions
+                        .push(InstructionBlock { role, content });
+                } else {
+                    request.messages.push(Message::new(role, content));
                 }
             }
         }
@@ -247,6 +251,7 @@ impl FormatCodec for OpenAiChatCodec {
             body.insert("max_completion_tokens".to_string(), json!(value));
         }
         if let Some(value) = request.sampling.temperature {
+            let value = scale_temperature(value, MAX_IR_TEMPERATURE, MAX_TEMPERATURE);
             body.insert("temperature".to_string(), json!(value));
         }
         if let Some(value) = request.sampling.top_p {

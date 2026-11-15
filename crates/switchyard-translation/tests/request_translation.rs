@@ -2286,6 +2286,81 @@ fn responses_rebuild_preserves_inline_instructions() -> TestResult {
     Ok(())
 }
 
+#[test]
+fn chat_rebuild_preserves_inline_instructions() -> TestResult {
+    let engine = TranslationEngine::default();
+    let policy = TranslationPolicy::default();
+    let body = json!({
+        "model": "gpt-4",
+        "messages": [
+            {"role": "system", "content": "Initial system."},
+            {"role": "developer", "content": "Initial developer."},
+            {"role": "user", "content": "Hello."},
+            {"role": "system", "content": "Later system."},
+            {"role": "developer", "content": "Later developer."},
+            {"role": "developer", "content": "Separate message."},
+            {"role": "user", "content": "Original suffix."}
+        ]
+    });
+    let mut request = engine
+        .decode_request(WireFormat::OpenAiChat, &body, &policy)?
+        .request;
+    request.preservation.requests.clear();
+
+    // Leading instructions stay top-level. Later ones stay in place.
+    assert_eq!(request.instructions.len(), 2);
+    assert_eq!(request.messages[1].role, Role::System);
+    assert_eq!(request.messages[2].role, Role::Developer);
+
+    assert_eq!(
+        engine
+            .encode_request(WireFormat::OpenAiChat, &request, &policy)?
+            .body,
+        body
+    );
+
+    let responses = engine
+        .encode_request(WireFormat::OpenAiResponses, &request, &policy)?
+        .body;
+    assert_eq!(
+        responses,
+        json!({
+            "model": "gpt-4",
+            "instructions": "Initial system.\n\nInitial developer.",
+            "input": [
+                {"type": "message", "role": "user", "content": "Hello."},
+                {"type": "message", "role": "system", "content": "Later system."},
+                {"type": "message", "role": "developer", "content": "Later developer."},
+                {"type": "message", "role": "developer", "content": "Separate message."},
+                {"type": "message", "role": "user", "content": "Original suffix."}
+            ]
+        })
+    );
+
+    let anthropic = engine
+        .encode_request(WireFormat::AnthropicMessages, &request, &policy)?
+        .body;
+    assert_eq!(
+        anthropic["system"],
+        "Initial system.\n\nInitial developer.\n\nLater system.\n\nLater developer.\n\nSeparate message."
+    );
+    assert_eq!(anthropic["messages"].as_array().map(Vec::len), Some(2));
+
+    // A suffix-only edit leaves earlier messages unchanged.
+    request.messages.last_mut().ok_or("missing suffix")?.content = vec![ContentBlock::Text {
+        text: "Edited suffix.".into(),
+    }];
+    let mut expected = body.clone();
+    expected["messages"][6]["content"] = json!("Edited suffix.");
+    assert_eq!(
+        engine
+            .encode_request(WireFormat::OpenAiChat, &request, &policy)?
+            .body,
+        expected
+    );
+    Ok(())
+}
+
 // Anthropic `system` is text only, so non-text instruction content is lossy.
 #[test]
 fn anthropic_reports_dropped_instruction_content() -> TestResult {
@@ -3982,25 +4057,56 @@ fn openai_tool_strictness_is_preserved_for_anthropic() -> TestResult {
     Ok(())
 }
 
-// Verifies Anthropic-bound OpenAI requests get the required max_tokens fallback.
+// Verifies Anthropic defaults and the policy for discarded non-default temperatures.
 #[test]
-fn openai_request_to_anthropic_adds_required_default_max_tokens() -> TestResult {
+fn openai_request_to_anthropic_parameters() -> TestResult {
     let engine = TranslationEngine::default();
     let body = json!({
         "model": "gpt-5",
         "messages": [{"role": "user", "content": "hi"}]
     });
 
-    let output = engine
-        .translate_request(
-            WireFormat::OpenAiChat,
-            WireFormat::AnthropicMessages,
-            &body,
-            &TranslationPolicy::default(),
-        )?
-        .body;
-
-    assert_eq!(output["max_tokens"], 64_000);
+    for (temperature, is_lossy) in [
+        (None, false),
+        (Some(1.0), true),
+        (Some(0.5), true),
+        (Some(2.0), false),
+    ] {
+        let mut body = body.clone();
+        if let Some(temperature) = temperature {
+            body["temperature"] = json!(temperature);
+        }
+        for lossy_conversion_policy in [
+            LossyConversionPolicy::AllowWithDiagnostics,
+            LossyConversionPolicy::Reject,
+        ] {
+            let policy = TranslationPolicy {
+                lossy_conversion_policy,
+                ..normalized_policy()
+            };
+            let result = engine.translate_request(
+                WireFormat::OpenAiChat,
+                WireFormat::AnthropicMessages,
+                &body,
+                &policy,
+            );
+            if is_lossy && lossy_conversion_policy == LossyConversionPolicy::Reject {
+                assert!(
+                    matches!(result, Err(TranslationError::LossyConversion(message))
+                    if message.contains("temperature"))
+                );
+                continue;
+            }
+            let output = result?;
+            assert_eq!(output.body["max_tokens"], 64_000);
+            assert!(output.body.get("temperature").is_none());
+            assert_eq!(output.diagnostics.len(), usize::from(is_lossy));
+            if is_lossy {
+                assert_eq!(output.diagnostics[0].code, "lossy_conversion");
+                assert!(output.diagnostics[0].message.contains("temperature"));
+            }
+        }
+    }
     Ok(())
 }
 

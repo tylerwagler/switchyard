@@ -5,11 +5,12 @@
 
 pub mod common;
 
+use futures::{TryStreamExt, executor::block_on};
 use pretty_assertions::assert_eq;
-use serde_json::json;
+use serde_json::{Value, json};
 use switchyard_translation::{
     ContentBlock, PreservationPolicy, ProviderExtensions, StopReason, TranslationEngine,
-    TranslationPolicy, WireFormat,
+    TranslationPolicy, WireFormat, encode_stream,
 };
 
 use common::{
@@ -17,6 +18,44 @@ use common::{
 };
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
+
+#[test]
+fn responses_tool_arguments_are_not_double_encoded() -> TestResult {
+    let engine = TranslationEngine::default();
+    let format = WireFormat::OpenAiResponses;
+    let policy = TranslationPolicy::default();
+    for (arguments, expected) in [
+        (json!(r#"{"city": "Paris"}"#), json!({"city": "Paris"})),
+        (json!("not JSON"), json!("not JSON")),
+        (json!({"city": "Paris"}), json!({"city": "Paris"})),
+    ] {
+        let body = json!({"output": [{"type": "function_call", "call_id": "call_1",
+            "name": "lookup", "arguments": arguments}]});
+        let response = engine.decode_response(format, &body, &policy)?.response;
+        assert_eq!(
+            engine.encode_response(format, &response, &policy)?.body,
+            body
+        );
+
+        let output = engine
+            .encode_response(format, &response, &normalized_policy())?
+            .body;
+        let arguments = output["output"][0]["arguments"]
+            .as_str()
+            .ok_or("missing arguments")?;
+        assert_eq!(serde_json::from_str::<Value>(arguments)?, expected);
+
+        let events =
+            block_on(encode_stream(response.into_stream(), format, None)?.try_collect::<Vec<_>>())?;
+        let arguments: String = events
+            .iter()
+            .filter(|event| event["type"] == "response.function_call_arguments.delta")
+            .filter_map(|event| event["delta"].as_str())
+            .collect();
+        assert_eq!(serde_json::from_str::<Value>(&arguments)?, expected);
+    }
+    Ok(())
+}
 
 #[test]
 fn responses_native_output_is_preserved_or_rejected() -> TestResult {
@@ -868,6 +907,9 @@ fn openai_chat_response_with_tool_call_translates_to_responses_output_item() -> 
                 }, {
                     "id": "call_3", "type": "function",
                     "function": {"name": "exec", "arguments": "{\"input\":\"ls -la\"}"}
+                }, {
+                    "id": "call_4", "type": "function",
+                    "function": {"name": "docs__search", "arguments": "{}"}
                 }]
             },
             "finish_reason": "tool_calls"
@@ -893,7 +935,9 @@ fn openai_chat_response_with_tool_call_translates_to_responses_output_item() -> 
             {"type": "function_call", "call_id": "call_2", "name": "mcp__docs__search",
                 "arguments": "{\"query\": \"streaming\"}"},
             {"type": "function_call", "call_id": "call_3", "name": "exec",
-                "arguments": "{\"input\": \"ls -la\"}"}
+                "arguments": "{\"input\": \"ls -la\"}"},
+            {"type": "function_call", "call_id": "call_4", "name": "docs__search",
+                "arguments": "{}"}
         ])
     );
     assert_eq!(
@@ -914,6 +958,7 @@ fn openai_chat_response_with_tool_call_translates_to_responses_output_item() -> 
             "input": "Search and list files",
             "tools": [
                 {"type": "function", "name": "search", "parameters": {}},
+                {"type": "function", "name": "docs__search", "parameters": {}},
                 {"type": "namespace", "name": "mcp__docs", "tools": [
                     {"type": "function", "name": "search", "parameters": {}}
                 ]},
@@ -930,7 +975,8 @@ fn openai_chat_response_with_tool_call_translates_to_responses_output_item() -> 
             "arguments": "{\"q\": \"rust\"}"},
         {"type": "function_call", "call_id": "call_2", "name": "search",
             "namespace": "mcp__docs", "arguments": "{\"query\": \"streaming\"}"},
-        {"type": "custom_tool_call", "call_id": "call_3", "name": "exec", "input": "ls -la"}
+        {"type": "custom_tool_call", "call_id": "call_3", "name": "exec", "input": "ls -la"},
+        {"type": "function_call", "call_id": "call_4", "name": "docs__search", "arguments": "{}"}
     ]);
     let anthropic = engine
         .translate_response(
@@ -1010,7 +1056,7 @@ fn openai_chat_response_with_text_and_tool_call_translates_both_to_responses() -
         "usage": {"prompt_tokens": 4, "completion_tokens": 3, "total_tokens": 7}
     });
 
-    let output = engine
+    let mut output = engine
         .translate_response(
             WireFormat::OpenAiChat,
             WireFormat::OpenAiResponses,
@@ -1023,6 +1069,22 @@ fn openai_chat_response_with_text_and_tool_call_translates_both_to_responses() -
     assert_eq!(output["output"][0]["content"][0]["text"], "Let me check.");
     assert_eq!(output["output"][1]["type"], "function_call");
     assert_eq!(output["output"][1]["call_id"], "call_1");
+
+    // Check text before the tool call, then reverse the items to check text after it.
+    for _ in 0..2 {
+        let decoded = engine
+            .decode_response(
+                WireFormat::OpenAiResponses,
+                &output,
+                &TranslationPolicy::default(),
+            )?
+            .response;
+        assert_eq!(decoded.outputs[0].stop_reason, Some(StopReason::ToolUse));
+        output["output"]
+            .as_array_mut()
+            .ok_or("output should be an array")?
+            .reverse();
+    }
     Ok(())
 }
 
