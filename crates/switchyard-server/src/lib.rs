@@ -1306,9 +1306,11 @@ async fn handle_llm_request(
     } else {
         None
     };
-    if native == Some(safeguards::NativeStage::Two) {
-        safeguards::native_to_judge(&state, &mut body);
-    }
+    let native_transcript = if native == Some(safeguards::NativeStage::Two) {
+        safeguards::native_to_judge(&state, &mut body)
+    } else {
+        None
+    };
     // Claude Code's attribution block: metered first, then removed when the
     // route forwards to backends that would only see it as prompt text.
     if wire_format == WireFormat::AnthropicMessages {
@@ -1342,7 +1344,7 @@ async fn handle_llm_request(
                 )
             }),
             if native == Some(safeguards::NativeStage::Two) {
-                safeguards::native_stage2_tap(&state, session_id)
+                safeguards::native_stage2_tap(&state, session_id, native_transcript)
             } else {
                 safeguards::client_classifier_tap(&state, &body, session_id)
             },
