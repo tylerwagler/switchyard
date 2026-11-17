@@ -481,7 +481,7 @@ async fn call_one(
         // Observe dispatch and live I/O once; buffering must not re-observe replay.
         let mut response = observability::observe_client_call(response)?;
         if is_routing && let LlmResponse::Stream(chunks) = response.llm_response {
-            let (chunks, usage) = buffer_routing_stream(chunks)
+            let (chunks, usage) = buffer_routing_stream(chunks, &response.upstream_headers)
                 .await
                 .map_err(|source| LibsyError::client_call(model_id.clone(), source))?;
             routing_usage = usage;
@@ -540,6 +540,7 @@ async fn call_one(
 // Routing logs need the final usage, but replay must keep signed provider events intact.
 async fn buffer_routing_stream(
     mut chunks: LlmResponseStream,
+    upstream_headers: &http::HeaderMap,
 ) -> std::result::Result<(LlmResponseStream, Option<Usage>), LlmClientError> {
     let mut events = Vec::new();
     let mut usage = None;
@@ -554,7 +555,7 @@ async fn buffer_routing_stream(
                     return Err(LlmClientError::UpstreamHttp {
                         status: StatusCode::BAD_GATEWAY,
                         body: message.clone(),
-                        headers: Box::new(http::HeaderMap::new()),
+                        headers: Box::new(upstream_headers.clone()),
                     });
                 }
                 _ => {}
@@ -1313,12 +1314,12 @@ mod tests {
                     FirstOutcome::ContentPolicy(status) => Err(LlmClientError::UpstreamHttp {
                         status,
                         body: r#"{"error":{"code":"content_policy_violation","message":"request blocked by content policy","type":"invalid_request_error"},"metadata":{"documentation_section":"context window"}}"#.to_string(),
-                        headers: Box::new(http::HeaderMap::new()),
+                        headers: Box::default(),
                     }),
                     FirstOutcome::Unauthorized => Err(LlmClientError::UpstreamHttp {
                         status: StatusCode::UNAUTHORIZED,
                         body: "unauthorized".to_string(),
-                        headers: Box::new(http::HeaderMap::new()),
+                        headers: Box::default(),
                     }),
                     FirstOutcome::StreamSuccess => Ok(stream_response(vec![
                         LlmResponseChunk::TextDelta {
@@ -2575,7 +2576,7 @@ mod tests {
                     &error(LlmClientError::UpstreamHttp {
                         status,
                         body: "failed".to_string(),
-                        headers: Box::new(http::HeaderMap::new()),
+                        headers: Box::default(),
                     }),
                     true
                 ),
@@ -2599,7 +2600,7 @@ mod tests {
                     &error(LlmClientError::UpstreamHttp {
                         status: StatusCode::BAD_REQUEST,
                         body: body.to_string(),
-                        headers: Box::new(http::HeaderMap::new()),
+                        headers: Box::default(),
                     }),
                     true
                 ),
@@ -2620,7 +2621,7 @@ mod tests {
                     &error(LlmClientError::UpstreamHttp {
                         status,
                         body: "failed".to_string(),
-                        headers: Box::new(http::HeaderMap::new()),
+                        headers: Box::default(),
                     }),
                     true
                 ),

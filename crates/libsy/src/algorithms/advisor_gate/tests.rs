@@ -718,7 +718,7 @@ async fn fail_open_logs_redact_the_upstream_error_body() {
                 Err(LlmClientError::UpstreamHttp {
                     status: http::StatusCode::INTERNAL_SERVER_ERROR,
                     body: format!("{MARKER}: validation failed"),
-                    headers: Box::new(http::HeaderMap::new()),
+                    headers: Box::default(),
                 })
             } else {
                 Ok(reply("done"))

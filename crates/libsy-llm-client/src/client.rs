@@ -656,9 +656,9 @@ impl TranslatingLlmClient {
         }
 
         let retry_after = retry_after_delay(response.headers());
-        // Captured before the body is consumed: a failure still has to carry the
-        // headers the client reads for retry and rate-limit decisions.
-        let upstream_headers = forwardable_error_headers(response.headers());
+        // Fork: `retry-after` given as an HTTP date is normalised to whole seconds,
+        // which is what the client reads (see `forwardable_error_headers`).
+        let headers = Box::new(forwardable_error_headers(response.headers()));
         let body = match response.text().await {
             Ok(body) => body,
             Err(error) => {
@@ -682,7 +682,7 @@ impl TranslatingLlmClient {
                 LlmClientError::UpstreamHttp {
                     status,
                     body,
-                    headers: Box::new(upstream_headers),
+                    headers,
                 }
             };
         Err(AttemptFailure {
@@ -3771,6 +3771,41 @@ mod tests {
         Ok(())
     }
 
+    // The error keeps every header of the last attempt; consumers choose what to forward.
+    #[tokio::test]
+    async fn upstream_error_carries_headers_from_the_last_attempt()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = MockServer::start().await;
+        // A zero `retry-after` keeps the retry from sleeping.
+        let reply = |id: &str| {
+            ResponseTemplate::new(429)
+                .insert_header("retry-after", "0")
+                .insert_header("x-request-id", id)
+                .insert_header("set-cookie", "a=b")
+        };
+        Mock::given(method("POST"))
+            .respond_with(reply("first"))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(reply("second"))
+            .mount(&server)
+            .await;
+        let client =
+            TranslatingLlmClient::new(&chat_map_with_retries(&format!("{}/v1", server.uri()), 1))?;
+        let Err(LlmClientError::UpstreamHttp { headers, .. }) = client
+            .call_rewrite_model(request_for(Some("gpt"), false), None)
+            .await
+        else {
+            panic!("expected an upstream HTTP error");
+        };
+        assert_eq!(headers["x-request-id"], "second");
+        assert_eq!(headers["retry-after"], "0");
+        assert_eq!(headers["set-cookie"], "a=b");
+        Ok(())
+    }
+
     #[tokio::test]
     async fn deadline_expires_before_send_or_stream_poll()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
@@ -3874,7 +3909,7 @@ mod tests {
                 error: LlmClientError::UpstreamHttp {
                     status,
                     body: String::new(),
-                    headers: Box::new(http::HeaderMap::new()),
+                    headers: Box::default(),
                 },
                 status: Some(status),
                 retry_after: None,
@@ -3892,7 +3927,7 @@ mod tests {
                 error: LlmClientError::UpstreamHttp {
                     status,
                     body: String::new(),
-                    headers: Box::new(http::HeaderMap::new()),
+                    headers: Box::default(),
                 },
                 status: Some(status),
                 retry_after: None,

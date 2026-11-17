@@ -79,8 +79,9 @@ const FORWARDED_UPSTREAM_HEADERS: &[&str] = &[
     "openai-processing-ms",
     // Anthropic spells its correlation id without the `x-` prefix.
     "request-id",
-    // Retry hints are read on failures as much as on successes.
+    // Callers use these to decide when to retry an upstream error.
     "retry-after",
+    "retry-after-ms",
     "traceparent",
     "tracestate",
     "x-litellm-response-cost",
@@ -108,19 +109,22 @@ fn should_forward_upstream_header(name: &HeaderName) -> bool {
             .any(|prefix| name.starts_with(prefix))
 }
 
-/// Appends the upstream headers this server forwards to a response.
-///
-/// Used for successes in the handler and for upstream failures where the error is
-/// rendered, so a client sees retry and rate-limit hints either way. A failure is
-/// where those hints matter most, and the error would otherwise carry none.
-fn append_forwarded_upstream_headers(response: &mut Response, headers: &HeaderMap) {
-    let response_headers = response.headers_mut();
-    for (name, value) in headers.iter() {
-        if should_forward_upstream_header(name) {
-            response_headers.append(name.clone(), value.clone());
+// Copies allowed upstream headers without replacing headers this server already set.
+fn forward_upstream_headers(target: &mut HeaderMap, upstream: &HeaderMap) {
+    let connection_headers = connection_header_names(upstream);
+    for name in upstream.keys() {
+        if !should_forward_upstream_header(name)
+            || target.contains_key(name)
+            || connection_headers.contains(name)
+        {
+            continue;
+        }
+        for value in upstream.get_all(name) {
+            target.append(name.clone(), value.clone());
         }
     }
 }
+
 /// Non-standard status used only in logs and metrics for a request whose
 /// downstream client disconnected before any response was written.
 const CLIENT_CLOSED_REQUEST: u16 = 499;
@@ -904,15 +908,18 @@ fn fallback_url(base_url: &str, path_and_query: &str) -> Result<reqwest::Url, St
     Ok(url)
 }
 
-fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
-    let connection_headers = headers
+fn connection_header_names(headers: &HeaderMap) -> Vec<HeaderName> {
+    headers
         .get_all(axum::http::header::CONNECTION)
         .iter()
         .filter_map(|value| value.to_str().ok())
         .flat_map(|value| value.split(','))
         .filter_map(|name| HeaderName::from_bytes(name.trim().as_bytes()).ok())
-        .collect::<Vec<_>>();
-    for name in connection_headers {
+        .collect()
+}
+
+fn strip_hop_by_hop_headers(headers: &mut HeaderMap) {
+    for name in connection_header_names(headers) {
         headers.remove(name);
     }
     for name in [
@@ -1450,7 +1457,7 @@ async fn handle_llm_request(
     };
     // Forward upstream headers before Switchyard writes its own so any header
     // this server emits always overrides an upstream echo of the same name.
-    append_forwarded_upstream_headers(&mut response, &upstream_headers);
+    forward_upstream_headers(response.headers_mut(), &upstream_headers);
     if let Some(provider_model) = provider_model.as_ref() {
         attach_routing_headers(&mut response, provider_model);
     }
@@ -1650,11 +1657,7 @@ fn client_error(error: &LlmClientError) -> Response {
             status,
             body,
             headers,
-        } => {
-            let mut response = upstream_error(*status, body);
-            append_forwarded_upstream_headers(&mut response, headers);
-            response
-        }
+        } => upstream_error(*status, body, headers),
         LlmClientError::Transport { source } | LlmClientError::InvalidResponse { source } => {
             error_response(
                 StatusCode::BAD_GATEWAY,
@@ -1681,7 +1684,7 @@ fn client_error(error: &LlmClientError) -> Response {
 }
 
 // Keep the provider's message and nonempty string code in our error JSON.
-fn upstream_error(status: StatusCode, body: &str) -> Response {
+fn upstream_error(status: StatusCode, body: &str, headers: &HeaderMap) -> Response {
     let parsed = serde_json::from_str::<Value>(body).unwrap_or_default();
     let error = &parsed["error"];
     let message = error["message"].as_str().unwrap_or(body);
@@ -1693,6 +1696,7 @@ fn upstream_error(status: StatusCode, body: &str) -> Response {
     if parsed["type"] == "error" && parsed["error"].is_object() {
         error.anthropic_body = Some(parsed.clone());
     }
+    error.upstream_headers = headers.clone();
     let mut response = error.into_response(WireFormat::OpenAiChat);
     // Provider messages and codes can quote request content; log only fixed metadata.
     response
@@ -1711,6 +1715,8 @@ struct ApiError {
     /// An Anthropic upstream's error JSON, sent unchanged to Anthropic callers
     /// because Claude Code's recovery matches its wording.
     anthropic_body: Option<Value>,
+    // Unfiltered headers from an upstream HTTP error; the allowed ones are forwarded.
+    upstream_headers: HeaderMap,
 }
 
 impl ApiError {
@@ -1726,6 +1732,7 @@ impl ApiError {
             error_type,
             code: code.into(),
             anthropic_body: None,
+            upstream_headers: HeaderMap::new(),
         }
     }
 
@@ -1749,6 +1756,7 @@ impl ApiError {
             }),
         };
         let mut response = (self.status, Json(body)).into_response();
+        forward_upstream_headers(response.headers_mut(), &self.upstream_headers);
         response
             .extensions_mut()
             .insert(RequestLogError(self.message.clone()));
@@ -2719,7 +2727,7 @@ target = "judge"
             body: format!(
                 r#"{{"error":{{"message":"validation failed: {LEAKED}","code":"invalid_request_{LEAKED}"}}}}"#
             ),
-            headers: Box::new(http::HeaderMap::new()),
+            headers: Box::default(),
         };
         for wire_format in [
             WireFormat::OpenAiChat,
@@ -2749,7 +2757,10 @@ target = "judge"
     fn upstream_header_forwarding_covers_litellm_cost() {
         for name in [
             "baggage",
+            "retry-after",
+            "retry-after-ms",
             "x-litellm-response-cost",
+            "x-should-retry",
             "x-ratelimit-remaining",
             "x-upstream-retry",
         ] {

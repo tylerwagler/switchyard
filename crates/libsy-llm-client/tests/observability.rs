@@ -449,7 +449,7 @@ impl RoutedLlmClient for JudgeClient {
             JudgeOutcome::CallFailure => Err(LlmClientError::UpstreamHttp {
                 status: http::StatusCode::INTERNAL_SERVER_ERROR,
                 body: format!(r#"{{"error":{{"message":"server error: {LEAKED_CONTENT}"}}}}"#),
-                headers: Box::new(http::HeaderMap::new()),
+                headers: Box::default(),
             }),
             JudgeOutcome::Reply(text) => Ok(Response {
                 llm_response: LlmResponse::Agg(text_response(None, *text)),
@@ -1530,7 +1530,7 @@ impl RoutedLlmClient for FailingStreamClient {
             Err(LlmClientError::UpstreamHttp {
                 status: http::StatusCode::BAD_GATEWAY,
                 body: LEAKED_CONTENT.into(),
-                headers: Box::new(http::HeaderMap::new()),
+                headers: Box::default(),
             })
         } else {
             Ok(LlmResponseChunk::StreamError {
