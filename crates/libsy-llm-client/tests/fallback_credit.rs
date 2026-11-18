@@ -7,10 +7,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::process::Command;
 
 use serde_json::{Value, json};
-use switchyard_llm_client::{
-    Backend, HttpBackendConfig, ModelConfig, RawResponse, TranslatingLlmClient,
-};
-use switchyard_protocol::WireFormat;
+use switchyard_llm_client::{Backend, HttpBackendConfig, ModelConfig, TranslatingLlmClient};
+use switchyard_protocol::{Metadata, Request, WireFormat};
+use switchyard_translation::{TranslationEngine, TranslationPolicy};
 use tracing_subscriber::fmt::format::FmtSpan;
 use wiremock::matchers::{body_partial_json, header, headers, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -156,17 +155,7 @@ async fn fallback_credit_retry_child() -> TestResult {
         )
     });
     let client = TranslatingLlmClient::new(&models)?;
-    let RawResponse::Buffered(refusal) = client
-        .call_rewrite_model_raw(
-            initial_body.clone(),
-            betas(INITIAL_BETAS),
-            None,
-            WireFormat::AnthropicMessages,
-        )
-        .await?
-    else {
-        return Err("expected a buffered refusal".into());
-    };
+    let refusal = call_anthropic(&client, initial_body.clone(), betas(INITIAL_BETAS)).await?;
     assert_eq!(refusal["stop_reason"], "refusal");
     let token = refusal["stop_details"]["fallback_credit_token"]
         .as_str()
@@ -180,17 +169,7 @@ async fn fallback_credit_retry_child() -> TestResult {
         .remove("fallbacks");
     retry_body["model"] = json!("claude-opus-4-8");
     retry_body["fallback_credit_token"] = json!(token);
-    let RawResponse::Buffered(answer) = client
-        .call_rewrite_model_raw(
-            retry_body,
-            betas(CREDIT_BETA),
-            None,
-            WireFormat::AnthropicMessages,
-        )
-        .await?
-    else {
-        return Err("expected a buffered retry response".into());
-    };
+    let answer = call_anthropic(&client, retry_body, betas(CREDIT_BETA)).await?;
     assert_eq!(answer["stop_reason"], "end_turn");
     assert_eq!(answer["content"][0]["text"], "Review completed.");
 
@@ -201,4 +180,31 @@ async fn fallback_credit_retry_child() -> TestResult {
     let first: Value = serde_json::from_slice(&requests[0].body)?;
     assert!(first.get("fallback_credit_token").is_none());
     Ok(())
+}
+
+// Decodes an Anthropic body, serves it, and encodes the answer back to Anthropic JSON.
+async fn call_anthropic(
+    client: &TranslatingLlmClient,
+    body: Value,
+    http_headers: Option<http::HeaderMap>,
+) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+    let engine = TranslationEngine::default();
+    let policy = TranslationPolicy::default();
+    let llm_request = engine
+        .decode_request(WireFormat::AnthropicMessages, &body, &policy)?
+        .request;
+    let extensions = llm_request.extensions.clone();
+    let request = Request {
+        llm_request,
+        metadata: Some(Metadata {
+            http_headers,
+            ..Metadata::default()
+        }),
+        ..Request::default()
+    };
+    let response = client.call_rewrite_model(request, None).await?;
+    let agg = response.llm_response.into_agg().await?;
+    Ok(engine
+        .encode_response_with_extensions(WireFormat::AnthropicMessages, &agg, &extensions, &policy)?
+        .body)
 }

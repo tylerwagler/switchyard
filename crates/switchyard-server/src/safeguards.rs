@@ -34,8 +34,8 @@ use std::time::{Duration, Instant, SystemTime};
 use futures_util::StreamExt;
 use futures_util::future::BoxFuture;
 use serde_json::{Value, json};
-use switchyard_protocol::{Metadata, ModelId};
-use switchyard_translation::{RawEventStream, WireFormat, encode_aggregated_response};
+use switchyard_protocol::{Metadata, ModelId, ProviderExtensions};
+use switchyard_translation::{RawEventStream, TranslationEngine, TranslationPolicy, WireFormat};
 
 use crate::ServerState;
 
@@ -753,8 +753,17 @@ impl Judge {
             .into_agg()
             .await
             .map_err(|error| error.to_string())?;
-        let message = encode_aggregated_response(&reply, WireFormat::AnthropicMessages, None)
-            .map_err(|error| error.to_string())?;
+        // Upstream removed `encode_aggregated_response`; this is its body with no
+        // served-model stamp.
+        let message = TranslationEngine::default()
+            .encode_response_with_extensions(
+                WireFormat::AnthropicMessages,
+                &reply,
+                &ProviderExtensions::default(),
+                &TranslationPolicy::default(),
+            )
+            .map_err(|error| error.to_string())?
+            .body;
         let text = message["content"]
             .as_array()
             .into_iter()

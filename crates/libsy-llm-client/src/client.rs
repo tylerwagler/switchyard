@@ -19,9 +19,7 @@ use switchyard_protocol::{
     LlmRequest, LlmResponse, LlmResponseChunk, LlmResponseStream, LlmResponseStreamEvent, Metadata,
     ModelId, Request, Response, RoutedLlmClient,
 };
-use switchyard_translation::{
-    TranslationError, WireFormat, decode_stream, encode_stream_with_extensions,
-};
+use switchyard_translation::{TranslationError, WireFormat, decode_stream};
 use tokio::time::Instant;
 use tracing::Instrument;
 
@@ -29,7 +27,6 @@ use crate::backend::{Backend, openai_url};
 use crate::error::{LlmClientError, Result};
 use crate::metrics;
 use crate::observed_translation;
-use crate::raw::RawResponse;
 
 // Caller headers safe to send when caller auth forwarding is disabled.
 const ALLOWED_METADATA_HEADERS: &[&str] = &["x-request-id"];
@@ -792,78 +789,6 @@ impl TranslatingLlmClient {
             metadata,
             upstream_headers,
         })
-    }
-
-    /// The whole decode → call → encode path a wire endpoint needs, in one call.
-    ///
-    /// Decodes `raw_http_request` from `wire_format` to the neutral IR, serves it via
-    /// [`call_rewrite_model`](Self::call_rewrite_model) — the *upstream* wire format is
-    /// resolved there from the model's backend, independently of `wire_format` — then
-    /// encodes the neutral response back into `wire_format`. The result is a buffered
-    /// [`RawResponse::Buffered`] JSON body or a streamed [`RawResponse::Stream`] of
-    /// wire events (the caller frames the stream as SSE). The response's `model` is
-    /// restamped with the model that actually served the call, so the body names the
-    /// model that answered rather than the route the caller addressed.
-    ///
-    /// `http_headers` are carried through as the request's
-    /// [`Metadata::http_headers`]. Backends with `forward_auth` disabled forward only
-    /// allowed metadata headers; `forward_auth` backends forward all application
-    /// headers. The forwarding backends in one route must use one credential family
-    /// unless they all use the same scheme, host, and port. Transport headers are always
-    /// rebuilt. Pass `None` to forward nothing.
-    pub async fn call_rewrite_model_raw(
-        &self,
-        raw_http_request: Value,
-        http_headers: Option<http::HeaderMap>,
-        target_name: Option<&ModelId>,
-        wire_format: WireFormat,
-    ) -> Result<RawResponse> {
-        let llm_request = observed_translation::decode_request(wire_format, &raw_http_request)
-            .map_err(|error| LlmClientError::RequestTranslation(error.to_string()))?;
-        let request_extensions = llm_request.extensions.clone();
-        // Report the provider model for the same target selected by `call_rewrite_model`.
-        let served_model = target_name
-            .cloned()
-            .or_else(|| llm_request.model.clone().map(ModelId::from))
-            .map(|target_name| self.provider_model(&target_name).to_string());
-
-        let request = Request {
-            llm_request,
-            raw_request: None,
-            metadata: Some(Metadata {
-                session_id: None,
-                agent_id: None,
-                task_id: None,
-                correlation_id: None,
-                extra_metadata: None,
-                http_headers,
-                wire_format: None,
-                ..Default::default()
-            }),
-        };
-        let response = self.call_rewrite_model(request, target_name).await?;
-
-        match response.llm_response {
-            LlmResponse::Agg(agg) => {
-                let body = observed_translation::encode_response(
-                    &agg,
-                    wire_format,
-                    served_model.as_deref(),
-                    &request_extensions,
-                )
-                .map_err(|error| LlmClientError::ResponseTranslation(error.to_string()))?;
-                Ok(RawResponse::Buffered(body))
-            }
-            LlmResponse::Stream(chunks) => {
-                let events = encode_stream_with_extensions(
-                    chunks,
-                    wire_format,
-                    served_model,
-                    &request_extensions,
-                )?;
-                Ok(RawResponse::Stream(events))
-            }
-        }
     }
 }
 
@@ -1768,6 +1693,31 @@ mod tests {
     use super::*;
     use crate::backend::HttpBackendConfig;
 
+    /// Decodes a wire body into a request, as a server endpoint does before calling the client.
+    fn wire_request(
+        body: Value,
+        http_headers: Option<http::HeaderMap>,
+        wire_format: WireFormat,
+    ) -> switchyard_translation::Result<Request> {
+        Ok(Request {
+            llm_request: switchyard_translation::decode_request(wire_format, &body)?,
+            raw_request: None,
+            metadata: Some(Metadata {
+                http_headers,
+                ..Default::default()
+            }),
+        })
+    }
+
+    fn assert_tool_call_name(agg: &switchyard_protocol::AggLlmResponse, name: &str) {
+        let Some(switchyard_protocol::ContentBlock::ToolCall(call)) =
+            agg.outputs[0].content.first()
+        else {
+            panic!("expected a tool call, got {:?}", agg.outputs[0].content);
+        };
+        assert_eq!(call.name, name);
+    }
+
     fn config(base_url: &str) -> HttpBackendConfig {
         HttpBackendConfig {
             base_url: base_url.to_string(),
@@ -2507,15 +2457,17 @@ mod tests {
             "max",
         ))?;
         client
-            .call_rewrite_model_raw(
-                json!({
-                    "model": "client-facing",
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "reasoning_effort": "high"
-                }),
-                None,
+            .call_rewrite_model(
+                wire_request(
+                    json!({
+                        "model": "client-facing",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "reasoning_effort": "high"
+                    }),
+                    None,
+                    WireFormat::OpenAiChat,
+                )?,
                 Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiChat,
             )
             .await?;
 
@@ -2547,15 +2499,17 @@ mod tests {
             "max",
         ))?;
         client
-            .call_rewrite_model_raw(
-                json!({
-                    "model": "client-facing",
-                    "input": [{"role": "user", "content": "hi"}],
-                    "reasoning": {"effort": "high", "summary": "auto"}
-                }),
-                None,
+            .call_rewrite_model(
+                wire_request(
+                    json!({
+                        "model": "client-facing",
+                        "input": [{"role": "user", "content": "hi"}],
+                        "reasoning": {"effort": "high", "summary": "auto"}
+                    }),
+                    None,
+                    WireFormat::OpenAiResponses,
+                )?,
                 Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiResponses,
             )
             .await?;
         Ok(())
@@ -2613,7 +2567,10 @@ mod tests {
         ];
         for (format, request) in requests {
             client
-                .call_rewrite_model_raw(request, None, Some(&ModelId::from("claude")), format)
+                .call_rewrite_model(
+                    wire_request(request, None, format)?,
+                    Some(&ModelId::from("claude")),
+                )
                 .await?;
         }
         for received in server.received_requests().await.unwrap_or_default() {
@@ -2676,11 +2633,9 @@ mod tests {
                 "reasoning_effort": "none", "logprobs": true, "top_logprobs": 8,
                 "chat_template_kwargs": {"enable_thinking": false}});
             let result = client
-                .call_rewrite_model_raw(
-                    raw.clone(),
-                    None,
+                .call_rewrite_model(
+                    wire_request(raw.clone(), None, WireFormat::OpenAiChat)?,
                     Some(&ModelId::from("gpt")),
-                    WireFormat::OpenAiChat,
                 )
                 .await;
             let rejects_field = message.starts_with("Unrecognized");
@@ -2731,12 +2686,14 @@ mod tests {
         let client =
             TranslatingLlmClient::new(&chat_map_with_retries(&format!("{}/v1", server.uri()), 1))?;
         client
-            .call_rewrite_model_raw(
-                json!({"model": "gpt", "messages": [{"role": "user", "content": "judge"}],
+            .call_rewrite_model(
+                wire_request(
+                    json!({"model": "gpt", "messages": [{"role": "user", "content": "judge"}],
                 "chat_template_kwargs": {"enable_thinking": false}}),
-                None,
+                    None,
+                    WireFormat::OpenAiChat,
+                )?,
                 Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiChat,
             )
             .await?;
         assert_eq!(count.load(Ordering::SeqCst), 3);
@@ -2763,11 +2720,9 @@ mod tests {
                     "instructions": "Be brief.", "store": false, "metadata": {"task": "judge"},
                     "custom_field": {"keep": true}});
                 client
-                    .call_rewrite_model_raw(
-                        raw.clone(),
-                        None,
+                    .call_rewrite_model(
+                        wire_request(raw.clone(), None, WireFormat::OpenAiResponses)?,
                         Some(&ModelId::from("gpt")),
-                        WireFormat::OpenAiResponses,
                     )
                     .await?;
                 let mut expected = raw;
@@ -2853,16 +2808,18 @@ mod tests {
             None,
         )])?;
         client
-            .call_rewrite_model_raw(
-                json!({
-                    "model": "client-facing",
-                    "max_tokens": 7,
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "output_config": {"effort": "high", "format": format}
-                }),
-                None,
+            .call_rewrite_model(
+                wire_request(
+                    json!({
+                        "model": "client-facing",
+                        "max_tokens": 7,
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "output_config": {"effort": "high", "format": format}
+                    }),
+                    None,
+                    WireFormat::AnthropicMessages,
+                )?,
                 Some(&ModelId::from("claude")),
-                WireFormat::AnthropicMessages,
             )
             .await?;
         Ok(())
@@ -2907,11 +2864,9 @@ mod tests {
         });
 
         client
-            .call_rewrite_model_raw(
-                raw,
-                None,
+            .call_rewrite_model(
+                wire_request(raw, None, WireFormat::OpenAiChat)?,
                 Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiChat,
             )
             .await?;
         Ok(())
@@ -2951,11 +2906,9 @@ mod tests {
         });
 
         client
-            .call_rewrite_model_raw(
-                raw,
-                None,
+            .call_rewrite_model(
+                wire_request(raw, None, WireFormat::OpenAiChat)?,
                 Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiChat,
             )
             .await?;
         Ok(())
@@ -3025,11 +2978,9 @@ mod tests {
         });
 
         client
-            .call_rewrite_model_raw(
-                raw,
-                None,
+            .call_rewrite_model(
+                wire_request(raw, None, WireFormat::AnthropicMessages)?,
                 Some(&ModelId::from("claude")),
-                WireFormat::AnthropicMessages,
             )
             .await?;
         Ok(())
@@ -3094,11 +3045,9 @@ mod tests {
                         request["store"] = json!(store);
                     }
                     client
-                        .call_rewrite_model_raw(
-                            request,
-                            None,
+                        .call_rewrite_model(
+                            wire_request(request, None, WireFormat::OpenAiResponses)?,
                             Some(&ModelId::from(model)),
-                            WireFormat::OpenAiResponses,
                         )
                         .await?;
                     let requests = server.received_requests().await.ok_or("missing requests")?;
@@ -3183,15 +3132,17 @@ mod tests {
             .resolve("inference-api.nvidia.com", *server.address())
             .build()?;
         client
-            .call_rewrite_model_raw(
-                json!({
-                    "model": "claude",
-                    "max_tokens": 7,
-                    "messages": [{"role": "user", "content": "hi"}]
-                }),
-                None,
+            .call_rewrite_model(
+                wire_request(
+                    json!({
+                        "model": "claude",
+                        "max_tokens": 7,
+                        "messages": [{"role": "user", "content": "hi"}]
+                    }),
+                    None,
+                    WireFormat::AnthropicMessages,
+                )?,
                 Some(&ModelId::from("claude")),
-                WireFormat::AnthropicMessages,
             )
             .await?;
 
@@ -3241,11 +3192,9 @@ mod tests {
         });
 
         client
-            .call_rewrite_model_raw(
-                raw,
-                None,
+            .call_rewrite_model(
+                wire_request(raw, None, WireFormat::AnthropicMessages)?,
                 Some(&ModelId::from("claude")),
-                WireFormat::AnthropicMessages,
             )
             .await?;
         Ok(())
@@ -3283,11 +3232,9 @@ mod tests {
         });
 
         client
-            .call_rewrite_model_raw(
-                raw,
-                Some(headers),
+            .call_rewrite_model(
+                wire_request(raw, Some(headers), WireFormat::AnthropicMessages)?,
                 Some(&ModelId::from("claude")),
-                WireFormat::AnthropicMessages,
             )
             .await?;
 
@@ -3353,11 +3300,9 @@ mod tests {
         });
 
         client
-            .call_rewrite_model_raw(
-                raw,
-                Some(headers),
+            .call_rewrite_model(
+                wire_request(raw, Some(headers), WireFormat::AnthropicMessages)?,
                 Some(&ModelId::from("claude")),
-                WireFormat::AnthropicMessages,
             )
             .await?;
 
@@ -3410,15 +3355,17 @@ mod tests {
         let mut headers = http::HeaderMap::new();
         headers.insert("anthropic-version", http::HeaderValue::from_static(VERSION));
         client
-            .call_rewrite_model_raw(
-                json!({
-                    "model": "client-facing",
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "max_tokens": 7
-                }),
-                Some(headers),
+            .call_rewrite_model(
+                wire_request(
+                    json!({
+                        "model": "client-facing",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 7
+                    }),
+                    Some(headers),
+                    WireFormat::AnthropicMessages,
+                )?,
                 Some(&ModelId::from("claude")),
-                WireFormat::AnthropicMessages,
             )
             .await?;
 
@@ -3459,15 +3406,17 @@ mod tests {
 
         let client = TranslatingLlmClient::new(&anthropic_map(&server.uri()))?;
         client
-            .call_rewrite_model_raw(
-                json!({
-                    "model": "client-facing",
-                    "messages": [{"role": "user", "content": "hi"}],
-                    "max_tokens": 7
-                }),
-                None,
+            .call_rewrite_model(
+                wire_request(
+                    json!({
+                        "model": "client-facing",
+                        "messages": [{"role": "user", "content": "hi"}],
+                        "max_tokens": 7
+                    }),
+                    None,
+                    WireFormat::AnthropicMessages,
+                )?,
                 Some(&ModelId::from("claude")),
-                WireFormat::AnthropicMessages,
             )
             .await?;
 
@@ -3585,14 +3534,12 @@ mod tests {
         });
 
         let response = client
-            .call_rewrite_model_raw(
-                raw,
-                None,
+            .call_rewrite_model(
+                wire_request(raw, None, WireFormat::OpenAiChat)?,
                 Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiChat,
             )
             .await?;
-        assert!(matches!(response, RawResponse::Stream(_)));
+        assert!(matches!(response.llm_response, LlmResponse::Stream(_)));
         Ok(())
     }
 
@@ -4274,11 +4221,9 @@ mod tests {
         });
 
         let Err(LlmClientError::UpstreamHttp { body, .. }) = client
-            .call_rewrite_model_raw(
-                raw,
-                Some(headers),
+            .call_rewrite_model(
+                wire_request(raw, Some(headers), WireFormat::AnthropicMessages)?,
                 Some(&ModelId::from("claude")),
-                WireFormat::AnthropicMessages,
             )
             .await
         else {
@@ -4316,77 +4261,9 @@ mod tests {
         Ok(())
     }
 
+    // A Codex namespace is folded into the upstream tool name.
     #[tokio::test]
-    async fn invalid_raw_request_is_a_request_translation_error()
-    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
-        let client = TranslatingLlmClient::new(&[])?;
-        let Err(error) = client
-            .call_rewrite_model_raw(
-                json!("invalid"),
-                None,
-                Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiChat,
-            )
-            .await
-        else {
-            panic!("expected request translation to fail");
-        };
-
-        assert!(matches!(
-            error,
-            LlmClientError::RequestTranslation(message) if !message.is_empty()
-        ));
-        Ok(())
-    }
-
-    // Raw path, buffered: decode an OpenAI Chat body -> call -> encode back to OpenAI
-    // Chat JSON, with the served `model` restamped over the id the caller addressed.
-    #[tokio::test]
-    async fn call_rewrite_model_raw_round_trips_buffered_json()
-    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "id": "chatcmpl-1",
-                "model": "gpt",
-                "choices": [{
-                    "index": 0,
-                    "message": {"role": "assistant", "content": "Hi there"},
-                    "finish_reason": "stop"
-                }],
-                "usage": {"prompt_tokens": 1, "completion_tokens": 2, "total_tokens": 3}
-            })))
-            .mount(&server)
-            .await;
-
-        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
-        let raw = json!({
-            "model": "client-facing",
-            "messages": [{"role": "user", "content": "hi"}]
-        });
-        let RawResponse::Buffered(body) = client
-            .call_rewrite_model_raw(
-                raw,
-                None,
-                Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiChat,
-            )
-            .await?
-        else {
-            panic!("expected a buffered response");
-        };
-
-        assert_eq!(body["choices"][0]["message"]["content"], "Hi there");
-        // The client sees the model that answered, not the "client-facing" route id.
-        assert_eq!(body["model"], "gpt");
-        Ok(())
-    }
-
-    // A Codex namespace is folded into the upstream tool name, then split back
-    // into name and namespace on the Responses call that returns to Codex.
-    #[tokio::test]
-    async fn call_rewrite_model_raw_restores_codex_mcp_namespace()
+    async fn chat_backend_folds_codex_mcp_namespace_into_the_tool_name()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -4437,23 +4314,15 @@ mod tests {
             }]
         });
 
-        let RawResponse::Buffered(body) = client
-            .call_rewrite_model_raw(
-                raw,
-                None,
+        let response = client
+            .call_rewrite_model(
+                wire_request(raw, None, WireFormat::OpenAiResponses)?,
                 Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiResponses,
             )
-            .await?
-        else {
-            panic!("expected a buffered response");
-        };
+            .await?;
+        let agg = response.llm_response.into_agg().await?;
 
-        assert_eq!(body["output"][0]["type"], "function_call");
-        assert_eq!(body["output"][0]["name"], "search");
-        assert_eq!(body["output"][0]["namespace"], "mcp__open_websearch");
-        // Arguments are parsed and re-serialized, so the spacing is normalized.
-        assert_eq!(body["output"][0]["arguments"], "{\"q\": \"rust\"}");
+        assert_tool_call_name(&agg, "mcp__open_websearch__search");
         Ok(())
     }
 
@@ -4507,17 +4376,13 @@ mod tests {
             }]
         });
 
-        let RawResponse::Buffered(body) = client
-            .call_rewrite_model_raw(
-                raw,
-                None,
+        let response = client
+            .call_rewrite_model(
+                wire_request(raw, None, WireFormat::OpenAiResponses)?,
                 Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiResponses,
             )
-            .await?
-        else {
-            panic!("expected a buffered response");
-        };
+            .await?;
+        let agg = response.llm_response.into_agg().await?;
 
         let received = server
             .received_requests()
@@ -4543,10 +4408,7 @@ mod tests {
             "mcp__open_websearch__search"
         );
         assert!(request_body["input"][0].get("namespace").is_none());
-
-        assert_eq!(body["output"][0]["type"], "function_call");
-        assert_eq!(body["output"][0]["name"], "search");
-        assert_eq!(body["output"][0]["namespace"], "mcp__open_websearch");
+        assert_tool_call_name(&agg, "mcp__open_websearch__search");
         Ok(())
     }
 
@@ -4648,11 +4510,9 @@ mod tests {
             for store in [json!(false), json!(true)] {
                 let raw = json!({"model": "client-facing", "store": store, "input": input.clone()});
                 client
-                    .call_rewrite_model_raw(
-                        raw,
-                        None,
+                    .call_rewrite_model(
+                        wire_request(raw, None, WireFormat::OpenAiResponses)?,
                         Some(&ModelId::from(model)),
-                        WireFormat::OpenAiResponses,
                     )
                     .await?;
             }
@@ -4727,57 +4587,9 @@ mod tests {
         Ok(())
     }
 
-    // Raw path, streaming: an inbound `stream: true` request yields an unframed stream
-    // of OpenAI Chat chunk objects whose deltas reassemble the completion.
+    // Allowed caller headers reach the upstream.
     #[tokio::test]
-    async fn call_rewrite_model_raw_streams_wire_events()
-    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
-        use futures::TryStreamExt;
-
-        let server = MockServer::start().await;
-        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"Hello\"}}]}\n\n\
-             data: {\"choices\":[{\"delta\":{\"content\":\" world\"}}]}\n\n\
-             data: [DONE]\n\n";
-        Mock::given(method("POST"))
-            .and(path("/v1/chat/completions"))
-            .respond_with(ResponseTemplate::new(200).set_body_raw(sse, "text/event-stream"))
-            .mount(&server)
-            .await;
-
-        let client = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
-        let raw = json!({
-            "model": "client-facing",
-            "messages": [{"role": "user", "content": "hi"}],
-            "stream": true
-        });
-        let RawResponse::Stream(stream) = client
-            .call_rewrite_model_raw(
-                raw,
-                None,
-                Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiChat,
-            )
-            .await?
-        else {
-            panic!("expected a streamed response");
-        };
-
-        let events: Vec<Value> = stream.try_collect().await?;
-        assert!(!events.is_empty(), "expected at least one wire event");
-        let content: String = events
-            .iter()
-            .filter_map(|event| event["choices"][0]["delta"]["content"].as_str())
-            .collect();
-        assert_eq!(content, "Hello world");
-        // The mock frames carry no `model`, so every chunk's model comes from the
-        // served id rather than the "unknown" fallback or the caller's route id.
-        assert!(events.iter().all(|event| event["model"] == "gpt"));
-        Ok(())
-    }
-
-    // Raw path forwards allowed caller headers to the upstream.
-    #[tokio::test]
-    async fn call_rewrite_model_raw_forwards_headers()
+    async fn call_rewrite_model_forwards_caller_headers()
     -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
@@ -4804,11 +4616,9 @@ mod tests {
         // The allowed request id survives and caller authorization cannot replace
         // the backend's credential.
         client
-            .call_rewrite_model_raw(
-                raw,
-                Some(headers),
+            .call_rewrite_model(
+                wire_request(raw, Some(headers), WireFormat::OpenAiChat)?,
                 Some(&ModelId::from("gpt")),
-                WireFormat::OpenAiChat,
             )
             .await?;
         Ok(())
