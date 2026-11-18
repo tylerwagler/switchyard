@@ -91,6 +91,10 @@ Omitting a non-default value after scaling to Anthropic's range follows the
 [lossy-conversion policy](translation.md#policies). Exact preserved Anthropic
 requests can still retain `temperature`.
 
+A model server that takes sampling values unchanged on every endpoint can opt out of
+this scaling and omission with `sampling = "verbatim"` on its
+[`llm_clients` entry](../toml_schema.md#llm_clients).
+
 For older Anthropic models that support non-default temperatures under API version
 `2023-06-01`, add these settings to the target's TOML configuration:
 

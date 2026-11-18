@@ -2996,6 +2996,7 @@ dependencies = [
  "switchyard-libsy",
  "switchyard-llm-client",
  "switchyard-protocol",
+ "switchyard-translation",
  "thiserror 2.0.18",
  "tokio",
  "toml",

@@ -8,8 +8,9 @@ use switchyard_protocol::MAX_IR_TEMPERATURE;
 
 use super::MAX_TEMPERATURE;
 use crate::codecs::common::{
-    first_nonempty_string, is_known_role_name, provider_extensions, reasoning_text_from_blocks,
-    reasoning_text_from_details, scale_temperature, text_from_blocks,
+    decode_temperature, encode_verbatim_sampling, first_nonempty_string, is_known_role_name,
+    provider_extensions, reasoning_text_from_blocks, reasoning_text_from_details,
+    scale_temperature, text_from_blocks,
 };
 use crate::codecs::openai_media::{
     ImagePayload, file_payload, file_source_text, image_payload, image_source_text,
@@ -44,6 +45,7 @@ impl FormatCodec for OpenAiChatCodec {
     fn decode_request(&self, body: &Value, policy: &TranslationPolicy) -> Result<DecodedRequest> {
         let body = object(body, "$")?;
         let mut diagnostics = Vec::new();
+        let (temperature, client_temperature) = decode_temperature(body, MAX_TEMPERATURE);
         let mut request = LlmRequest {
             model: body
                 .get("model")
@@ -52,12 +54,10 @@ impl FormatCodec for OpenAiChatCodec {
                 .map(ToOwned::to_owned),
             stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
             sampling: SamplingParams {
-                temperature: body
-                    .get("temperature")
-                    .and_then(Value::as_f64)
-                    .map(|value| scale_temperature(value, MAX_TEMPERATURE, MAX_IR_TEMPERATURE)),
+                temperature,
                 top_p: body.get("top_p").and_then(Value::as_f64),
                 top_k: None,
+                client_temperature,
             },
             output: OutputParams {
                 max_output_tokens: body
@@ -250,7 +250,9 @@ impl FormatCodec for OpenAiChatCodec {
         if let Some(value) = request.output.max_output_tokens {
             body.insert("max_completion_tokens".to_string(), json!(value));
         }
-        if let Some(value) = request.sampling.temperature {
+        if !encode_verbatim_sampling(&mut body, request, policy)
+            && let Some(value) = request.sampling.temperature
+        {
             let value = scale_temperature(value, MAX_IR_TEMPERATURE, MAX_TEMPERATURE);
             body.insert("temperature".to_string(), json!(value));
         }

@@ -42,6 +42,7 @@ fn policy() -> TranslationPolicy {
         },
         preservation: PreservationPolicy::InMemory,
         target_capabilities: TargetCapabilities::default(),
+        sampling: switchyard_translation::SamplingPolicy::default(),
     }
 }
 

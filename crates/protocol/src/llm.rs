@@ -468,6 +468,36 @@ pub struct SamplingParams {
     pub top_p: Option<f64>,
     /// Maximum number of candidate tokens considered at each step.
     pub top_k: Option<i64>,
+    /// The temperature number exactly as the client's wire request carried it.
+    ///
+    /// Request decoders record it beside the scaled [`Self::temperature`]. An encoder for a
+    /// backend that takes sampling values verbatim writes this number rather than rescaling
+    /// the IR value. Requests built directly on the IR leave it unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_temperature: Option<ClientTemperature>,
+}
+
+/// A client's own temperature and the IR value it was decoded to.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ClientTemperature {
+    /// The JSON number from the client's request, unscaled.
+    pub value: serde_json::Number,
+    /// The [`SamplingParams::temperature`] this number decoded to. When the IR temperature
+    /// no longer equals it, the IR value was edited after decoding and this record is stale.
+    pub ir: f64,
+}
+
+impl SamplingParams {
+    /// The client's own temperature number, if the IR temperature still is the value it
+    /// decoded to. `None` for an absent temperature, a request built on the IR, or an IR
+    /// temperature edited after decoding.
+    pub fn client_temperature(&self) -> Option<&serde_json::Number> {
+        let ir = self.temperature?;
+        self.client_temperature
+            .as_ref()
+            .filter(|client| client.ir.to_bits() == ir.to_bits())
+            .map(|client| &client.value)
+    }
 }
 
 /// Output budget and structured-output options.

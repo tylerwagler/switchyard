@@ -10,9 +10,10 @@ use serde_json::{Map, Value};
 use crate::diagnostic::TranslationDiagnostic;
 use crate::error::{Result, TranslationError};
 use crate::format::WireFormat;
-use crate::llm::{ContentBlock, LlmRequest, Tool, ToolChoice};
-use crate::policy::TranslationPolicy;
+use crate::llm::{ClientTemperature, ContentBlock, LlmRequest, Tool, ToolChoice};
+use crate::policy::{SamplingPolicy, TranslationPolicy};
 use crate::util::push_lossy;
+use switchyard_protocol::MAX_IR_TEMPERATURE;
 
 // Internal provenance survives mutations that invalidate exact request replay.
 pub(crate) const ANTHROPIC_REQUEST_KEY: &str = "switchyard_anthropic_request";
@@ -23,6 +24,65 @@ pub(crate) fn scale_temperature(temperature: f64, source_max: f64, target_max: f
         return temperature;
     }
     (temperature / source_max) * target_max
+}
+
+/// Decodes a wire temperature to the IR scale and keeps the client's own number beside it.
+pub(crate) fn decode_temperature(
+    body: &Map<String, Value>,
+    source_max: f64,
+) -> (Option<f64>, Option<ClientTemperature>) {
+    let Some(Value::Number(number)) = body.get("temperature") else {
+        return (None, None);
+    };
+    let Some(value) = number.as_f64() else {
+        return (None, None);
+    };
+    let ir = scale_temperature(value, source_max, MAX_IR_TEMPERATURE);
+    (
+        Some(ir),
+        Some(ClientTemperature {
+            value: number.clone(),
+            ir,
+        }),
+    )
+}
+
+/// Writes sampling values for a target that takes them verbatim.
+///
+/// Returns false under [`SamplingPolicy::Provider`], leaving the codec's own rules to run.
+/// Temperature is the client's own number. A request built on the IR, or one whose IR
+/// temperature was edited after decoding, has no client number: its IR value is written
+/// as it stands, since such a target reads one scale on every endpoint.
+/// `top_k` comes from the IR, else from a client field that decoded as an extension.
+pub(crate) fn encode_verbatim_sampling(
+    body: &mut Map<String, Value>,
+    request: &LlmRequest,
+    policy: &TranslationPolicy,
+) -> bool {
+    if policy.sampling != SamplingPolicy::Verbatim {
+        return false;
+    }
+    let temperature = request.sampling.client_temperature().cloned().or_else(|| {
+        request
+            .sampling
+            .temperature
+            .and_then(serde_json::Number::from_f64)
+    });
+    if let Some(value) = temperature {
+        body.insert("temperature".to_string(), Value::Number(value));
+    }
+    let top_k = request.sampling.top_k.map(Value::from).or_else(|| {
+        request
+            .extensions
+            .fields
+            .get("top_k")
+            .filter(|value| value.is_i64() || value.is_u64())
+            .cloned()
+    });
+    if let Some(value) = top_k {
+        body.insert("top_k".to_string(), value);
+    }
+    true
 }
 
 /// Returns true when the request was decoded from an Anthropic Messages body.

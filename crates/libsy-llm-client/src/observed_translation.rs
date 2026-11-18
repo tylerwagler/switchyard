@@ -7,15 +7,30 @@ use std::sync::LazyLock;
 
 use serde_json::Value;
 use switchyard_protocol::{AggLlmResponse, LlmRequest};
-use switchyard_translation::{Result, TranslationEngine, TranslationPolicy, WireFormat};
+use switchyard_translation::{
+    Result, SamplingPolicy, TranslationEngine, TranslationPolicy, WireFormat,
+};
 
 use crate::metrics;
 
 static ENGINE: LazyLock<TranslationEngine> = LazyLock::new(TranslationEngine::default);
 static POLICY: LazyLock<TranslationPolicy> = LazyLock::new(TranslationPolicy::default);
+static VERBATIM_SAMPLING_POLICY: LazyLock<TranslationPolicy> =
+    LazyLock::new(|| TranslationPolicy {
+        sampling: SamplingPolicy::Verbatim,
+        ..TranslationPolicy::default()
+    });
 
-pub(crate) fn encode_request(request: &LlmRequest, format: WireFormat) -> Result<Value> {
-    let encoded = ENGINE.encode_request(format, request, &POLICY)?;
+pub(crate) fn encode_request(
+    request: &LlmRequest,
+    format: WireFormat,
+    sampling: SamplingPolicy,
+) -> Result<Value> {
+    let policy = match sampling {
+        SamplingPolicy::Provider => &POLICY,
+        SamplingPolicy::Verbatim => &VERBATIM_SAMPLING_POLICY,
+    };
+    let encoded = ENGINE.encode_request(format, request, policy)?;
     metrics::record_translation_diagnostics(&encoded.diagnostics, "request_encode", format);
     Ok(encoded.body)
 }

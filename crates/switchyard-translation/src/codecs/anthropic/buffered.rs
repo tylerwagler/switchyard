@@ -8,8 +8,8 @@ use switchyard_protocol::MAX_IR_TEMPERATURE;
 
 use super::{DEFAULT_TEMPERATURE, MAX_TEMPERATURE};
 use crate::codecs::common::{
-    ANTHROPIC_REQUEST_KEY, is_anthropic_request, is_known_role_name, provider_extensions,
-    scale_temperature, text_from_blocks,
+    ANTHROPIC_REQUEST_KEY, decode_temperature, encode_verbatim_sampling, is_anthropic_request,
+    is_known_role_name, provider_extensions, scale_temperature, text_from_blocks,
 };
 use crate::codecs::openai_chat::{decode_file_source, decode_image_source};
 use crate::codecs::structured_output::decode_openai_schema_enforcement;
@@ -74,6 +74,7 @@ impl FormatCodec for AnthropicMessagesCodec {
             })
             .transpose()?;
         let response_format = decode_anthropic_output_format(body, &mut diagnostics, policy)?;
+        let (temperature, client_temperature) = decode_temperature(body, MAX_TEMPERATURE);
         let mut request = LlmRequest {
             model: body
                 .get("model")
@@ -86,12 +87,10 @@ impl FormatCodec for AnthropicMessagesCodec {
                 response_format,
             },
             sampling: SamplingParams {
-                temperature: body
-                    .get("temperature")
-                    .and_then(Value::as_f64)
-                    .map(|value| scale_temperature(value, MAX_TEMPERATURE, MAX_IR_TEMPERATURE)),
+                temperature,
                 top_p: body.get("top_p").and_then(Value::as_f64),
                 top_k: body.get("top_k").and_then(Value::as_i64),
+                client_temperature,
             },
             reasoning: ReasoningParams {
                 effort: body
@@ -354,10 +353,12 @@ impl FormatCodec for AnthropicMessagesCodec {
         } else {
             body.insert("max_tokens".to_string(), json!(64_000));
         }
-        if let Some(value) = request
-            .sampling
-            .temperature
-            .map(|value| scale_temperature(value, MAX_IR_TEMPERATURE, MAX_TEMPERATURE))
+        let is_verbatim = encode_verbatim_sampling(&mut body, request, policy);
+        if !is_verbatim
+            && let Some(value) = request
+                .sampling
+                .temperature
+                .map(|value| scale_temperature(value, MAX_IR_TEMPERATURE, MAX_TEMPERATURE))
             && value != DEFAULT_TEMPERATURE
         {
             push_lossy(
@@ -371,7 +372,7 @@ impl FormatCodec for AnthropicMessagesCodec {
         if let Some(value) = request.sampling.top_p {
             body.insert("top_p".to_string(), json!(value));
         }
-        if let Some(value) = request.sampling.top_k {
+        if !is_verbatim && let Some(value) = request.sampling.top_k {
             body.insert("top_k".to_string(), json!(value));
         }
         if request.stream {

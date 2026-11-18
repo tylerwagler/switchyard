@@ -42,6 +42,7 @@ pub use payload_capture::with_payload_capture;
 pub use responses_reasoning::ResponsesReasoningPolicy;
 pub use run::{ClientRouter, decide, run};
 pub use switchyard_translation::RawEventStream;
+pub use switchyard_translation::SamplingPolicy;
 pub use system_one::SystemOneClient;
 
 /// Registers process-wide compatibility gauges with the global meter provider.

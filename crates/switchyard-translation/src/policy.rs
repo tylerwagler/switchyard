@@ -33,6 +33,21 @@ pub enum PreservationPolicy {
     Disabled,
 }
 
+/// Controls how request encoders write sampling parameters for the target.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SamplingPolicy {
+    /// Follow the target wire format's hosted provider: temperature is rescaled from the IR
+    /// range to the provider's range, Anthropic Messages requests omit it, and `top_k` is
+    /// written only where the provider's schema defines it.
+    #[default]
+    Provider,
+    /// The target takes sampling values on one scale whatever its wire format, as a
+    /// self-hosted model server does. Temperature is written as the client sent it, never
+    /// rescaled or omitted, and `top_k` is written in every target format.
+    Verbatim,
+}
+
 /// Capability constraints for the target model or provider profile.
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TargetCapabilities {
@@ -56,6 +71,9 @@ pub struct TranslationPolicy {
     pub deterministic_ids: DeterministicIdPolicy,
     pub preservation: PreservationPolicy,
     pub target_capabilities: TargetCapabilities,
+    /// How request encoders write sampling parameters. Defaults to the provider's rules.
+    #[serde(default)]
+    pub sampling: SamplingPolicy,
 }
 
 impl Default for TranslationPolicy {
@@ -67,6 +85,7 @@ impl Default for TranslationPolicy {
             },
             preservation: PreservationPolicy::InMemory,
             target_capabilities: TargetCapabilities::default(),
+            sampling: SamplingPolicy::default(),
         }
     }
 }

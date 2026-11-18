@@ -35,5 +35,6 @@ switchyard-llm-client.workspace = true
 [dev-dependencies]
 async-trait.workspace = true
 futures-util.workspace = true
+switchyard-translation.workspace = true
 tokio.workspace = true
 wiremock.workspace = true

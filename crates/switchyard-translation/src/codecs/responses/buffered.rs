@@ -10,9 +10,10 @@ use switchyard_protocol::MAX_IR_TEMPERATURE;
 
 use super::MAX_TEMPERATURE;
 use crate::codecs::common::{
-    collect_responses_reasoning_text, encrypted_reasoning_data, encrypted_reasoning_item_id,
-    is_anthropic_request, is_known_role_name, provider_extensions, reasoning_text_from_blocks,
-    scale_temperature, text_from_blocks,
+    collect_responses_reasoning_text, decode_temperature, encode_verbatim_sampling,
+    encrypted_reasoning_data, encrypted_reasoning_item_id, is_anthropic_request,
+    is_known_role_name, provider_extensions, reasoning_text_from_blocks, scale_temperature,
+    text_from_blocks,
 };
 use crate::codecs::openai_chat::{decode_file_source, decode_image_source};
 use crate::codecs::openai_media::{
@@ -49,6 +50,7 @@ impl FormatCodec for OpenAiResponsesCodec {
         let body = crate::util::object(body, "$")?;
         let mut diagnostics = Vec::new();
         let response_format = decode_responses_text_format(body.get("text"));
+        let (temperature, client_temperature) = decode_temperature(body, MAX_TEMPERATURE);
         let mut request = LlmRequest {
             model: body
                 .get("model")
@@ -70,12 +72,10 @@ impl FormatCodec for OpenAiResponsesCodec {
                 raw: body.get("reasoning").cloned(),
             },
             sampling: SamplingParams {
-                temperature: body
-                    .get("temperature")
-                    .and_then(Value::as_f64)
-                    .map(|value| scale_temperature(value, MAX_TEMPERATURE, MAX_IR_TEMPERATURE)),
+                temperature,
                 top_p: body.get("top_p").and_then(Value::as_f64),
                 top_k: None,
+                client_temperature,
             },
             stream: body.get("stream").and_then(Value::as_bool).unwrap_or(false),
             preservation: capture_request_preservation(
@@ -297,7 +297,9 @@ impl FormatCodec for OpenAiResponsesCodec {
         if !reasoning.is_empty() {
             body.insert("reasoning".to_string(), Value::Object(reasoning));
         }
-        if let Some(value) = request.sampling.temperature {
+        if !encode_verbatim_sampling(&mut body, request, policy)
+            && let Some(value) = request.sampling.temperature
+        {
             let value = scale_temperature(value, MAX_IR_TEMPERATURE, MAX_TEMPERATURE);
             body.insert("temperature".to_string(), json!(value));
         }

@@ -19,7 +19,7 @@ use switchyard_protocol::{
     LlmRequest, LlmResponse, LlmResponseChunk, LlmResponseStream, LlmResponseStreamEvent, Metadata,
     ModelId, Request, Response, RoutedLlmClient,
 };
-use switchyard_translation::{TranslationError, WireFormat, decode_stream};
+use switchyard_translation::{SamplingPolicy, TranslationError, WireFormat, decode_stream};
 use tokio::time::Instant;
 use tracing::Instrument;
 
@@ -63,6 +63,7 @@ pub struct ModelConfig {
     default_backend: Backend,
     other_backends: Option<Vec<Backend>>,
     responses_reasoning: crate::ResponsesReasoningPolicy,
+    sampling: SamplingPolicy,
 }
 
 impl ModelConfig {
@@ -78,7 +79,17 @@ impl ModelConfig {
             default_backend,
             other_backends,
             responses_reasoning: crate::ResponsesReasoningPolicy::default(),
+            sampling: SamplingPolicy::default(),
         }
+    }
+
+    /// Sets how sampling parameters are written for this target. The default follows the
+    /// wire format's hosted provider; [`SamplingPolicy::Verbatim`] sends the client's own
+    /// temperature and `top_k` to a server that reads them the same on every endpoint.
+    #[must_use]
+    pub fn with_sampling(mut self, policy: SamplingPolicy) -> Self {
+        self.sampling = policy;
+        self
     }
 
     /// Sets how Responses reasoning items are replayed to this target.
@@ -355,7 +366,12 @@ impl TranslatingLlmClient {
             return Err(LlmClientError::TemporarilyUnavailable);
         }
 
-        let mut body = observed_translation::encode_request(&llm_request, wire_format)
+        let sampling = self
+            .configs_by_target
+            .get(target_name)
+            .map(|config| config.sampling)
+            .unwrap_or_default();
+        let mut body = observed_translation::encode_request(&llm_request, wire_format, sampling)
             .map_err(|error| LlmClientError::RequestEncoding(error.to_string()))?;
         // `encode_request` round-trips a preserved same-format body verbatim,
         // which keeps the caller's original `model`. Set the provider model explicitly.
@@ -4648,5 +4664,205 @@ mod tests {
         let forwarded = forwardable_error_headers(&headers);
         assert_eq!(forwarded[RETRY_AFTER], "42");
         assert_eq!(forwarded["x-should-retry"], "true");
+    }
+
+    // Mounts one chat-completions and one messages reply, buffered and streamed.
+    async fn sampling_server() -> MockServer {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .and(wiremock::matchers::body_partial_json(json!({"stream": true})))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                "data: {\"id\":\"1\",\"model\":\"gpt\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n",
+                "text/event-stream",
+            ))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "1",
+                "model": "gpt",
+                "choices": [{
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop"
+                }],
+                "usage": {}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "model": "claude",
+                "content": [{"type": "text", "text": "ok"}],
+                "stop_reason": "end_turn",
+                "usage": {"input_tokens": 1, "output_tokens": 1}
+            })))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    fn sampling_request(format: WireFormat, temperature: Option<&Value>, stream: bool) -> Value {
+        let mut body = match format {
+            WireFormat::AnthropicMessages => json!({
+                "model": "client-facing",
+                "max_tokens": 8,
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+            WireFormat::OpenAiResponses => json!({
+                "model": "client-facing",
+                "input": [{"role": "user", "content": "hi"}]
+            }),
+            WireFormat::OpenAiChat => json!({
+                "model": "client-facing",
+                "messages": [{"role": "user", "content": "hi"}]
+            }),
+        };
+        if let Some(value) = temperature {
+            body["temperature"] = value.clone();
+        }
+        if stream {
+            body["stream"] = json!(true);
+        }
+        body
+    }
+
+    // Sends one request and returns the body the backend received.
+    async fn upstream_body(
+        client: &TranslatingLlmClient,
+        server: &MockServer,
+        target: &str,
+        format: WireFormat,
+        body: Value,
+    ) -> std::result::Result<Value, Box<dyn Error + Sync + Send + 'static>> {
+        let before = server
+            .received_requests()
+            .await
+            .ok_or("missing requests")?
+            .len();
+        let response = client
+            .call_rewrite_model(
+                wire_request(body, None, format)?,
+                Some(&ModelId::from(target)),
+            )
+            .await?;
+        response.llm_response.into_agg().await?;
+        let received = server.received_requests().await.ok_or("missing requests")?;
+        assert_eq!(received.len(), before + 1);
+        Ok(serde_json::from_slice(&received[before].body)?)
+    }
+
+    #[tokio::test]
+    async fn verbatim_sampling_sends_the_clients_temperature_upstream()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = sampling_server().await;
+        // The spelling a routes file uses; the runner's tests load it from TOML.
+        let verbatim: SamplingPolicy = serde_json::from_value(json!("verbatim"))?;
+        assert_eq!(verbatim, SamplingPolicy::Verbatim);
+        let client = TranslatingLlmClient::new(&[
+            ModelConfig::new("claude", Backend::Anthropic(config(&server.uri())), None)
+                .with_sampling(verbatim),
+            ModelConfig::new(
+                "gpt",
+                Backend::OpenAiChat(config(&format!("{}/v1", server.uri()))),
+                None,
+            )
+            .with_sampling(verbatim),
+        ])?;
+        let sources = [
+            WireFormat::OpenAiChat,
+            WireFormat::OpenAiResponses,
+            WireFormat::AnthropicMessages,
+        ];
+        for target in ["claude", "gpt"] {
+            for source in sources {
+                for stream in [false, true] {
+                    // A streamed reply is mounted for the chat backend only.
+                    if stream && target == "claude" {
+                        continue;
+                    }
+                    for text in ["0", "0.1", "0.2", "0.3", "0.4", "0.7", "1", "1.5", "2"] {
+                        let sent: Value = serde_json::from_str(text)?;
+                        let body = upstream_body(
+                            &client,
+                            &server,
+                            target,
+                            source,
+                            sampling_request(source, Some(&sent), stream),
+                        )
+                        .await?;
+                        assert_eq!(
+                            body.get("temperature").map(Value::to_string).as_deref(),
+                            Some(text),
+                            "{source} -> {target} stream={stream}: {body}"
+                        );
+                    }
+                    let body = upstream_body(
+                        &client,
+                        &server,
+                        target,
+                        source,
+                        sampling_request(source, None, stream),
+                    )
+                    .await?;
+                    assert!(body.get("temperature").is_none(), "{body}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn default_sampling_follows_the_provider()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = sampling_server().await;
+        let mut models = anthropic_map(&server.uri());
+        models.extend(chat_map(&format!("{}/v1", server.uri())));
+        let client = TranslatingLlmClient::new(&models)?;
+
+        // OpenAI in, Anthropic out: the temperature is omitted, greedy included.
+        for sent in [json!(0.4), json!(0)] {
+            let body = upstream_body(
+                &client,
+                &server,
+                "claude",
+                WireFormat::OpenAiChat,
+                sampling_request(WireFormat::OpenAiChat, Some(&sent), false),
+            )
+            .await?;
+            assert!(body.get("temperature").is_none(), "{body}");
+        }
+        // Anthropic in, OpenAI out: the value is doubled onto OpenAI's range.
+        for (sent, received) in [(json!(1.0), json!(2.0)), (json!(0.3), json!(0.6))] {
+            for stream in [false, true] {
+                let body = upstream_body(
+                    &client,
+                    &server,
+                    "gpt",
+                    WireFormat::AnthropicMessages,
+                    sampling_request(WireFormat::AnthropicMessages, Some(&sent), stream),
+                )
+                .await?;
+                assert_eq!(body["temperature"], received, "{body}");
+            }
+        }
+        // The same format on both sides replays the client's body.
+        let body = upstream_body(
+            &client,
+            &server,
+            "gpt",
+            WireFormat::OpenAiChat,
+            sampling_request(WireFormat::OpenAiChat, Some(&json!(0.4)), false),
+        )
+        .await?;
+        assert_eq!(body["temperature"], json!(0.4), "{body}");
+        Ok(())
     }
 }
