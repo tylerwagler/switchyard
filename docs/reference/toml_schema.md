@@ -68,6 +68,7 @@ route reaches no upstream. A file without a `[targets]` table is rejected with
 | `extra_headers` | No | `{}` | Custom HTTP headers sent to the model server. Set credentials with `api_key_env` or `forward_auth`; the server rejects headers owned by the selected auth mode. Header names are case-insensitive. Configured values replace caller values for the same name. |
 | `responses_reasoning` | No | `"auto"` | Responses reasoning replay: `"auto"`, `"preserve_encrypted"`, `"preserve_plaintext"`, or `"drop"`. Only valid for `openai_responses`. |
 | `sampling` | No | `"provider"` | How sampling parameters are written for this server: `"provider"` or `"verbatim"`. Valid for every `format`. |
+| `anthropic_body` | No | `"provider"` | How an encoded Anthropic Messages body is finished for this server: `"provider"` or `"verbatim"`. Has an effect only for `anthropic_messages`. |
 | `fallback_on_rate_limit` | No | `true` | Try another completion candidate after an upstream HTTP 429 exhausts retries. Set to `false` to return the 429 instead. |
 | `max_retries` | No | `2` | Retry budget, `0`–`10`. |
 | `failure_cooldown_ms` | No | `5000` (5 seconds) | Skip a backend for this many milliseconds after an exhausted transient completion failure. Zero disables it. |
@@ -128,6 +129,33 @@ sampling = "verbatim"
 
 Leave `sampling` unset for a hosted provider. An unknown value is rejected when
 the server loads.
+
+`anthropic_body` controls two rewrites Switchyard applies to every request body it
+sends to an `anthropic_messages` server, after encoding it and whether or not the
+caller's own body is replayed. The values are:
+
+- `"provider"` (default): follow Anthropic's hosted API. A `cache_control` marker
+  (the caller's top-level policy, else `{"type":"ephemeral"}`) is added to the
+  final caller block when the body carries fewer than four, and a string message
+  `content` it lands on becomes a one-block array. Replayed `thinking` blocks with
+  no `signature`, such as those Switchyard translates from an OpenAI-format
+  server's reasoning, are removed, and a message left with no blocks gets an
+  empty string `content`.
+- `"verbatim"`: neither rewrite. For a self-hosted model server that caches prompt
+  prefixes itself and ignores `cache_control`, and whose chat template replays
+  earlier reasoning: removing a thinking block changes the prompt the server
+  renders from the one it generated, which costs its prefix cache and the
+  model's own reasoning.
+
+```toml
+[llm_clients.local]
+format = "anthropic_messages"
+base_url = "http://model-server.internal:8000"
+anthropic_body = "verbatim"
+```
+
+Leave `anthropic_body` unset for Anthropic, Bedrock and other hosted providers.
+An unknown value is rejected when the server loads.
 
 The TOML never contains the secret itself. `api_key_env` names a variable that
 must exist and be non-empty when the server loads.

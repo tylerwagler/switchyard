@@ -15,9 +15,9 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use switchyard_llm_client::{
-    AuxiliaryOperation, Backend, ClientRouter, DEFAULT_MAX_RETRIES, HttpBackendConfig, ModelConfig,
-    OpenAiDecisionClient, ResponsesReasoningPolicy, SamplingPolicy, SystemOneClient,
-    TranslatingLlmClient,
+    AnthropicBodyPolicy, AuxiliaryOperation, Backend, ClientRouter, DEFAULT_MAX_RETRIES,
+    HttpBackendConfig, ModelConfig, OpenAiDecisionClient, ResponsesReasoningPolicy, SamplingPolicy,
+    SystemOneClient, TranslatingLlmClient,
 };
 use switchyard_protocol::{
     LlmClientError, ModelId, RoutedDecisionClient, RoutedLlmClient, WireFormat,
@@ -1763,6 +1763,7 @@ impl DeploymentConfig {
                 )
                 .with_responses_reasoning(client_config.responses_reasoning.unwrap_or_default())
                 .with_sampling(client_config.sampling)
+                .with_anthropic_body(client_config.anthropic_body)
                 .with_provider_model(target.id.clone()),
             );
         }
@@ -2137,6 +2138,10 @@ struct LlmClientConfig {
     /// How sampling parameters are written for this server. Unset follows the provider.
     #[serde(default)]
     sampling: SamplingPolicy,
+    /// How an encoded Anthropic Messages body is finished for this server (the prompt-caching
+    /// marker, unsigned thinking blocks). Unset follows the provider.
+    #[serde(default)]
+    anthropic_body: AnthropicBodyPolicy,
 }
 
 #[derive(Debug, Deserialize)]
@@ -4282,6 +4287,56 @@ target = "azure"
             VALID_CONFIG.replace("\nbase_url = ", "\nsampling = \"provider\"\nbase_url = ");
         runner_from_toml(&provider)?;
         Ok(())
+    }
+
+    #[test]
+    fn anthropic_body_defaults_to_provider_and_accepts_verbatim() -> RunnerResult<()> {
+        let default: DeploymentConfig = toml::from_str(VALID_CONFIG)
+            .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
+        assert!(
+            default
+                .llm_clients
+                .values()
+                .all(|client| client.anthropic_body == AnthropicBodyPolicy::Provider)
+        );
+        // Each `base_url` line belongs to one client; the three clients cover every format.
+        let verbatim = VALID_CONFIG.replace(
+            "\nbase_url = ",
+            "\nanthropic_body = \"verbatim\"\nbase_url = ",
+        );
+        let config: DeploymentConfig = toml::from_str(&verbatim)
+            .map_err(|error| RunnerError::configuration_source(error.to_string(), error))?;
+        assert_eq!(config.llm_clients.len(), 3);
+        assert!(
+            config
+                .llm_clients
+                .values()
+                .all(|client| client.anthropic_body == AnthropicBodyPolicy::Verbatim)
+        );
+        runner_from_toml(&verbatim)?;
+        let provider = VALID_CONFIG.replace(
+            "\nbase_url = ",
+            "\nanthropic_body = \"provider\"\nbase_url = ",
+        );
+        runner_from_toml(&provider)?;
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_body_rejects_an_unknown_value_at_load() {
+        for value in ["\"exact\"", "\"Verbatim\"", "\"\"", "true"] {
+            let invalid = format!(
+                "{VALID_CONFIG}\n[llm_clients.unused]\nformat = \"anthropic_messages\"\nbase_url = \"https://example.test\"\nanthropic_body = {value}\n"
+            );
+            let message = error_message(&invalid);
+            assert!(message.contains("anthropic_body"), "{value}: {message}");
+            if value != "true" {
+                assert!(
+                    message.contains("expected `provider` or `verbatim`"),
+                    "{value}: {message}"
+                );
+            }
+        }
     }
 
     #[test]

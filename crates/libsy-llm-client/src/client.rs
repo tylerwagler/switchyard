@@ -55,6 +55,27 @@ const INITIAL_RETRY_DELAY: Duration = Duration::from_millis(250);
 const MAX_RETRY_BACKOFF: Duration = Duration::from_secs(2);
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
+/// How the client finishes an Anthropic Messages body after encoding it, for one target.
+///
+/// A hosted Anthropic endpoint gets two rewrites the caller did not ask for: a
+/// `cache_control` breakpoint on the final caller block (Anthropic caches only at
+/// marked blocks), and replayed `thinking` blocks without a `signature` dropped
+/// (Anthropic and Bedrock reject an unsigned block). A self-hosted model server that
+/// speaks the same format needs neither: it caches prompt prefixes on its own and reads
+/// no `cache_control`, and its template may replay every turn's reasoning, so a dropped
+/// block changes the prompt it renders and loses the reasoning it generated.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnthropicBodyPolicy {
+    /// Follow Anthropic's hosted API: mark the final caller block for prompt caching and
+    /// drop unsigned thinking blocks.
+    #[default]
+    Provider,
+    /// Send the encoded body without either rewrite: thinking blocks reach the server as
+    /// the caller sent them, and no `cache_control` is added or moved.
+    Verbatim,
+}
+
 /// A named target's provider model and backends.
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
@@ -64,6 +85,7 @@ pub struct ModelConfig {
     other_backends: Option<Vec<Backend>>,
     responses_reasoning: crate::ResponsesReasoningPolicy,
     sampling: SamplingPolicy,
+    anthropic_body: AnthropicBodyPolicy,
 }
 
 impl ModelConfig {
@@ -80,7 +102,17 @@ impl ModelConfig {
             other_backends,
             responses_reasoning: crate::ResponsesReasoningPolicy::default(),
             sampling: SamplingPolicy::default(),
+            anthropic_body: AnthropicBodyPolicy::default(),
         }
+    }
+
+    /// Sets how an encoded Anthropic Messages body is finished for this target. The default
+    /// follows Anthropic's hosted API; [`AnthropicBodyPolicy::Verbatim`] sends it without the
+    /// prompt-caching marker and without dropping unsigned thinking blocks.
+    #[must_use]
+    pub fn with_anthropic_body(mut self, policy: AnthropicBodyPolicy) -> Self {
+        self.anthropic_body = policy;
+        self
     }
 
     /// Sets how sampling parameters are written for this target. The default follows the
@@ -371,6 +403,11 @@ impl TranslatingLlmClient {
             .get(target_name)
             .map(|config| config.sampling)
             .unwrap_or_default();
+        let anthropic_body = self
+            .configs_by_target
+            .get(target_name)
+            .map(|config| config.anthropic_body)
+            .unwrap_or_default();
         let mut body = observed_translation::encode_request(&llm_request, wire_format, sampling)
             .map_err(|error| LlmClientError::RequestEncoding(error.to_string()))?;
         // `encode_request` round-trips a preserved same-format body verbatim,
@@ -384,7 +421,9 @@ impl TranslatingLlmClient {
         // reinstate `reasoning_effort` deliberately via `extra_body`.
         if matches!(backend, Backend::Anthropic(_)) {
             strip_anthropic_incompatible_fields(&mut body);
-            strip_unsigned_thinking_blocks(&mut body);
+            if anthropic_body == AnthropicBodyPolicy::Provider {
+                strip_unsigned_thinking_blocks(&mut body);
+            }
         }
         omit_configured_body_fields(&mut body, backend.omit_body_fields());
         merge_extra_body(&mut body, backend.extra_body());
@@ -413,7 +452,9 @@ impl TranslatingLlmClient {
             if nvidia_inference_api_backend(backend) {
                 strip_anthropic_tool_strict(&mut body);
             }
-            enable_anthropic_prompt_caching(&mut body, llm_request.temporary_note_count);
+            if anthropic_body == AnthropicBodyPolicy::Provider {
+                enable_anthropic_prompt_caching(&mut body, llm_request.temporary_note_count);
+            }
         }
         if matches!(
             backend,
@@ -4863,6 +4904,197 @@ mod tests {
         )
         .await?;
         assert_eq!(body["temperature"], json!(0.4), "{body}");
+        Ok(())
+    }
+
+    // The shape Claude Code sends to `/v1/messages` mid tool loop: system blocks with its
+    // own cache breakpoint, a tool, earlier turns whose thinking blocks carry the
+    // signature the server sent (pulsar signs with its message id), one assistant turn
+    // whose thinking arrived unsigned (an earlier turn served through a translated
+    // OpenAI-format route), and a final user turn as a plain string (a side request).
+    fn claude_code_request() -> Value {
+        json!({
+            "model": "client-facing",
+            "max_tokens": 32000,
+            "stream": false,
+            "system": [
+                {"type": "text", "text": "You are Claude Code."},
+                {"type": "text", "text": "Project instructions.", "cache_control": {"type": "ephemeral"}}
+            ],
+            "tools": [{"name": "Bash", "description": "Run a command",
+                       "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}}],
+            "thinking": {"type": "enabled", "budget_tokens": 8000},
+            "messages": [
+                {"role": "user", "content": [{"type": "text", "text": "list the files"}]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "I should run ls.", "signature": "msg_0123"},
+                    {"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "ls"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_1", "content": "a.txt\nb.txt"}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "Two files; read a.txt next.", "signature": ""},
+                    {"type": "tool_use", "id": "toolu_2", "name": "Bash", "input": {"command": "cat a.txt"}}
+                ]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "toolu_2", "content": "hello"}
+                ]},
+                {"role": "assistant", "content": [
+                    {"type": "thinking", "thinking": "Only thinking survived this turn."}
+                ]},
+                {"role": "user", "content": "summarise"}
+            ]
+        })
+    }
+
+    // The thinking texts of every message in an upstream body, in order.
+    fn thinking_texts(body: &Value) -> Vec<String> {
+        body["messages"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|message| message["content"].as_array())
+            .flatten()
+            .filter(|block| block["type"] == "thinking")
+            .filter_map(|block| block["thinking"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn anthropic_body_provider_rewrites_a_claude_code_request()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = sampling_server().await;
+        let client = TranslatingLlmClient::new(&anthropic_map(&server.uri()))?;
+        let sent = claude_code_request();
+        let body = upstream_body(
+            &client,
+            &server,
+            "claude",
+            WireFormat::AnthropicMessages,
+            sent.clone(),
+        )
+        .await?;
+        // The unsigned thinking blocks are gone; the signed one stays.
+        assert_eq!(thinking_texts(&body), vec!["I should run ls."], "{body}");
+        // A turn left with no block is sent as an empty string.
+        assert_eq!(body["messages"][5]["content"], json!(""), "{body}");
+        // The final string turn became a block carrying a breakpoint the caller did not set.
+        assert_eq!(
+            body["messages"][6]["content"],
+            json!([{"type": "text", "text": "summarise", "cache_control": {"type": "ephemeral"}}]),
+            "{body}"
+        );
+        // Everything else is the caller's.
+        assert_eq!(body["system"], sent["system"]);
+        assert_eq!(body["tools"], sent["tools"]);
+        assert_eq!(body["thinking"], sent["thinking"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn anthropic_body_verbatim_sends_the_callers_body()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = sampling_server().await;
+        // The spelling a routes file uses; the runner's tests load it from TOML.
+        let verbatim: AnthropicBodyPolicy = serde_json::from_value(json!("verbatim"))?;
+        assert_eq!(verbatim, AnthropicBodyPolicy::Verbatim);
+        let client = TranslatingLlmClient::new(&[ModelConfig::new(
+            "claude",
+            Backend::Anthropic(config(&server.uri())),
+            None,
+        )
+        .with_anthropic_body(verbatim)])?;
+        let mut sent = claude_code_request();
+        let body = upstream_body(
+            &client,
+            &server,
+            "claude",
+            WireFormat::AnthropicMessages,
+            sent.clone(),
+        )
+        .await?;
+        // Byte for byte the caller's request but for the provider model id.
+        sent["model"] = json!("claude");
+        assert_eq!(body, sent);
+        Ok(())
+    }
+
+    // An OpenAI Responses caller replaying its plaintext reasoning mid tool loop, translated
+    // to an Anthropic-format server. The request encoder itself already leaves unsigned
+    // reasoning out of a body it builds (Chat Completions' `reasoning_content` is not even
+    // decoded), so on a translated hop the policy changes only the cache marker: the
+    // unsigned-thinking strip reaches the caller's own Anthropic body, replayed as sent.
+    #[tokio::test]
+    async fn anthropic_body_policy_on_a_translated_request()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = sampling_server().await;
+        let request = json!({
+            "model": "client-facing",
+            "input": [
+                {"role": "user", "content": "list the files"},
+                {"type": "reasoning", "summary": [],
+                 "content": [{"type": "reasoning_text", "text": "I should run ls."}]},
+                {"type": "function_call", "call_id": "call_1", "name": "Bash",
+                 "arguments": "{\"command\":\"ls\"}"},
+                {"type": "function_call_output", "call_id": "call_1", "output": "a.txt"}
+            ],
+            "tools": [{"type": "function", "name": "Bash", "parameters": {"type": "object"}}]
+        });
+        let provider = TranslatingLlmClient::new(&anthropic_map(&server.uri()))?;
+        let verbatim = TranslatingLlmClient::new(&[ModelConfig::new(
+            "claude",
+            Backend::Anthropic(config(&server.uri())),
+            None,
+        )
+        .with_anthropic_body(AnthropicBodyPolicy::Verbatim)])?;
+        let mut bodies = Vec::new();
+        for client in [&provider, &verbatim] {
+            let body = upstream_body(
+                client,
+                &server,
+                "claude",
+                WireFormat::OpenAiResponses,
+                request.clone(),
+            )
+            .await?;
+            assert!(thinking_texts(&body).is_empty(), "{body}");
+            bodies.push(body);
+        }
+        assert_eq!(count_cache_control_blocks(&bodies[0]), 1, "{}", bodies[0]);
+        assert_eq!(count_cache_control_blocks(&bodies[1]), 0, "{}", bodies[1]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn anthropic_body_policy_leaves_other_formats_alone()
+    -> std::result::Result<(), Box<dyn Error + Sync + Send + 'static>> {
+        let server = sampling_server().await;
+        let request = sampling_request(WireFormat::AnthropicMessages, None, false);
+        let provider = TranslatingLlmClient::new(&chat_map(&format!("{}/v1", server.uri())))?;
+        let verbatim = TranslatingLlmClient::new(&[ModelConfig::new(
+            "gpt",
+            Backend::OpenAiChat(config(&format!("{}/v1", server.uri()))),
+            None,
+        )
+        .with_anthropic_body(AnthropicBodyPolicy::Verbatim)])?;
+        let a = upstream_body(
+            &provider,
+            &server,
+            "gpt",
+            WireFormat::AnthropicMessages,
+            request.clone(),
+        )
+        .await?;
+        let b = upstream_body(
+            &verbatim,
+            &server,
+            "gpt",
+            WireFormat::AnthropicMessages,
+            request,
+        )
+        .await?;
+        assert_eq!(a, b);
         Ok(())
     }
 }
