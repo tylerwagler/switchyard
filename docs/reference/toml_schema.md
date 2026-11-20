@@ -806,6 +806,7 @@ leaves the judge alone in charge. Read-only tools still skip both stages.
 | `block_at` | No | `0.9` | P(block) at or above which stage 1 blocks. |
 | `allow_below` | No | `0.25` | P(block) below which stage 1 allows; `0` sends every action stage 1 does not block to the judge. |
 | `timeout_ms` | No | `10000` | Time allowed for the stage-1 call. |
+| `api_key_env` | No | unset | Name of the environment variable holding a key sent as `Authorization: Bearer`, for a pulsar started with `--api-key-file`. It must exist and be non-empty when the server loads. Omit to send no authentication. |
 
 The thresholds must satisfy 0 ≤ `allow_below` ≤ `block_at` ≤ 1. Verdict-log lines carry
 `stage1_p_block` when stage 1 answered, and `fast_path` `stage1_block` or `stage1_allow` when it

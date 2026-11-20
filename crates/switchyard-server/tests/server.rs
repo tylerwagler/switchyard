@@ -71,6 +71,7 @@ impl MockUpstream {
             .route("/v1/responses/compact", post(upstream_responses_auxiliary))
             .route("/future/provider/endpoint", post(upstream_fallback))
             .route("/v1/systemone", post(upstream_systemone))
+            .route("/keyed/systemone", post(upstream_keyed_systemone))
             .layer(DefaultBodyLimit::disable())
             .with_state(Arc::clone(&calls));
         let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -133,6 +134,29 @@ async fn upstream_systemone(
     calls.lock().await.push(body.clone());
     let risky = body["state"]["action"].to_string().contains("rm -rf");
     Json(json!({"decisions": [{"p_block": if risky { 0.97 } else { 0.12 }}]}))
+}
+
+/// The decision model behind a pulsar started with `--api-key-file`: 401 unless the request
+/// carries `Authorization: Bearer stage1-secret`.
+async fn upstream_keyed_systemone(
+    State(calls): State<Arc<Mutex<Vec<Value>>>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> HttpResponse {
+    if headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        != Some("Bearer stage1-secret")
+    {
+        return (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({"error": {"message": "invalid API key", "type": "authentication_error"}})),
+        )
+            .into_response();
+    }
+    upstream_systemone(State(calls), Json(body))
+        .await
+        .into_response()
 }
 
 async fn upstream_chat(
@@ -1370,6 +1394,78 @@ timeout_ms = 2000
     )
     .await?;
     assert_eq!(response.json()?["content"][0]["text"], "<severity>50");
+    Ok(())
+}
+
+#[tokio::test]
+async fn native_classifier_stage1_sends_its_api_key() -> TestResult {
+    const KEY_ENV: &str = "SWITCHYARD_TEST_STAGE1_KEY";
+    unsafe {
+        // "unsafe" is for concurrent reads and writes, very rare
+        std::env::set_var(KEY_ENV, "stage1-secret");
+    }
+    let upstream = MockUpstream::start().await?;
+    let config = |key_line: &str| {
+        format!(
+            r#"
+schema_version = 1
+[llm_clients.mock]
+format = "openai_chat"
+base_url = "{base_url}"
+max_retries = 0
+failure_cooldown_ms = 0
+[targets.main]
+id = "model/a"
+llm_client = "mock"
+[targets.judge]
+id = "model/judge"
+llm_client = "mock"
+[routes.main]
+id = "{ROUTE_MODEL}"
+type = "passthrough"
+target = "main"
+[routes.judge]
+id = "switchyard/safeguards-judge"
+type = "passthrough"
+target = "judge"
+[safeguards]
+judge_route = "judge"
+native_model = "claude-sonnet-5-elytron"
+[safeguards.stage1]
+url = "{base_url}/../keyed/systemone"
+timeout_ms = 2000
+{key_line}
+"#,
+            base_url = upstream.base_url,
+        )
+    };
+    // With the key the decision model answers; without it, its 401 escalates (severity 50).
+    for (key_line, severity) in [
+        (format!("api_key_env = \"{KEY_ENV}\""), "97"),
+        (String::new(), "50"),
+    ] {
+        let app = build_switchyard_router(load_test_config(&config(&key_line))?);
+        let response = send(
+            &app,
+            "POST",
+            "/v1/messages",
+            Some(native_classifier_body("rm -rf build", true)),
+        )
+        .await?;
+        assert_eq!(response.status, StatusCode::OK, "{key_line}");
+        assert_eq!(
+            response.json()?["content"][0]["text"],
+            format!("<severity>{severity}"),
+            "{key_line}"
+        );
+    }
+    // A variable that is not set is refused when the config loads.
+    assert!(
+        load_test_config(&config(
+            "api_key_env = \"SWITCHYARD_TEST_STAGE1_KEY_UNSET\""
+        ))
+        .is_err()
+    );
     Ok(())
 }
 

@@ -216,6 +216,8 @@ struct SafeguardsStage1Config {
     allow_below: Option<f64>,
     #[serde(default)]
     timeout_ms: Option<u64>,
+    #[serde(default)]
+    api_key_env: Option<String>,
 }
 
 /// The decision model asked before the judge (`[safeguards.stage1]`).
@@ -229,6 +231,9 @@ pub struct SafeguardsStage1 {
     pub allow_below: f64,
     /// Time allowed for one stage 1 answer.
     pub timeout: std::time::Duration,
+    /// The environment variable holding the bearer token sent to `url`; `None` sends none.
+    /// The name, not the key, so a debug print of the config never shows the secret.
+    pub api_key_env: Option<String>,
 }
 
 /// The judge for Claude Code's server-side auto mode check.
@@ -1482,6 +1487,9 @@ impl DeploymentConfig {
                                 "safeguards.stage1 wants 0 <= allow_below ({allow_below}) <= block_at ({block_at}) <= 1"
                             )));
                         }
+                        if let Some(variable) = &stage1.api_key_env {
+                            read_api_key("[safeguards.stage1]", variable)?;
+                        }
                         Some(SafeguardsStage1 {
                             url: stage1.url,
                             block_at,
@@ -1489,6 +1497,7 @@ impl DeploymentConfig {
                             timeout: std::time::Duration::from_millis(
                                 stage1.timeout_ms.unwrap_or(DEFAULT_STAGE1_TIMEOUT_MS),
                             ),
+                            api_key_env: stage1.api_key_env,
                         })
                     }
                 };

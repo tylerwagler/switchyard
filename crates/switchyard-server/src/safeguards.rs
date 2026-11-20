@@ -954,13 +954,14 @@ async fn ask_stage1(
             .acquire()
             .await
             .map_err(|error| error.to_string())?;
-        let response = state
-            .http_client()
-            .post(&stage1.url)
-            .json(body)
-            .send()
-            .await
-            .map_err(|error| error.to_string())?;
+        let mut request = state.http_client().post(&stage1.url).json(body);
+        if let Some(variable) = &stage1.api_key_env
+            && let Ok(token) = std::env::var(variable)
+            && !token.trim().is_empty()
+        {
+            request = request.bearer_auth(token);
+        }
+        let response = request.send().await.map_err(|error| error.to_string())?;
         let status = response.status();
         let answer: Value = response.json().await.map_err(|error| error.to_string())?;
         if !status.is_success() {
